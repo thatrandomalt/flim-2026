@@ -26,8 +26,7 @@ server/dist/
 *.aiff
 *.wv
 Test FLP/
-# dev tools: reverse-engineering notes and test suites stay local
-client/dev/
+# dev tools
 __pycache__/
 *.pyc
 # editors / OS

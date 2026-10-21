@@ -22,7 +22,7 @@ If the Build Tools are installed somewhere else, change `VCVARS` at the top of `
 | `common/flim_res.h` | dialog resource IDs |
 | `restart_test.ps1` | dev loop: close FL, rebuild, start leader "A" and member "B" connected to a server (`-Minimized`, `-NoLocalB`) |
 | `gen_icon.py` | regenerates `launcher/flim.ico` (needs Pillow) |
-| `dev/` | reverse-engineering notes and test tools: kept local, not in this repo (`.gitignore`) |
+| `dev/` | reverse-engineering notes and test tools (not built or shipped), see [dev/README.md](dev/README.md) |
 
 ## FL build dependency
 The engine calls FL's internal functions and reads its data at addresses found for
