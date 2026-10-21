@@ -2,7 +2,7 @@
 # 26.1.7.5654): make a change in A (or B) through FL's own functions via the probe, wait, compare.
 #   python live_test.py [test ...]            (no names: all, in order; e.g. "mix_insert mix_delete")
 # FLIM_TEST_VST=<.fst of a plugin to load into a mixer slot> (default: Xfer OTT from FL's plugin database).
-import sys, os, time, struct, math, threading
+import sys, os, re, time, struct, math, threading
 import fl
 from mk import *
 
@@ -224,6 +224,63 @@ def t_sample():
     a.call(0xf54760, a.mkstr(dst), 32, chans(a)[-1], 0)
     check('channel with sample added', lambda: len(chans(a)), lambda: len(chans(b)), wait=10)
 
+# Any file a plugin loads travels: an SF2 Player with a soundfont from a user folder (B must download it:
+# restart_test.ps1 -NoLocalB). Its path is a Delphi short string in the plugin data (length byte, no end).
+SF2_FST = os.path.join(fl_dir(), r'Data\Patches\Plugin database\Generators\Misc\SoundFont Player.fst')
+def fst_with_sf2(src, dst, sf2):
+    # the factory preset again, its soundfont (in event 213, after a length byte) replaced by sf2
+    d = open(src, 'rb').read()
+    j = d.find(b'FLdt'); p = j + 8; out = bytearray(d[:j + 8])
+    def varint(n):
+        o = b''
+        while True:
+            c = n & 0x7f; n >>= 7
+            o += bytes([c | (0x80 if n else 0)])
+            if not n: return o
+    while p < len(d):
+        q = p; e = d[q]; q += 1
+        if e == 172: e = struct.unpack_from('<I', d, q)[0]; q += 4
+        c = e >> 6 if e < 0x100 else e >> 30
+        if c < 3: n = (1, 2, 4)[c]
+        else:
+            n = sh = 0
+            while True:
+                x = d[q]; q += 1; n |= (x & 0x7f) << sh; sh += 7
+                if x < 128: break
+        v = d[q:q + n]
+        i = v.find(b'%FLStudioFactoryData%')
+        if e == 213 and i > 0:
+            s = sf2.encode('mbcs')
+            v = v[:i - 1] + bytes([len(s)]) + s + v[i + v[i - 1]:]
+            out += bytes([213]) + varint(len(v)) + v
+        else: out += d[p:q + n]
+        p = q + n
+    out[j + 4:j + 8] = struct.pack('<I', len(out) - j - 8)
+    open(dst, 'wb').write(out)
+def sf2_in(p, ch, tag):                                  # (path, bytes) of the soundfont p's channel ch points at
+    path = os.path.join(TMP, 'flim_live_sf2_%s.fst' % tag)
+    if os.path.exists(path): os.remove(path)
+    p.call(V(p, 'SAVEPRESET'), p.mkstr(path), 32, chans(p)[ch], 1)
+    d = open(path, 'rb').read() if os.path.exists(path) else b''
+    m = re.search(rb'[A-Za-z]:\\[^\x00-\x1f]*?\.sf2', d)
+    f = m.group().decode('mbcs') if m else ''
+    return f, (open(f, 'rb').read() if f and os.path.exists(f) else None)
+def t_sf2():
+    if not os.path.exists(SF2_FST): print('   (no %s: SF2 test skipped)' % SF2_FST); return
+    folder = os.path.join(os.environ['USERPROFILE'], 'Documents', 'flim live test soundfonts')
+    os.makedirs(folder, exist_ok=True)
+    for k, name in enumerate(('Strings A.sf2', 'Strings B.sf2')):
+        sf2 = os.path.join(folder, name)
+        with open(sf2, 'wb') as f:                       # a real upload each run: a new tail (RIFF readers stop at its end)
+            f.write(open(os.path.join(fl_dir(), r'Data\Patches\Soundfonts\STR_Ensemble.sf2'), 'rb').read() + b'flim%f' % time.time())
+        dst = os.path.join(TMP, 'flim_live_sf2_%d.fst' % k)
+        fst_with_sf2(SF2_FST, dst, sf2)
+        if k == 0: a.call(0x1004230, -1, 0, 1)            # a new channel; then the second soundfont into the same one
+        a.call(0xf54760, a.mkstr(dst), 32, chans(a)[-1], 1)
+        want = open(sf2, 'rb').read()
+        check('SF2 soundfont %s arrives' % 'AB'[k], lambda: (len(chans(a)), True),
+              lambda: (len(chans(b)), sf2_in(b, -1, 'b')[1] == want), wait=20)
+
 def mix_state(p):
     n = mix_count(p)
     return n, [mix_name(p, t) for t in range(n)], [rec_get(p, mix_id(t, 0x1fc0)) for t in range(1, n - 1)], [has_plug(p, t) for t in range(1, n - 1)]
@@ -250,6 +307,50 @@ def t_mix_append():
 def t_mix_move():
     mix_move(a, 3, 1)
     check('mixer: A moves track 3 right (edits)', lambda: mix_state(a), lambda: mix_state(b), wait=15)
+
+# Solo is each person's own: FL solos by muting the other tracks, which must not reach the others.
+MUTE, SOLO = 0x127b9b0, 0x127c2a0                               # setTrackEnabled(t, on); solo(t, 1 on / 0 off, 2: mixer default)
+def mixb(p, t, off): return p.r(mix_rec(p, t) + off, 1)[0]     # +0x18 enabled, +0x1a soloed, +0x1c enabled before the solo
+def mutes(p): return [mixb(p, t, 0x18) for t in range(mix_count(p))]
+
+def t_solo():
+    a.call(MUTE, 6, 0)
+    check('mute 6 (shared)', lambda: mixb(a, 6, 0x18), lambda: mixb(b, 6, 0x18))
+    before = mutes(b)
+    a.call(SOLO, 3, 1, 2); time.sleep(2.5)
+    check('solo: A has 3 soloed', lambda: (mixb(a, 3, 0x1a), mixb(a, 4, 0x18)), lambda: (1, 0))
+    check('solo: B keeps its mutes', lambda: mutes(b), lambda: before)
+    b.call(MUTE, 5, 0); b.call(MUTE, 6, 1)                      # B mutes 5 and unmutes 6 meanwhile
+    check('solo: A stays soloed, keeps B\'s mutes', lambda: (mixb(a, 3, 0x1a), mixb(a, 5, 0x1c), mixb(a, 6, 0x1c)), lambda: (1, 0, 1))
+    a.call(SOLO, 3, 0, 2)
+    check('unsolo: A has the shared mutes', lambda: mutes(a), lambda: mutes(b), wait=4)
+    before = mutes(b)
+    a.call(SOLO, 3, 1, 2); time.sleep(1.5); a.call(MUTE, 7, 0)  # a mute click ends FL's solo, the rest left muted
+    time.sleep(2.5)
+    check('mute ends solo: B unchanged', lambda: mutes(b), lambda: before)
+    check('mute ends solo: A back to shared', lambda: mutes(a), lambda: mutes(b), wait=4)
+
+# Fruity Delay 3 locked its user out: the other FL sent its state back after applying their edits.
+FD3_FST = os.path.join(fl_dir(), r'Data\Patches\Plugin database\Effects\Delay reverb\Fruity Delay 3.fst')
+def fx_id(t, s, p): return 0x70000000 + (((t << 6) | s) << 16) + 0x8000 + p
+def log_since(pos, pid):
+    with open(LOG, 'rb') as f:
+        f.seek(pos); return [l for l in f.read().decode('utf-8', 'replace').splitlines() if '[%d]' % pid in l]
+
+def t_fd3_lock():
+    t, s, p = 6, 1, 14
+    a.call(V(a, 'LOADPRESET'), a.mkstr(FD3_FST), 48, fx_slot(a, t, s), 0)
+    check('Fruity Delay 3 arrives', lambda: has_plug(a, t, s), lambda: has_plug(b, t, s), wait=10)
+    time.sleep(5)
+    pos = os.path.getsize(LOG)
+    for k in range(15):                                         # A works a knob; B's user is busy elsewhere
+        rec_set(a, fx_id(t, s, p), 1000 + 120 * k); time.sleep(0.7)
+    time.sleep(8)                                               # B's state checks get round to it
+    check('FD3: B has A\'s edits', lambda: rec_get(a, fx_id(t, s, p)), lambda: rec_get(b, fx_id(t, s, p)), wait=4)
+    u = 'fx %d/%d' % (t, s)                                     # B must neither send its state nor put an old one back
+    bad = [l[13:110] for l in log_since(pos, A) if 'snapped back' in l or 'PLUG applied unit=' + u in l]
+    bad += [l[13:110] for l in log_since(pos, B) if u + ': reverting' in l or 'PLUG sent plug.state unit=' + u in l]
+    check('FD3: B leaves A\'s plugin alone', lambda: bad[:2], lambda: [])
 
 if __name__ == '__main__':
     T = {k[2:]: v for k, v in list(globals().items()) if k.startswith('t_')}

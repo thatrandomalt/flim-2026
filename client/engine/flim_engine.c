@@ -76,6 +76,8 @@ static wchar_t g_flBuild[32];      // FLEngine_x64.dll's file version
 #define MAINFORM_VA  FLVA(MAINFORM) // global: pointer to FL main form pointer
 #define MIX_STRIDE   0x1478
 #define MIX_ENABLED  0x18          // byte: 1 = enabled (unmuted)
+#define MIX_SOLO     0x1a          // byte: 1 = this track is soloed
+#define MIX_PRESOLO  0x1c          // byte: its MIX_ENABLED from before a solo, put back on unsolo
 
 #define REC_UpdateValue   0x01
 #define REC_GetValue      0x02
@@ -306,7 +308,7 @@ typedef struct {
     int type;
     uint32_t id, v;          // T_PARAM
     int unit, a, b;          // unit kind + (channel) or (track, slot)
-    int mode;                // T_SNAP mode / T_LOAD: 1 = skip if identical
+    int mode;                // T_SNAP mode / T_LOAD: 1 = skip if identical / T_PARAM: 1 = someone else's edit
     char *path;              // T_LOAD / T_ADDCH: inbound .fst file (owned; deleted after use)
     int *order;              // T_ORDER: [n, from0..from(n-1)]; T_FXSYNC/T_NOTESYNC: bitmap;
                              // T_NOTES: note records, it->mode = count (owned)
@@ -369,6 +371,29 @@ static int fl_ready(void) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
+// Solo is each person's own listening. FL solos by muting the other tracks (MIX_SOLO set on the
+// soloed one, every track's own state kept in MIX_PRESOLO until the unsolo), so while anything is
+// soloed here, a track's mute as the others know it is its MIX_PRESOLO.
+static int solo_scan(void) {
+    int t, n = mix_count();
+    __try {
+        char *arr = *(char **)(g_flBase + (MIXARR_VA - IMG_BASE));
+        for (t = 0; t < n; t++) if (arr[(size_t)t * MIX_STRIDE + MIX_SOLO]) return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return 0;
+}
+static int solo_on(void) {                 // solo_scan at most once per clock tick: the poll reads every track's mute
+    static volatile DWORD at;
+    static volatile int on;
+    DWORD now = GetTickCount();
+    if (now != at) { on = solo_scan(); at = now; }
+    return on;
+}
+static uint32_t mute_get(int t, int solo) {
+    __try { return (*(char **)(g_flBase + (MIXARR_VA - IMG_BASE)))[(size_t)t * MIX_STRIDE + (solo ? MIX_PRESOLO : MIX_ENABLED)] ? 1u : 0u; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return REC_NONE; }
+}
+
 // Current value of any synced id (REC param or pseudo id). REC_NONE if absent.
 // SEH-guarded so a bad moment inside FL (e.g. mid project load) can't take FL down.
 static uint32_t read_value(uint32_t id) {
@@ -376,8 +401,7 @@ static uint32_t read_value(uint32_t id) {
         if (IS_MUTE_ID(id)) {
             int t = (int)(id & 0xFFFFF);
             if (t >= mix_count()) return REC_NONE;
-            char *arr = *(char **)(g_flBase + (MIXARR_VA - IMG_BASE));
-            return arr[(size_t)t * MIX_STRIDE + MIX_ENABLED] ? 1u : 0u;
+            return mute_get(t, solo_on());
         }
         return g_rec(id, 0, REC_GetValue);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -389,8 +413,12 @@ static uint32_t read_value(uint32_t id) {
 static uint32_t write_value(uint32_t id, uint32_t v) {
     __try {
         if (IS_MUTE_ID(id)) {
-            g_setEnabled((int)(id & 0xFFFFF), v ? 1 : 0);
-            return read_value(id);
+            int t = (int)(id & 0xFFFFF), solo = solo_scan();
+            if (t >= mix_count()) return REC_NONE;
+            // soloing here: heard after the unsolo (FL's mute would also end the solo, leaving the rest muted)
+            if (solo) (*(char **)(g_flBase + (MIXARR_VA - IMG_BASE)))[(size_t)t * MIX_STRIDE + MIX_PRESOLO] = v ? 1 : 0;
+            else g_setEnabled(t, v ? 1 : 0);
+            return mute_get(t, solo);
         }
         return g_rec(id, v, REC_UpdateValue | REC_UpdateControl);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -609,9 +637,9 @@ static void enqueue(const QItem *it) {
     wake_main();
 }
 
-static void enqueue_apply(uint32_t id, uint32_t v) {
+static void enqueue_apply(uint32_t id, uint32_t v, int remote) {
     QItem it; memset(&it, 0, sizeof(it));
-    it.type = T_PARAM; it.id = id; it.v = v;
+    it.type = T_PARAM; it.id = id; it.v = v; it.mode = remote;
     enqueue(&it);
 }
 
@@ -816,6 +844,9 @@ static uint64_t fnv64(const unsigned char *p, size_t n) {
 #define EV_NEWPLUGIN     212
 #define EV_SAMPLE_PATH   196
 #define EV_PLUGIN_DATA   213
+#define EV_INSFLAGS      236       // a mixer track's flags (u32, flags, u32), one per track in order
+#define INS_ENABLED      0x8
+#define INS_SOLO         0x1000
 typedef int (*flpev_t)(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end);
 static int flp_walk(const unsigned char *d, size_t n, flpev_t cb, void *ctx);
 
@@ -3144,6 +3175,19 @@ static void send_project(const unsigned char *d, size_t n, const wchar_t *name) 
     logmsg("PROJECT sent %S (%zu bytes)", (name && *name) ? name : L"(untitled)", n);
 }
 
+// A snapshot carries no solo of ours: each track gets its own mute state back and loses the solo.
+static int solostrip_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end) {
+    int *t = (int *)ctx;
+    (void)at; (void)end;
+    if (id != EV_INSFLAGS || n < 8) return 1;
+    if (*t < mix_count()) {
+        uint32_t *f = (uint32_t *)(p + 4);
+        *f = (*f & ~(uint32_t)(INS_SOLO | INS_ENABLED)) | (mute_get(*t, 1) == 1 ? INS_ENABLED : 0);
+    }
+    (*t)++;
+    return 1;
+}
+
 // Leader: snapshot of the current project (FL's own project writer; the current file
 // name stays as it is). Returns malloc'd bytes or NULL. Main thread.
 static int g_ownSave = 0;                  // inside it: not a save to announce (save_detour)
@@ -3159,6 +3203,7 @@ static unsigned char *project_snapshot(size_t *n) {
     if (!r) { logmsg("PROJECT snapshot failed"); return NULL; }
     unsigned char *d = read_file_w(path, n);
     DeleteFileW(path);
+    if (d && solo_scan()) { int t = 0; flp_walk(d, *n, solostrip_cb, &t); }
     return d;
 }
 
@@ -4107,7 +4152,7 @@ static void plug_undo(const char *key, int apply) {
         Slot *s = &g_slots[k];
         int u2, a2, b2;
         if (!s->hasUndo || !plug_param_unit(s->id, &u2, &a2, &b2) || u2 != unit || a2 != a || b2 != b) continue;
-        if (apply) { enqueue_apply(s->id, s->undo); n++; }
+        if (apply) { enqueue_apply(s->id, s->undo, 0); n++; }
         s->hasUndo = 0;
     }
     if (n) logmsg("LOCK %s denied: %d params snapped back", key, n);
@@ -4732,7 +4777,7 @@ static void do_plugfocus(const QItem *it) {
     logmsg("PLUGFOCUS: window %p is %s %d/%d (%d votes vs %d): checking its state", (void *)it->wnd,
            hit.unit == U_CH ? "ch" : "fx", hit.a, hit.b, V[best].votes, second);
     u = unit_ptr(hit.unit, hit.a, hit.b);
-    if (!u || u->lastAct || u->identAt || u->addAt || GetTickCount() < u->suppressUntil) return;   // handled elsewhere
+    if (!u || u->lastAct || u->identAt || u->addAt || u->baselineAt || GetTickCount() < u->suppressUntil) return;   // handled elsewhere
     enqueue_unit(T_SNAP, hit.unit, hit.a, hit.b, u->hash ? SNAP_IF_DIFF : SNAP_BASELINE, NULL);
 }
 // Poll thread: the user worked in a plugin window and paused (or has been at it for a while).
@@ -4968,6 +5013,18 @@ static void drain_queue_mainthread(void) {
             LeaveCriticalSection(&g_slotLock);
         }
         uint32_t r = write_value(it.id, it.v);
+        if (it.mode) {
+            // someone else's edit moved this channel's / effect's saved state: not ours to send back (the
+            // state checks would, and take the plugin lock from them). They wait for a new baseline; params
+            // a plugin links to the one it got aren't local edits either.
+            int un, ua, ub;
+            Unit *u = unit_of_id(it.id, &un, &ua, &ub) ? unit_ptr(un, ua, ub) : NULL;
+            if (u) {
+                DWORD now = GetTickCount();
+                u->baselineAt = now + REBASE_MS;
+                if ((it.id & 0xFFFF) >= REC_PLUG_FIRST) u->suppressUntil = now + SUPPRESS_MS;
+            }
+        }
         if (s) {
             // what the plugin made of it (its own rounding) isn't a local change either: sent back, it
             // would echo between the peers, or be snapped back forever while the sender holds the lock.
@@ -5294,6 +5351,37 @@ static void schedule_units(DWORD now) {
     (void)t; (void)s;
 }
 
+// FL's solo (un)mutes the tracks one by one around flagging the soloed one, so a pass can land
+// mid-way: a mute change counts once two passes in a row read it, and not while solo is changing.
+// On unsolo the tracks go back to the mute states everyone shares (FL may unmute them all instead,
+// or leave the rest muted when a mute click ended the solo).
+#define SOLO_HOLD_MS 1000
+static unsigned char g_mutePend[MAX_MIX];  // a track's new mute reading + 1, until the next pass confirms it
+static DWORD g_soloChangedAt;              // when solo last went on or off here
+static void solo_poll(DWORD now) {
+    static int was = -1;
+    int on = solo_scan(), i, n = g_nslot;
+    if (on == was) return;
+    if (was >= 0) logmsg("SOLO %s here (each person's own: not synced)", on ? "on" : "off");
+    if (was == 1)
+        for (i = 0; i < n; i++) {
+            Slot *s = &g_slots[i];
+            int t = (int)(s->id & 0xFFFFF);
+            if (IS_MUTE_ID(s->id) && t < mix_count() && s->last != REC_NONE && mute_get(t, 0) != s->last) enqueue_apply(s->id, s->last, 0);
+        }
+    was = on;
+    g_soloChangedAt = now;
+}
+static int mute_settled(Slot *s, uint32_t v, DWORD now) {
+    int t = (int)(s->id & 0xFFFFF);
+    if (t >= MAX_MIX) return 1;
+    if (v == s->last || v == REC_NONE || s->last == REC_NONE) { g_mutePend[t] = 0; return 1; }
+    if (now - g_soloChangedAt < SOLO_HOLD_MS) return 0;
+    if (g_mutePend[t] != v + 1) { g_mutePend[t] = (unsigned char)(v + 1); return 0; }
+    g_mutePend[t] = 0;
+    return 1;
+}
+
 static DWORD WINAPI pollThread(LPVOID p) {
     (void)p;
     DWORD lastScan = GetTickCount(), lastBeat = GetTickCount();
@@ -5354,6 +5442,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
         scan_meta(now);
         focus_poll(now);
         cursor_poll(now);
+        solo_poll(now);
         uint64_t mixH = mix_ids_hash();
         n = g_nslot;
         for (i = 0; i < n; i++) {
@@ -5363,6 +5452,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
             if (fl_presets_loading()) break;           // a load began meanwhile: the rest next tick
             v = read_value(s->id);
             if (s->gen != g0) continue;                 // raced with an apply; re-read next tick
+            if (IS_MUTE_ID(s->id) && !mute_settled(s, v, now)) continue;
             EnterCriticalSection(&g_slotLock);
             uint32_t prev = s->last;
             if (v != prev) s->last = v;
@@ -5441,14 +5531,14 @@ static DWORD WINAPI pollThread(LPVOID p) {
                 // plugin params go under their plugin's lock
                 if (!plug_lock_param(unit, a, b, s, g_changes[i].prev, key, sizeof(key))) {
                     logmsg("LOCK %s held by another user: param 0x%08x snapped back", key, s->id);
-                    enqueue_apply(s->id, g_changes[i].prev);
+                    enqueue_apply(s->id, g_changes[i].prev, 0);
                     enqueue_hint(key);
                     continue;
                 }
             } else {
                 if (s->lockedByPeer) {
                     // someone else holds this knob: snap our local edit back
-                    enqueue_apply(s->id, g_changes[i].prev);
+                    enqueue_apply(s->id, g_changes[i].prev, 0);
                     continue;
                 }
                 if (!s->lockedByMe) { send_lock("lock_acquire", s->id); s->lockedByMe = 1; }
@@ -5520,7 +5610,7 @@ static int route_inbound(uint32_t id, uint32_t v, int onlyIfDiff) {
     if (!add_slot(id)) { pend_put(id, v); return 0; }
     Slot *s = slot_by_id(id);
     if (onlyIfDiff && s && s->last == v) return 0;
-    enqueue_apply(id, v);
+    enqueue_apply(id, v, 1);
     return 1;
 }
 
@@ -5531,7 +5621,7 @@ static void retry_pending(void) {
         Pend p = g_pend[i];
         if (add_slot(p.id)) {
             Slot *s = slot_by_id(p.id);
-            if (!s || s->last != p.v) { enqueue_apply(p.id, p.v); applied++; }
+            if (!s || s->last != p.v) { enqueue_apply(p.id, p.v, 1); applied++; }
         } else g_pend[kept++] = p;
     }
     g_npend = kept;
@@ -6217,6 +6307,28 @@ static void pathlist_add(PathList *L, const wchar_t *w) {
 }
 
 // ---- paths inside plugin data ----
+// Any file a plugin (FL's own or a VST) has loaded travels: samples, soundfonts, wavetables, impulse
+// responses, multisamples... Never programs, plugin binaries (a VST wrapper's state names its .dll),
+// shortcuts, keys or Windows' own files. A file name needs an extension.
+static int named_file(const wchar_t *w, size_t n) {          // "...\name.ext"
+    size_t e = n;
+    while (e > 0 && w[e - 1] != L'.' && w[e - 1] != L'\\' && w[e - 1] != L'/') e--;
+    return e >= 3 && w[e - 1] == L'.' && w[e - 2] != L'\\' && w[e - 2] != L'/' && n > e && n - e <= 10;
+}
+static int content_file(const wchar_t *w, size_t n) {
+    static const wchar_t *const NO[] = { L".exe", L".dll", L".vst", L".vst3", L".clap", L".aaxplugin", L".component",
+        L".sys", L".drv", L".ocx", L".cpl", L".bat", L".cmd", L".ps1", L".vbs", L".com", L".scr", L".msi", L".lnk",
+        L".url", L".lic", L".key", L".pem", L".pfx", L".p12" };
+    size_t i, k;
+    if (!named_file(w, n)) return 0;
+    if (n > 11 && _wcsnicmp(w + 1, L":\\Windows\\", 10) == 0) return 0;
+    for (i = 0; i < sizeof(NO) / sizeof(NO[0]); i++) {
+        k = wcslen(NO[i]);
+        if (n > k && _wcsnicmp(w + n - k, NO[i], k) == 0) return 0;
+    }
+    return 1;
+}
+// Media that may be named even where it isn't on this PC (a moved sample): there the extension ends it.
 static int audio_ext(const wchar_t *w, size_t n) {
     static const wchar_t *const EXT[] = { L".wav", L".mp3", L".ogg", L".flac", L".aif", L".aiff", L".wv", L".rx2", L".rex", L".sf2" };
     size_t i, k;
@@ -6225,6 +6337,26 @@ static int audio_ext(const wchar_t *w, size_t n) {
         if (n > k && _wcsnicmp(w + n - k, EXT[i], k) == 0) return 1;
     }
     return 0;
+}
+// `units` of path text (wide: UTF-16LE chars; else bytes: UTF-8 when valid, else the ANSI code page) -> out.
+static int path_text(const unsigned char *s, size_t units, int wide, wchar_t *out, int cap) {
+    int m;
+    if (units + 1 > (size_t)cap) return 0;
+    if (wide) { memcpy(out, s, units * 2); out[units] = 0; return 1; }
+    m = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, (const char *)s, (int)units, out, cap - 1);
+    if (m <= 0) m = MultiByteToWideChar(CP_ACP, 0, (const char *)s, (int)units, out, cap - 1);
+    if (m <= 0) return 0;
+    out[m] = 0;
+    return 1;
+}
+// path as bytes: enc 0 UTF-16LE, 1 UTF-8, 2 the ANSI code page (0 = not representable there).
+static int path_bytes(const wchar_t *w, int enc, unsigned char *out, int cap) {
+    BOOL lossy = FALSE;
+    int k = (int)wcslen(w), m;
+    if (enc == 0) { if (k * 2 > cap) return 0; memcpy(out, w, (size_t)k * 2); return k * 2; }
+    if (enc == 1) return WideCharToMultiByte(CP_UTF8, 0, w, k, (char *)out, cap, NULL, NULL);
+    m = WideCharToMultiByte(CP_ACP, WC_NO_BEST_FIT_CHARS, w, k, (char *)out, cap, NULL, &lossy);
+    return lossy ? 0 : m;
 }
 // [tag u32][length u64][payload] records exactly covering v[a, b)?
 static int tlv_valid(const unsigned char *v, size_t a, size_t b) {
@@ -6253,7 +6385,7 @@ static int tlv_path(const unsigned char *p, size_t n, wchar_t *out, int cap) {
     if (k && !out[k - 1]) k--;
     for (i = 0; i < k; i++) if (out[i] < 32) return 0;
     out[k] = 0;
-    return (is_abs_path(out) || out[0] == L'%') && audio_ext(out, k);
+    return (is_abs_path(out) || out[0] == L'%') && content_file(out, k);
 }
 static void tlv_collect(const unsigned char *v, size_t a, size_t b, int depth, PathList *L) {
     wchar_t w[SAMPLE_PATH_MAX];
@@ -6264,38 +6396,58 @@ static void tlv_collect(const unsigned char *v, size_t a, size_t b, int depth, P
         a = e;
     }
 }
-// Plain absolute paths anywhere in the data: "X:\..." / "\\..." as UTF-16LE or ANSI,
-// ending in an audio extension. *wide tells which encoding was found (for the rewrite).
+// Plain paths anywhere in the data ("X:\..." or "X:/...", "\\server\...", "%FLStudioUserData%\..."),
+// as UTF-16LE, UTF-8 or ANSI text -> out; returns the chars (wide) or bytes it covers, 0 = none.
+// Where it ends, first match wins:
+//  - a length right before it: 8 or 4 bytes (a VST wrapper's records, many plugins' own formats; for
+//    UTF-16 in chars or bytes) or one byte (a Delphi short string: SF2 Player), when that cut leaves
+//    "name.ext" and no letter follows. That is the path, even when it's a plugin binary (then none);
+//  - the end of the text;
+//  - text running on into other data (SF2 Player's 0xFF filler): the longest beginning that is a file
+//    here or ends in a media extension.
 static size_t raw_path_at(const unsigned char *v, size_t i, size_t n, int wide, wchar_t *out, int cap) {
-    size_t k = 0, step = wide ? 2 : 1;
-    while (i + k * step + step <= n && k + 1 < (size_t)cap) {
-        unsigned c = wide ? *(const uint16_t *)(v + i + k * step) : v[i + k * step];
-        if (c < 32 || c == '"' || c == '*' || c == '?' || c == '<' || c == '>' || c == '|') break;
-        out[k++] = (wchar_t)c;
+    size_t k = 0, st = wide ? 2 : 1, len, c[4];
+    wchar_t full[SAMPLE_PATH_MAX];
+    int j;
+    while (i + (k + 1) * st <= n && k + 1 < (size_t)cap) {
+        unsigned ch = wide ? *(const uint16_t *)(v + i + k * st) : v[i + k * st];
+        if (ch < 32 || ch == '"' || ch == '*' || ch == '?' || ch == '<' || ch == '>' || ch == '|') break;
+        k++;
     }
-    out[k] = 0;
-    if (!wide && k) {                                       // ANSI: decode with the system code page
-        char a[SAMPLE_PATH_MAX];
-        size_t j;
-        for (j = 0; j < k; j++) a[j] = (char)v[i + j];
-        a[k] = 0;
-        if (!MultiByteToWideChar(CP_ACP, 0, a, -1, out, cap)) return 0;
+    c[0] = i >= 8 ? (size_t)*(const uint64_t *)(v + i - 8) : 0;
+    c[1] = i >= 4 ? *(const uint32_t *)(v + i - 4) : 0;
+    c[2] = wide ? c[0] / 2 : (i >= 1 ? v[i - 1] : 0);
+    c[3] = wide ? c[1] / 2 : 0;
+    for (j = 0; j < 4; j++) {
+        unsigned next;
+        if (c[j] < 4 || c[j] > k || !path_text(v + i, c[j], wide, out, cap) || !named_file(out, wcslen(out))) continue;
+        next = c[j] == k ? 0 : (wide ? *(const uint16_t *)(v + i + c[j] * st) : v[i + c[j]]);
+        if (iswalpha((wint_t)next) && next < 128) continue;
+        if (content_file(out, wcslen(out))) return c[j];
+        out[0] = 0;
+        return 0;
     }
-    while (k > 4 && !audio_ext(out, wcslen(out))) {         // the string may run on into other data
-        out[--k] = 0;
-        if (!wide) { out[0] = 0; return 0; }
-    }
-    return is_abs_path(out) && audio_ext(out, wcslen(out)) ? k : 0;
+    if (i + k * st >= n || (wide ? *(const uint16_t *)(v + i + k * st) : v[i + k * st]) < 32)
+        if (path_text(v + i, k, wide, out, cap) && content_file(out, wcslen(out))) return k;
+    for (len = k; len > 4; len--)
+        if (path_text(v + i, len, wide, out, cap) && content_file(out, wcslen(out)) &&
+            (audio_ext(out, wcslen(out)) || (expand_path(out, full, SAMPLE_PATH_MAX) && file_exists_w(full)))) return len;
+    out[0] = 0;
+    return 0;
 }
 static int raw_starts(const unsigned char *v, size_t i, size_t n, int wide) {
-    size_t st = wide ? 2 : 1;
-    unsigned c0, c1, c2;
+    static const char UD[] = "%flstudiouserdata%";
+    size_t st = wide ? 2 : 1, j;
+    unsigned c[3];
     if (i + 3 * st > n) return 0;
-    c0 = wide ? *(const uint16_t *)(v + i) : v[i];
-    c1 = wide ? *(const uint16_t *)(v + i + st) : v[i + st];
-    c2 = wide ? *(const uint16_t *)(v + i + 2 * st) : v[i + 2 * st];
+    for (j = 0; j < 3; j++) c[j] = wide ? *(const uint16_t *)(v + i + j * st) : v[i + j * st];
     if (wide && (v[i + 1] || v[i + 3])) return 0;
-    return ((c0 | 0x20) >= 'a' && (c0 | 0x20) <= 'z' && c1 == ':' && c2 == '\\') || (c0 == '\\' && c1 == '\\');
+    if (((c[0] | 0x20) >= 'a' && (c[0] | 0x20) <= 'z' && c[1] == ':' && (c[2] == '\\' || c[2] == '/')) || (c[0] == '\\' && c[1] == '\\'))
+        return 1;
+    if (c[0] != '%' || i + (sizeof(UD) - 1) * st > n) return 0;
+    for (j = 0; j < sizeof(UD) - 1; j++)
+        if (((wide ? *(const uint16_t *)(v + i + j * st) : v[i + j * st]) | 0x20) != (unsigned)UD[j]) return 0;
+    return 1;
 }
 static void raw_collect(const unsigned char *v, size_t n, PathList *L) {
     wchar_t w[SAMPLE_PATH_MAX];
@@ -6436,32 +6588,71 @@ static int alias_in(const wchar_t *dir, const wchar_t *to, size_t len, wchar_t *
     }
     return 1;
 }
-// Same-length replacement of plain paths in plugin data (in place). Caller holds g_sampleLock.
-static int raw_rewrite(unsigned char *v, size_t n) {
-    wchar_t w[SAMPLE_PATH_MAX], al[SAMPLE_PATH_MAX];
-    size_t i, k, j;
-    int wide, changed = 0;
-    for (wide = 1; wide >= 0; wide--)
-        for (i = 0; i + 8 < n; i++) {
-            const wchar_t *to;
-            if (!raw_starts(v, i, n, wide) || (k = raw_path_at(v, i, n, wide, w, SAMPLE_PATH_MAX)) == 0) continue;
-            to = map_find(w);
-            if (to && wcslen(w) == k && alias_path(to, k, al, SAMPLE_PATH_MAX)) {
-                int ascii = 1;
-                for (j = 0; j < k; j++) ascii &= al[j] < 128;
-                if (wide) memcpy(v + i, al, k * 2);
-                else if (ascii) for (j = 0; j < k; j++) v[i + j] = (unsigned char)al[j];
-                else { logmsg("SAMPLES %S: no same-length local name, it will be missing", w); i += k - 1; continue; }
+// Plain paths in plugin data -> o: the exact strings the sender listed (g_pmap), as UTF-16LE, UTF-8 or
+// ANSI text, become a local name of the same length; one after a one-byte length (a Delphi short string,
+// SF2 Player) becomes the local file itself when no same-length name fits (only outside Image-Line's TLV
+// layout, whose lengths that would break). Caller holds g_sampleLock. 1 = changed.
+typedef struct { unsigned char *b; int n, enc; const wchar_t *from, *to; } PathPat;
+static int raw_rewrite(const unsigned char *v, size_t n, int shortOk, RewriteCtx *o) {
+    PathPat *P = (PathPat *)malloc(sizeof(PathPat) * (size_t)(g_npmap * 3 + 1));
+    int np = 0, m, enc, changed = 0;
+    size_t i = 0, done = 0;
+    for (m = 0; m < g_npmap; m++) {
+        unsigned char b[3][SAMPLE_PATH_MAX * 3];
+        int bn[3];
+        for (enc = 0; enc < 3; enc++) bn[enc] = path_bytes(g_pmap[m].from, enc, b[enc], sizeof(b[enc]));
+        if (bn[2] == bn[1] && memcmp(b[2], b[1], (size_t)bn[1]) == 0) bn[2] = 0;   // ANSI = UTF-8 (plain ASCII)
+        for (enc = 0; enc < 3; enc++) {
+            if (bn[enc] < 8) continue;
+            P[np].b = (unsigned char *)malloc((size_t)bn[enc]);
+            memcpy(P[np].b, b[enc], (size_t)bn[enc]);
+            P[np].n = bn[enc]; P[np].enc = enc; P[np].from = g_pmap[m].from; P[np].to = g_pmap[m].to;
+            np++;
+        }
+    }
+    while (i + 8 < n) {
+        PathPat *q = NULL;
+        int k;
+        if (raw_starts(v, i, n, 1) || raw_starts(v, i, n, 0))
+            for (k = 0; k < np && !q; k++)
+                if (i + P[k].n <= n && memcmp(v + i, P[k].b, P[k].n) == 0) q = &P[k];
+        if (!q) { i++; continue; }
+        {
+            unsigned char nb[SAMPLE_PATH_MAX * 3];
+            wchar_t al[SAMPLE_PATH_MAX];
+            size_t len = q->enc ? (size_t)q->n : wcslen(q->from), j;
+            int ascii = 1, tn;
+            if (alias_path(q->to, len, al, SAMPLE_PATH_MAX)) for (j = 0; j < len; j++) ascii &= q->enc == 0 || al[j] < 128;
+            else ascii = -1;
+            if (ascii == 1) {
+                rw_put(o, v + done, i - done);
+                if (q->enc) for (j = 0; j < len; j++) { unsigned char c = (unsigned char)al[j]; rw_put(o, &c, 1); }
+                else rw_put(o, al, len * 2);
                 {   // an alias of a placeholder is a placeholder too (it is a hard link: it fills in with it)
                     char ph[65];
                     uint64_t phs;
-                    if (placeholder_of(to, ph, &phs)) placeholder_add(al, ph, phs);
+                    if (placeholder_of(q->to, ph, &phs)) placeholder_add(al, ph, phs);
                 }
-                changed = 1;
-                logmsg("SAMPLES plugin data: %S -> %S", w, al);
-            } else if (to) logmsg("SAMPLES %S: no same-length local name, it will be missing", w);
-            i += k * (wide ? 2 : 1) - 1;
+                logmsg("SAMPLES plugin data: %S -> %S", q->from, al);
+            } else if (q->enc && shortOk && i > 0 && v[i - 1] == q->n && (tn = path_bytes(q->to, q->enc, nb, sizeof(nb))) > 0 && tn < 256) {
+                unsigned char lb = (unsigned char)tn;
+                rw_put(o, v + done, i - 1 - done);
+                rw_put(o, &lb, 1);
+                rw_put(o, nb, (size_t)tn);
+                logmsg("SAMPLES plugin data: %S -> %S (its length byte follows)", q->from, q->to);
+            } else {
+                logmsg("SAMPLES %S: no same-length local name, it will be missing", q->from);
+                i += (size_t)q->n;
+                continue;
+            }
+            changed = 1;
+            i += (size_t)q->n;
+            done = i;
         }
+    }
+    if (changed) rw_put(o, v + done, n - done);
+    for (m = 0; m < np; m++) free(P[m].b);
+    free(P);
     return changed;
 }
 
@@ -6471,16 +6662,18 @@ static int rewrite_cb(void *ctx, int id, const unsigned char *p, size_t n, size_
     wchar_t w[SAMPLE_PATH_MAX];
     int i;
     if (id == EV_PLUGIN_DATA && n >= 12) {
-        RewriteCtx t;
+        RewriteCtx t, r;
         int st = tlv_start(p, n), ch = 0;
         memset(&t, 0, sizeof(t));
+        memset(&r, 0, sizeof(r));
         if (st >= 0) {
             t.d = p;
             rw_put(&t, p, (size_t)st);
             tlv_rewrite(p, (size_t)st, n, 0, &t);
             ch = t.changed;
         } else rw_put(&t, p, n);
-        if (raw_rewrite(t.o, t.n)) ch = 1;
+        if (raw_rewrite(t.o, t.n, st < 0, &r)) { free(t.o); t = r; ch = 1; }
+        else free(r.o);
         if (ch) { rw_event(c, id, t.o, t.n); c->changed = 1; }
         else rw_put(c, c->d + at, end - at);
         free(t.o);

@@ -56,7 +56,7 @@ samples) is kept in sync over the internet. It works a bit like [Drawpile](https
 | Playlist markers (including time signature markers); the project's time signature | |
 | Time signatures of single patterns (pattern menu) and piano roll markers | |
 | Automation clips | |
-| Sample files used by channels, audio clips and plugins like FPC (see [Samples](#samples)) | |
+| Sample files used by channels, audio clips and plugins like FPC, and other files plugins load, such as SF2 Player's soundfont (see [Samples](#samples)) | |
 | Opening or loading a project (the leader's project is sent to everyone) | |
 | Which window everyone is working in, and where their mouse is in the piano roll and playlist (see [Who's where](#whos-where)) | |
 
@@ -80,6 +80,10 @@ one at the same moment, the leader's change wins.
 own modulation, controllers linked inside FL) happen the same way on every PC, so flim only syncs a
 change when someone is using FL (a click or key press in the last 1.5 s). Changes made with a MIDI
 controller alone aren't synced for now.
+
+**Solo is yours:** soloing a mixer track only changes what you hear. The others keep their mutes, and
+when you unsolo, your tracks get back the mutes everyone shares, including any someone changed while
+you were soloing.
 
 **Staying out of your way:** someone else's plugin changes load without opening the plugin's window,
 and they wait while you're in the middle of something (holding a mouse button, a menu or dialog of a
@@ -205,11 +209,13 @@ both when the leader's project is sent and when someone loads a new sample durin
   e.g. *"Sending them uploads 60.6 MB (63,504,132 bytes). Send them now?"*. **No** leaves those samples
   out (they will be missing for the others) and flim won't ask about them again until FL restarts.
 - Samples in FL's factory content are never sent: every FL installation has them.
-- Samples inside plugin states are found too: in FPC (and other newer Image-Line plugins that store
-  them the same way), and as plain file paths in any other plugin's state (Slicer, Serum's own samples...).
-  For the latter, the receiving copy points at a link to the downloaded file whose path has exactly the
-  length of the original (so the plugin's data stays valid): in a subfolder of the song folder when that
-  fits, else under the shorter `Documents\flim\samples\`. When the real file arrives, the plugin is loaded
+- Files inside plugin states are found too: in FPC (and other newer Image-Line plugins that store
+  them the same way), and as file paths in any other plugin's state (SF2 Player's soundfont, Slicer,
+  Serum's own samples...), whatever the file type. Programs and plugin files (`.dll`, `.vst3`, ...) are
+  never sent. For the latter, the receiving copy points at a link to the downloaded file whose path has
+  exactly the length of the original (so the plugin's data stays valid): in a subfolder of the song
+  folder when that fits, else under the shorter `Documents\flim\samples\`. If no such path fits and the
+  plugin stores the path's length (SF2 Player), it points at the downloaded file itself. When the real file arrives, the plugin is loaded
   again with the state it was sent (not the one it made of the silent placeholder, so Slicer's slices
   stay right). Plugins that compress or encrypt their state (Kontakt, ...) aren't covered.
 

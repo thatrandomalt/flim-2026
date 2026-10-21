@@ -164,7 +164,8 @@ treats 172 as a plain dword event loses alignment there and misses everything af
 `flp_walk` (engine), `flp.py` and `live_test.py` handle it.
 
 Events flim uses: 196 sample path (UTF-16), 199 version, 201 / 203 plugin name, 212 new plugin, 213
-plugin data (Image-Line TLV records, or a VST wrapper blob), 224 note channel, 233 playlist items, 237
+plugin data (Image-Line TLV records, or a VST wrapper blob), 224 note channel, 233 playlist items, 236
+mixer track flags (`u32, flags, u32`, one per track in track order: 8 enabled, `0x1000` soloed), 237
 project time (creation date + work time as two doubles).
 
 ## 4. Mixer tracks
@@ -179,6 +180,9 @@ Track 0 is Master, 1..n-2 are inserts, n-1 is "Current".
 | `+0x0c` | name (UnicodeString, `''` = "Insert N") |
 | `+0x18` | enabled (byte) |
 | `+0x19` | selected (byte); `sub_12C19C0(record)` = selected, or it is the focused track (int at `0x193FA10`) |
+| `+0x1a` | soloed (byte); `mixer.isTrackSolo` reads it |
+| `+0x1b` | solo leaves this track alone (byte; see Solo) |
+| `+0x1c` | enabled before the solo (byte; see Solo) |
 | `+0x28` | the track's own index (int) |
 | `+0x2d` | dock side byte (insert copies the neighbour's with flag 4) |
 | `+0x118`, `+0x158`, `+0x1c0` | per-track objects; each holds the track index (at `+8`, `+8`, `+0x1c`) |
@@ -247,6 +251,37 @@ identities.
 - The poll thread sends nothing while the count differs from the last known one. It also undoes a
   tick's pending changes if the identities changed during that tick, so a delete caught halfway (FL
   permutes before it shrinks the count) never leaks shifted values.
+
+### Solo
+FL solos by muting the other tracks, so flim used to send those mutes: a solo soloed for everyone.
+- `sub_127C2A0(track, mode, flags)` is the entry (`mixer.soloTrack`'s callback `sub_D5F580`). Mode 0
+  unsolo, 1 solo; 2 and 3 toggle (they decide from the current state, and add flag 4 when another
+  track is soloed already). The Python default for flags is 2.
+- `sub_127BB10(track, on, flags)` does the work, record by record (all 501). Solo sets `+0x1a` on the
+  soloed track only and saves `+0x18` into `+0x1c` (not with flag 4: the first solo's save stays).
+  Then it mutes, through `sub_12C1810(record, on)`, every track that neither feeds nor is fed by the
+  soloed one (`sub_127BAB0`), except tracks with `+0x1b`.
+- Unsolo clears `+0x1a` and enables the tracks again: from `+0x1c` only if a main-form option is on
+  (`*(*MAINFORM + 0xd98) + 0x49e`), otherwise all of them. In the test FLs, unsolo unmuted everything.
+- `SetTrackEnabled(t, 0)` (`MUTE_RVA`) clears `+0x1a` on every track unless `t` has `+0x1b`: a mute
+  click ends the solo and leaves the other tracks muted.
+- Saved projects keep it: event 236 has `0x1000` on the soloed track and the solo's mutes in bit 8.
+- FL 26.1.5 has the same offsets (its `SetTrackEnabled` reads `+0x1b` and clears `+0x1a`).
+
+How flim keeps it local (engine `solo_*`, `mute_*`):
+- While anything is soloed here, a track's synced mute is its `+0x1c`, so soloing changes nothing
+  the others see.
+- A mute that arrives meanwhile is written to `+0x1c` and heard after the unsolo. `SetTrackEnabled`
+  would end the solo and leave the other tracks muted, and those mutes would then go out.
+- When the solo ends, every track gets the mute state everyone shares back, whatever FL did (all
+  enabled, or what a mute click left).
+- FL changes the tracks one at a time around flagging the soloed one, so a poll pass can land
+  half-way. A mute change counts only once two passes in a row read it, and not for 1 s after the
+  solo state changed.
+- A project snapshot (join, re-sync, backup) has none of the leader's solo: `project_snapshot` puts
+  each track's `+0x1c` into bit 8 of event 236 and clears `0x1000`. Checked by restarting B while A
+  had a track soloed: B came in with the shared mutes and no solo.
+- Tests: `live_test.py solo`, harness `t_solo`.
 
 ## 5. Plugins: window state, loading, missing plugins
 
@@ -324,10 +359,40 @@ sample paths then point there (the project name is the `.zip`'s path) and FL del
 so the samples are gone after a crash or restart. flim's leader copies them into the song folder,
 rewrites the paths and reopens the project from there (`temp_project_rescue`).
 
-**Sample plugins and placeholders (Slicer 2).** Fruity Slicer 2 keeps its sample as a length-prefixed
-ANSI path inside IL TLV data (`[u32 len incl. NUL]` + path). Loaded with flim's silent 8 kHz placeholder,
-it fits its slices to that; its own save afterwards has lost them. So after the download flim reloads
-the state it *received* (`phload_*`), not the plugin's save of itself.
+**Files plugins load (soundfonts, wavetables, samples).** Besides FL's sample paths (event 196) and
+Image-Line TLV records, flim looks for file paths anywhere in plugin data (event 213), because each
+plugin stores them its own way:
+- SF2 Player keeps its soundfont as a Delphi short string: a length byte, the path with no end mark,
+  then `0xFF` filler. Factory soundfonts are `%FLStudioFactoryData%\...`. The old scan read the
+  filler as part of the path and dropped it, so a soundfont loaded during a session never went out.
+- FL's VST wrapper names the plugin's binary in a record `[u32 id][u64 len][path]`, followed by the
+  next record's id (a digit: `...\OTT.vst3` then `8`).
+- Fruity Slicer 2: `[u32 len incl. NUL]` + ANSI path.
+- VSTs write UTF-16 or UTF-8, with `\` or `/`.
+
+The sender (`raw_collect`) takes a path that starts at a drive (`X:\`, `X:/`), a UNC `\\` or
+`%FLStudioUserData%`, in UTF-16LE or 8-bit (UTF-8, else ANSI). Its end comes from a length right
+before it (u64, u32 or byte as above, if the next character isn't a letter), else from a terminator,
+else from the longest prefix that is an existing file. It must name a file (`\name.ext`) that isn't a
+program or system file (`.exe`, `.dll`, `.vst3`, ..., anything under `Windows\`): those are installed,
+not sent. The receiver (`raw_rewrite`) replaces each path it has a download for as an exact string in
+all three encodings: with a same-length alias of the local file, or, in a short string, with the
+local path and a new length byte. Tests: harness `t_samples`, `live_test.py sf2` (B downloads a
+soundfont A's SF2 Player loads).
+
+**Sample plugins and placeholders (Slicer 2).** Loaded with flim's silent 8 kHz placeholder, Fruity
+Slicer 2 fits its slices to that; its own save afterwards has lost them. So after the download flim
+reloads the state it *received* (`phload_*`), not the plugin's save of itself.
+
+**Someone else's edits are not ours to send back (the Fruity Delay 3 lock).** Applying another
+person's param changes moves the plugin's saved state. flim's state checks (the sweep, one unit every
+`SWEEP_MS` while someone uses this FL, and the check after working in a plugin window) compared it
+with the baseline from before and took the difference for a local change. A tester busy elsewhere in
+FL then sent the whole state back under the plugin lock, and the editor's next moves snapped back;
+while the editor held the lock, the tester's FL reloaded the old agreed state every couple of seconds
+instead, undoing the edits there. Now each param applied from someone else delays that unit's checks
+until a new baseline (`REBASE_MS` after the last one), and params a plugin moves along with it
+(`SUPPRESS_MS`) aren't local edits. `live_test.py fd3_lock` failed both ways before.
 
 **Reading plugin params during a load deadlocks.** With flim's poll thread calling `ProcessRECEvent`
 (get) on Fruity Slicer 2's params while the main thread was inside `LoadPresetFile` on it, the *next*
@@ -371,8 +436,9 @@ The poll thread now skips while `FLLOADS_VA` > 0 or a project load runs.
   pattern ops.
 - `live_test.py` makes a change in one FL through FL's own functions and checks the other. It covers
   params, mixer names/mute/routes/colors, notes, patterns and pattern ops, markers, time signatures,
-  channels (add, rename, reorder, delete, with a sample), clips, VST state, and mixer insert, delete,
-  append and move. Run it after every port.
+  channels (add, rename, reorder, delete, with a sample), clips, VST state, an SF2 Player soundfont,
+  mixer insert, delete, append and move, solo staying local, and a plugin someone else is editing
+  (51 checks). Run it after every port.
 - The engine writes `%TEMP%\flim_crash_<pid>.dmp` on the first jump into unloaded code (on by default,
   `FLIM_CRASHDUMP=0` turns it off); flim.exe puts it into the crash report, and saves a hang report
   (a small dump of FL) after 20 s without an answer (`hang_watch`; `IsHungAppWindow` doesn't notice a
