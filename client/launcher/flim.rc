@@ -1,0 +1,96 @@
+#include <windows.h>
+#include "../common/flim_res.h"
+#include "../common/flim_version.h"
+// flim.exe icon (the bean, built by gen_icon.py). FL's own exe is untouched.
+IDI_FLIM ICON "flim.ico"
+1 ICON "flim.ico"
+
+IDD_SETUP DIALOGEX 0, 0, 300, 150
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "flim setup"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Where is FL Studio 2026 installed? (the folder that contains FL64.exe)", -1, 10, 10, 280, 10
+    EDITTEXT        IDC_FLDIR, 10, 23, 224, 14, ES_AUTOHSCROLL
+    PUSHBUTTON      "Browse...", IDC_BROWSE, 240, 23, 50, 14
+    LTEXT           "", IDC_FLINFO, 10, 40, 280, 10
+    LTEXT           "Your name (what other people in the session see):", -1, 10, 60, 280, 10
+    EDITTEXT        IDC_NAME, 10, 73, 140, 14, ES_AUTOHSCROLL
+    LTEXT           "Letters, digits, spaces, - _ .\nUp to 24 characters.", -1, 156, 72, 134, 20
+    LTEXT           "You can change these later in flim's window.", -1, 10, 104, 280, 10
+    DEFPUSHBUTTON   "OK", IDOK, 184, 126, 56, 16
+    PUSHBUTTON      "Cancel", IDCANCEL, 244, 126, 46, 16
+END
+
+IDD_MAIN DIALOGEX 0, 0, 560, 300
+STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "flim"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Your name:", -1, 10, 11, 42, 10
+    EDITTEXT        IDC_M_NAME, 54, 9, 110, 13, ES_AUTOHSCROLL
+    LTEXT           "Song name:", -1, 172, 11, 40, 10
+    EDITTEXT        IDC_M_SONG, 214, 9, 118, 13, ES_AUTOHSCROLL
+    LTEXT           "", IDC_M_FLINFO, 10, 27, 262, 10, SS_ENDELLIPSIS
+    PUSHBUTTON      "FL folder...", IDC_M_CHANGEFL, 278, 24, 54, 14
+
+    GROUPBOX        "Join a session", -1, 6, 43, 328, 62
+    LTEXT           "Server address (from whoever hosts, e.g. ws://203.0.113.7:8080):", -1, 14, 54, 312, 10
+    EDITTEXT        IDC_J_URL, 14, 65, 312, 13, ES_AUTOHSCROLL
+    LTEXT           "Password:", -1, 14, 86, 38, 10
+    EDITTEXT        IDC_J_PW, 54, 84, 110, 13, ES_AUTOHSCROLL | ES_PASSWORD
+    AUTOCHECKBOX    "Remember", IDC_J_REMEMBER, 172, 86, 60, 10
+    DEFPUSHBUTTON   "Join", IDC_J_JOIN, 270, 83, 56, 15
+
+    GROUPBOX        "Host a session on this PC (nothing else to install)", -1, 6, 111, 328, 160
+    LTEXT           "Port:", -1, 14, 125, 20, 10
+    EDITTEXT        IDC_H_PORT, 36, 123, 34, 13, ES_NUMBER
+    LTEXT           "Password:", -1, 80, 125, 36, 10
+    EDITTEXT        IDC_H_PW, 118, 123, 110, 13, ES_AUTOHSCROLL | ES_PASSWORD
+    PUSHBUTTON      "Start hosting", IDC_H_START, 270, 122, 56, 15
+    AUTOCHECKBOX    "Open the port on my router automatically (UPnP), so people outside my network can join", IDC_H_UPNP, 14, 141, 312, 10
+    AUTOCHECKBOX    "Also open FL on this PC and join", IDC_H_ALSOFL, 14, 154, 312, 10
+    LTEXT           "Not hosting.", IDC_H_STATUS, 14, 169, 312, 36
+    LTEXT           "Address to give the others:", -1, 14, 209, 120, 10
+    EDITTEXT        IDC_H_SHARE, 14, 220, 256, 13, ES_AUTOHSCROLL | ES_READONLY
+    PUSHBUTTON      "Copy", IDC_H_COPY, 274, 219, 52, 15
+    LTEXT           "", IDC_H_PEOPLE, 14, 239, 312, 26
+
+    GROUPBOX        "Session", -1, 340, 6, 214, 265
+    LTEXT           "FL isn't running.", IDC_S_STATUS, 348, 18, 198, 50
+    LISTBOX         IDC_S_LOG, 348, 72, 198, 174, LBS_NOINTEGRALHEIGHT | LBS_NOSEL | WS_VSCROLL | WS_HSCROLL | WS_BORDER
+    LTEXT           "Keep a plugin I change locked to me for", -1, 348, 253, 128, 10
+    EDITTEXT        IDC_S_LOCK, 478, 251, 20, 13, ES_NUMBER
+    LTEXT           "s (1-10)", -1, 502, 253, 44, 10
+
+    PUSHBUTTON      "Open FL without connecting", IDC_M_OPENFL, 6, 279, 110, 14
+    AUTOCHECKBOX    "Back up the project every", IDC_M_BACKUP, 124, 281, 94, 10
+    EDITTEXT        IDC_M_BACKUPMIN, 219, 279, 22, 13, ES_NUMBER
+    LTEXT           "min", -1, 244, 281, 14, 10
+    PUSHBUTTON      "Projects folder", IDC_M_PROJECTS, 262, 279, 62, 14
+    PUSHBUTTON      "Change...", IDC_M_PROJDIR, 326, 279, 40, 14
+    PUSHBUTTON      "Crash reports", IDC_M_CRASHES, 370, 279, 58, 14
+    PUSHBUTTON      "Close", IDCANCEL, 500, 279, 54, 14
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     FLIM_VER_Y, FLIM_VER_M, FLIM_VER_D, 0
+PRODUCTVERSION  FLIM_VER_Y, FLIM_VER_M, FLIM_VER_D, 0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "ProductName",     "flim"
+            VALUE "FileDescription", "flim"
+            VALUE "FileVersion",     FLIM_VERSION
+            VALUE "ProductVersion",  FLIM_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

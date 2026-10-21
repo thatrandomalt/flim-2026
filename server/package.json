@@ -1,0 +1,21 @@
+{
+  "name": "flim-server",
+  "version": "0.1.0",
+  "private": true,
+  "description": "flim authority/relay server: WebSocket op-ordering + lock arbitration for multiplayer FL Studio",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts"
+  },
+  "dependencies": {
+    "ws": "8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.14.9",
+    "@types/ws": "8.5.10",
+    "tsx": "4.16.2",
+    "typescript": "5.5.3"
+  }
+}

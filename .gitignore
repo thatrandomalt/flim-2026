@@ -1,0 +1,38 @@
+# build output (MSVC)
+client/out/
+*.obj
+*.res
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+# server
+server/node_modules/
+server/dist/
+# logs / FL projects, samples and crash dumps never belong here
+*.log
+*.flp
+*.fst
+*.bak
+*.dmp
+*.zip
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.aif
+*.aiff
+*.wv
+Test FLP/
+# dev tools: reverse-engineering notes and test suites stay local
+client/dev/
+__pycache__/
+*.pyc
+# editors / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
