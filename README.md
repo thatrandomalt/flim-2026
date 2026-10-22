@@ -76,7 +76,10 @@ me for … s* in flim's window): it is how long a plugin you're working on stays
 Names, colors, routing, markers and the time signature have no locks; if two people change the same
 one at the same moment, the leader's change wins. If the channel lists ever end up different anyway (say,
 two people add or delete channels at the very same moment), flim notices and reloads the leader's
-project for everyone instead of letting edits land on the wrong channels.
+project for everyone instead of letting edits land on the wrong channels. As a safety net, whenever
+nobody has changed anything for a few seconds, each FL compares a fingerprint of the song (names,
+routing, notes, clips, automation links, mixer levels) with the leader's. One that differs twice in a
+row reloads the leader's project, at most every 2 minutes.
 
 **What isn't an edit:** values that move by themselves (automation playing back, a Patcher preset's
 own modulation, controllers linked inside FL) happen the same way on every PC, so flim only syncs a

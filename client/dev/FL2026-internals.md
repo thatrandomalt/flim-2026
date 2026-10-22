@@ -344,15 +344,29 @@ How flim keeps it local (engine `solo_*`, `mute_*`):
 each person's own view:
 - in the plugin record (event 212, 52 bytes): flags at `+16`, bit 0 = editor open; editor x / y at
   `+36` / `+40` (verified by opening, closing and moving a Sampler and an OTT editor and diffing the
-  saves);
+  saves); its width / height at `+44` / `+48` (Fruity Parametric EQ 2 700x350, Fruity Compressor 500x105,
+  a Sampler 0x0). FL corrects the size when the editor first opens after a load: kHs Gate's 236x458
+  became 235x457 and stayed so after closing;
 - for a VST (event 201 = `Fruity Wrapper`): the wrapper data (event 213) is a 4-byte header and
   `[u32 id][u64 len][data]` records. Record 2's bytes 1..8 are the editor size (two int32: 567x805
   while open, 160x25 after closing). Everything from the `XTSV` marker on is the plugin's own state.
 
-flim's `state_hash` ignores those bytes (opening or moving an editor is not an edit), and `do_load`
-copies our own window bytes into a received state before loading it (someone else's load never opens,
-closes or moves our windows). Before this, opening an editor sent the whole state and took the plugin
-lock.
+flim's `state_hash` ignores those bytes (opening, moving or resizing an editor is not an edit), and
+`do_load` copies our own window bytes into a received state before loading it (someone else's load
+never opens, closes, moves or resizes our windows). Before this, opening an editor sent the whole state
+and took the plugin lock.
+
+**Zip entry times inside saved states.** Some plugins keep their state as a zip archive: Kilohearts'
+(kHs Gate, kHs Compactor) is one `state.json` entry, deflated, with a data descriptor, inside FL's VST
+wrapper record 53. Every entry carries its save time, DOS time + date in 2 s steps, in its local header
+(`PK\3\4` `+10`) and in its central directory record (`PK\1\2` `+12`), so two saves differ as soon as the
+clock moves on. `state_hash` clears those 4 bytes (`zip_times_clear`) in each archive in plugin data
+(event 213) whose end record (`PK\5\6`) checks out: the directory ends right at the end record and holds
+exactly the entries it counts, and each entry's offset (counted from the archive's own start, wherever
+it sits in the data) lands on a local header with the same name. Bytes that only look like an archive
+are hashed as they are. Only the hash's copy is cleared: loads and sends keep the real times. Not
+covered: times in zip extra fields (`0x5455`, NTFS `0x000a`), which the kHs archives don't have. Tests:
+harness `t_groups`, `live_test.py drift`.
 
 **Loads and FL's progress bar** (the "access violation reading FFFFFFFFFFFFFFFF" crash a member hit
 when a sample finished downloading). `LoadPresetFile` reads the `.fst` through a stream whose refill
@@ -489,11 +503,57 @@ instead, undoing the edits there. Now each param applied from someone else delay
 until a new baseline (`REBASE_MS` after the last one), and params a plugin moves along with it
 (`SUPPRESS_MS`) aren't local edits. `live_test.py fd3_lock` failed both ways before.
 
+**Only a plugin someone worked in here goes out (the drift ping-pong).** Some plugins never save the
+same bytes twice: Kilohearts' (kHs Gate, kHs Compactor) state is a zip whose entries carry the save
+time (DOS time and date, 2 s steps: local header `+10`, central directory `+12`), and automation moves
+others. flim's state checks (the sweep, the check after working in a plugin window, the one after a
+preset-sized burst) used to send any difference if there had been input anywhere in FL since the
+unit's baseline. Two people busy elsewhere, or `live_test.py`'s fake user, then sent such a plugin back
+and forth on every sweep pass (about every 16 s), and each apply reloads it: an audio glitch each time.
+Now:
+- A state goes out only if someone here worked in that plugin since its baseline or the last state
+  loaded into it (`unit_touched`: `Unit.userAt` later than `baseAt`): its params moved with local input
+  (the poll thread's activity pass), input went into its plugin window (`plugin_input` ->
+  `plugfocus_poll` -> `do_plugfocus`), a preset was loaded into it (`loadpreset_detour`; FL's browser drop
+  onto a channel calls `LoadPresetFile` too), or its automation links changed
+  here (`links_scan`). Any other difference is drift and isn't sent. Not seen: a file dropped on Patcher with
+  Shift held (`sub_FEDD90` hands it to the plugin with `FPD_LoadFile`, no `LoadPresetFile`).
+- The sweep skips plugins nobody worked in: a look would take the drift as the baseline, and with it an
+  edit whose plugin-window check hasn't run yet. A check that sends nothing leaves `baseAt` alone, so a
+  change the plugin makes a moment later (a file it loads in the background) still goes out with the
+  sweep. A sent state, a silent baseline (plain knob tweaks, someone else's applies, moves) or a loaded
+  state ends the work.
+- Work in a plugin window means input whose own window is inside that `TPluginForm` (the message
+  hook's `plugin_input`). It used to be the last clicked window (`g_focusHwnd`), so after one click in
+  an editor every key-up or wheel turn anywhere counted as work in it: kHs Gate went out 20 times in a
+  minute with the fake user typing. A click is checked once, `PLUGFOCUS_IDLE_MS` after the work stops
+  (or every `PLUGFOCUS_LONG_MS` while it goes on); it used to be checked at once and again after.
+- Working in a kHs plugin's window used to send it at each check (and the other FL reloaded it: a
+  glitch): the hash couldn't tell its zip times from an edit, and the first open of its editor after a
+  load moved its size in the plugin record by a pixel. Both are left out now ("Window state" and "Zip
+  entry times" above): a click in kHs Gate's window gets it checked (the `PLUGFOCUS` log line) and sends
+  nothing. Its saves after a load, 10 s and 40 s later, with the editor first opened, clicked and closed
+  all hash the same (all six differed before).
+- Still sent: working in a plugin that drifts some other way sends it at each check. Input into a
+  bridged plugin's editor (another process) never reaches the hook: its param changes count
+  (`input_recent`), but a change that moves no param only goes out with the next work in that plugin here.
+- Live, light test project, 2 minutes with the fake user and nobody in a plugin: 8 states sent and 3
+  reloads before (lock reverts; the rest arrived in the same 2 s and matched), none now. Test:
+  `live_test.py drift`.
+
 **Reading plugin params during a load deadlocks.** With flim's poll thread calling `ProcessRECEvent`
 (get) on Fruity Slicer 2's params while the main thread was inside `LoadPresetFile` on it, the *next*
 load of Slicer 2 hung for good: main thread in `sub_F46490` (`0xf4c58f`) -> Slicer 2 -> its
 `engine_x64.dll` waiting, no other thread in its code (plain FL, and flim without a session, never hung).
 The poll thread now skips while `FLLOADS_VA` > 0 or a project load runs.
+- FL lowers that count only on the loader's normal way out (`sub_F51FD0`: `++` at `0xf520e1`, `--` at
+  `0xf53f4b`), and not every way out passes the decrement. Seen live: `LoadPresetFile` given a `.wav`
+  (probe call, mask 32, a channel) left it raised, one per call, and flim then held everything on that FL
+  ("FL is loading something") for good. FL's browser drop onto a channel (`sub_FEDD90`) calls
+  `LoadPresetFile(file, 32, channel, flags)` with the dropped file first (`0xfedf99`), so a sample drop may
+  hit the same exit; not reproduced with a real drag. `loadpreset_call` (around flim's own calls and inside
+  `loadpreset_detour`) puts back whatever a call leaves above where it started: the call is synchronous, so
+  that is a leak. `live_test.py sample_drop` checks the count after loading another sample into a Sampler.
 
 **The channel list.** flim knows channels only by their object's address: a channel has no ID (the
 only per-channel counter-like field is its index at `+0x794`). It used to sync only channels added at
@@ -546,10 +606,63 @@ the structure op:
 - The poll thread doesn't re-read values while a structure change is pending or after it; what bumps
   `g_structGen` without a map (a project load, an order FL didn't follow) re-reads itself (`slots_reread`).
 - Not covered: pattern ops still re-take note, clip and pattern baselines, and two people changing
-  structure in the same instant can still send an edit by an old number (`stress`, phase "both", fails
-  about one check in three runs). After the whole suite, pattern 7's clips on playlist track 9 once ended
-  864 vs 288 ticks long (B's FL resized them back after each apply); not reproduced with the pattern tests
-  plus `stress` alone.
+  structure in the same instant can still send an edit by an old number (the safety net below reloads
+  the member then).
+- **A pattern's length is cached** in its record: `+0x48` / `+0x4c` / `+0x50` (length in ticks), `+0x54`,
+  `+0x5c` (60 when empty). `UpdatePatternLength(p, flag)` (`PATLENUPD`, `sub_12D17A0`) works them out from
+  the notes and markers. Its last step, `sub_E4B5F0(playlist, p, old, new)`, resizes the pattern's
+  playlist clips whose length was the old one; `flag` only redraws the editors when `p` is the current
+  pattern. FL runs it after its own note edits (`PatternLengthChanged` passes 1), but not after notes
+  added through the array's vmt, which is what flim's apply does. The receiver's cache stayed stale and
+  later cut the writer's longer clips back: the two fought over them (`LOCK clips:... local change
+  reverted`). `notes_apply` now ends with it (`pat_len_recalc`). Test: `live_test.py
+  pattern_length_notes` (2 checks; the length check failed on the old engine). `stress`'s note op now
+  runs it too, as FL's editing would.
+- Still open: in a long run (the whole suite, then `stress`), A's clips can end up longer than the
+  pattern after a channel delete took the pattern's notes. FL on A shrinks the pattern but not its
+  clips, while B's FL and any project load size them to the pattern. No op carries that, and a reload
+  doesn't fix it (the safety net stops reloading for it; see below).
+
+### The desync safety net
+Whatever still slips through mustn't stay. Examples: two people changing structure in the same instant, an
+op lost to a crash or a dropped connection, a value FL moved by itself on one side only. So the leader
+fingerprints the song (`digest_take`) and sends it (`digest` op) every `DIGEST_NET_MS` (15 s), but only
+while nothing is in flight: no song op sent or received for `QUIET_MS` (5 s), its queue empty, no project
+loading. A member that is quiet too compares the fingerprint with its own, part by part. If a part differs
+on two checks in a row, it loads the leader's project (`resync`), at most once per `DESYNC_MIN_MS` (2 min).
+- **The parts:**
+  - names and colors of channels, mixer tracks, patterns (with lengths) and playlist tracks;
+  - markers, time signature, pattern markers;
+  - routes by track number;
+  - notes and the current arrangement's clips (their saved first 0x20 bytes), in any order, selection
+    masked;
+  - automation links;
+  - mixer track volume and pan, unless automated.
+- **Left out:** each person's own state: solo and mutes, selections, windows, main volume, plugin states
+  (they drift).
+- **The valve:** a part that still differs on the first check after such a reload is one FL itself makes
+  different (it normalizes some things on load). The member stops reloading for it until it matches
+  again, and logs `DESYNC <part> still differ after loading the leader's project: a reload doesn't fix
+  that`. Without the valve the clip case above reloaded every 2 minutes.
+- Input doesn't block a check: an edit still settling makes one mismatch, and a reload needs two.
+- **Live:**
+  - B's mixer volume moved with no input there (taken for automation, so not sent): two mismatches,
+    then a reload, then equal again, 40 s in all.
+  - In the full suite it fixed mixer volumes and automation links after `stress`'s "both" phase; its
+    clips stayed different (the valve).
+  - No false reloads when idle.
+- `t_clip` writes clip records FL doesn't make itself (item `0x5001`); after a reload B has FL's form of
+  them. That's the valve's case too.
+- Notes and the bulk guard: a channel insert / delete renumbers the notes of every later channel in every
+  pattern, and the note scanner (which keeps plain hashes, not records) sees all of those patterns change
+  at once. `NOTES_BULK` (8 patterns = a project load) used to re-baseline them all, and a note edited in
+  the same scan was never sent (3 of 3 lost with a delete and a note at once, HEAD included; `stress`
+  phase "A alone" notes whenever `chan_race` ended in a real race, which changes the seeded op sequence).
+  Now nothing settles while FL's channel list differs from flim's (`chan_list_changed`, as for clips),
+  a pattern that equals its renumbered base as sets (`pat_matches_base`: `group_diff` against
+  `unit_base`) only changed number and is taken as known, and only the rest count toward `NOTES_BULK`.
+  `do_notesnap` waits too if a structure change is pending: a check queued just before one would send
+  renumbered notes ahead of the chan op.
 - `main_busy` holds plugin-touching tasks while a mouse button is down only when FL is the foreground
   app: the global button state held flim's queue for as long as someone dragged anything in any program.
 
@@ -648,7 +761,7 @@ target REC id, `+0x14` flags (8 internal, 4 MIDI, 2 smoothing), `+0x18` smoothin
   mixer insert, delete, append and move, routes across moves, solo staying local, quick mutes, a plugin
   someone else is editing, channels inserted mid-list, quickly and by both at once, the main volume
   staying local, the shared folder, notes into new patterns while the other FL plays, automation
-  clips and their links, an effect moved inside its track, and a soloed song (116 checks, 18 of them the quick-change stress test; the last
+  clips and their links, an effect moved inside its track, a drifting plugin staying put, another sample loaded into a Sampler, a pattern made longer by someone else's notes, and a soloed song (123 checks, 18 of them the quick-change stress test; the last
   test opens a song). Run it after every port.
 - The engine writes `%TEMP%\flim_crash_<pid>.dmp` on the first jump into unloaded code (on by default,
   `FLIM_CRASHDUMP=0` turns it off); flim.exe puts it into the crash report, and saves a hang report

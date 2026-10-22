@@ -49,9 +49,17 @@ static int file_version(const wchar_t *file, WORD v[4]) {
 enum { GUI_STATUS = 1, GUI_LOG, GUI_CONNECT, GUI_DISCONNECT, GUI_HELLO, GUI_SETTINGS, GUI_ALERT };
 enum { NET_OFF, NET_CONNECTING, NET_ON, NET_ERR };   // the connection state in GUI_STATUS
 
+// %APPDATA%: from the environment first. The engine reads its settings while FL starts up, and
+// asking the shell for the same folder from a second thread then crashed FL under Wine (FL's own
+// SHGetPathFromIDListW for CSIDL_APPDATA faulted inside Wine's shell32).
+static int flim_appdata(wchar_t *out, int cap) {
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", out, cap);
+    if (n && n < (DWORD)cap) return 1;
+    return SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, out));
+}
 static int flimcfg_path(wchar_t *out, int cap) {
     wchar_t dir[MAX_PATH];
-    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, dir))) return 0;
+    if (!flim_appdata(dir, MAX_PATH)) return 0;
     swprintf_s(out, cap, L"%s\\flim", dir);
     CreateDirectoryW(out, NULL);
     wcscat_s(out, cap, L"\\flim.ini");

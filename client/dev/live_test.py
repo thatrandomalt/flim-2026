@@ -56,8 +56,8 @@ def make_wav(path, hz):
     open(path, 'wb').write(b'RIFF' + struct.pack('<I', 36 + len(data)) + b'WAVEfmt ' +
                            struct.pack('<IHHIIHH', 16, 1, 1, 44100, 88200, 2, 16) + b'data' + struct.pack('<I', len(data)) + data)
 
-def fst_with_sample(src, dst, wav):
-    # the .fst again with a sample path event (196) after the plugin name (203).
+def fst_with_sample(src, dst, wav, replace=False):
+    # the .fst again with a sample path event (196) after the plugin name (203); replace: instead of its own 196.
     # FL 2026: byte 172 escapes a 32-bit id, sized by its top bits when >= 0x100 (see flp.py)
     d = open(src, 'rb').read()
     j = d.find(b'FLdt'); p = j + 8; out = bytearray(d[:j + 8])
@@ -78,8 +78,9 @@ def fst_with_sample(src, dst, wav):
             while True:
                 x = d[q]; q += 1; n |= (x & 0x7f) << sh; sh += 7
                 if x < 128: break
-        out += d[p:q + n]
-        if e == 203: out += bytes([196]) + varint(len(path)) + path
+        if replace and e == 196: out += bytes([196]) + varint(len(path)) + path
+        else: out += d[p:q + n]
+        if e == 203 and not replace: out += bytes([196]) + varint(len(path)) + path
         p = q + n
     out[j + 4:j + 8] = struct.pack('<I', len(out) - j - 8)
     open(dst, 'wb').write(out)
@@ -229,6 +230,30 @@ def t_sample():
     a.call(0xf54760, a.mkstr(dst), 32, chans(a)[-1], 0)
     check('channel with sample added', lambda: len(chans(a)), lambda: len(chans(b)), wait=10)
 
+# Another sample into an existing Sampler, through FL's loader (its own state with another sample path, loaded with
+# LoadPresetFile, which FL's browser drop onto a channel calls too). No knob moves and no plugin window gets
+# input: the preset-load detour is what makes it work in that channel. (A raw .wav handed to LoadPresetFile
+# from here returns 2 and loads nothing; the drop's other calls weren't reproduced.)
+def wav_in(p, i, tag):                                          # the .wav p's channel i plays (its bytes)
+    s = chan_state_bytes(p, i, tag)
+    for k in (0, 1):
+        m = re.search(r'[A-Za-z]:\\[^\x00-\x1f]*?\.wav', s[k:].decode('utf-16le', 'replace'))
+        if m and os.path.exists(m.group()): return open(m.group(), 'rb').read()
+def t_sample_drop():
+    wav = os.path.join(TMP, 'flim live drop.wav')
+    make_wav(wav, 600 + time.time() % 100)                      # new content each run: B downloads it
+    i = next((i for i in range(len(chans(a))) if wav_in(a, i, 'a') is not None), None)   # a Sampler playing a .wav
+    if i is None: print('   (no channel plays a .wav: skipped)'); return
+    want, ch = open(wav, 'rb').read(), chans(a)[i]
+    src, dst = (os.path.join(TMP, n) for n in ('flim_live_sampler.fst', 'flim_live_sampler2.fst'))
+    a.call(V(a, 'SAVEPRESET'), a.mkstr(src), 32, ch, 1)
+    fst_with_sample(src, dst, wav, replace=True)
+    a.call(V(a, 'LOADPRESET'), a.mkstr(dst), 32, ch, 1)
+    check('another sample into a Sampler', lambda: (wav_in(a, i, 'a') == want, True), lambda: (True, wav_in(b, i, 'b') == want), wait=15)
+    # LoadPresetFile can leave FL's running-loads count (FLLOADS) raised; flim, which waits while FL loads, then
+    # held everything on that FL for good
+    check('...FL\'s load count back to 0', lambda: a.d(a.g(0x15e3908)), lambda: 0)
+
 # Any file a plugin loads travels: an SF2 Player with a soundfont from a user folder (B must download it:
 # restart_test.ps1 -NoLocalB). Its path is a Delphi short string in the plugin data (length byte, no end).
 SF2_FST = os.path.join(fl_dir(), r'Data\Patches\Plugin database\Generators\Misc\SoundFont Player.fst')
@@ -285,6 +310,36 @@ def t_sf2():
         want = open(sf2, 'rb').read()
         check('SF2 soundfont %s arrives' % 'AB'[k], lambda: (len(chans(a)), True),
               lambda: (len(chans(b)), sf2_in(b, -1, 'b')[1] == want), wait=20)
+
+# kHs plugins keep their state as a zip stamped with the save time: no two saves are the same. Each sweep
+# pass sent such a plugin from whichever FL had any input (each apply reloads it: a glitch), and after one
+# click in its window, every key elsewhere counted as work in it (sent every 3 s). Its entry times aren't
+# a change any more (state_hash), so a click in its window gets it checked and sends nothing.
+def t_drift():
+    import ctypes
+    def state(t, s):
+        path = os.path.join(TMP, 'flim_live_drift.fst')
+        if os.path.exists(path): os.remove(path)
+        a.call(V(a, 'SAVEPRESET'), a.mkstr(path), 48, fx_slot(a, t, s), 1)
+        return open(path, 'rb').read() if os.path.exists(path) else b''
+    def sent(pos): return [l.split(' unit=')[1].split(' (')[0] for l in log_since(pos, A) + log_since(pos, B) if 'sent plug.state' in l]
+    def checked(pos): return [l.split(' is ')[1].split(' (')[0] for l in log_since(pos, A) if 'PLUGFOCUS: window' in l and ' is ' in l]
+    def title(k): w = ctypes.create_unicode_buffer(200); ctypes.windll.user32.GetWindowTextW(k, w, 200); return w.value
+    time.sleep(5); pos = os.path.getsize(LOG)
+    time.sleep(35)                                              # a sweep pass, the fake user busy in both
+    check('drift: nothing sent with nobody in a plugin', lambda: sent(pos), lambda: [], wait=0)
+    gate = next(((t, s) for t in range(mix_count(a)) for s in range(10) if has_plug(a, t, s) and b'kHs Gate' in state(t, s)), None)
+    if not gate: print('   (no kHs Gate in the project: its window part skipped)'); return
+    t, s = gate; slot = fx_slot(a, t, s); show = va(a, a.q(a.q(slot) + 0xE0))   # holder->vmt[0xE0](holder, show)
+    a.call(show, slot, 1); time.sleep(1.5)
+    win = [k for p, h, c, ti in fl.windows((A,)) for k, cc in [(h, c)] + fl.children(h)
+           if cc == 'TPluginForm' and title(k).startswith('kHs Gate') and '(Insert %d)' % t in title(k)]
+    if not win: print('   (kHs Gate\'s window not found: its window part skipped)'); return
+    pos = os.path.getsize(LOG); fl.post_click(win[0]); time.sleep(6)
+    check('drift: a click in its window checks it, sends nothing', lambda: (checked(pos), sent(pos)), lambda: (['fx %d/%d' % gate], []), wait=0)
+    pos = os.path.getsize(LOG); time.sleep(12)
+    check('drift: keys elsewhere afterwards don\'t', lambda: sent(pos), lambda: [], wait=0)
+    a.call(show, slot, 0)
 
 def routes(p, t):                                               # where track t sends (+0x394: {int level, byte on} per track)
     n = mix_count(p); r = p.r(mix_rec(p, t) + 0x394, n * 8)
@@ -519,6 +574,24 @@ def responds(pid, ms=3000):                                     # FL's main thre
             return bool(ctypes.windll.user32.SendMessageTimeoutW(w[1], 0, 0, 0, 2, ms, ctypes.byref(r)))   # WM_NULL, SMTO_ABORTIFHUNG
     return False
 def unsel(recs): return [r[:0x13] + bytes([r[0x13] & 0x7f]) + r[0x14:] for r in recs]   # selection is each person's own
+PATLENUPD = 0x12d17a0                                           # UpdatePatternLength(p, 1): FL's own after a note edit
+# A pattern's length is cached in its record (+0x48...) and sizes its playlist clips. Notes applied from
+# someone else left the receiver's cache stale, and it cut the writer's clips back to its old length.
+def t_pattern_length_notes():
+    sz, rs = clips(a)
+    pats = sorted({struct.unpack_from('<I', r, 4)[0] >> 16 for r in rs if struct.unpack_from('<I', r, 4)[0] >> 16 >= 0x5000})
+    src = next(iter(notes(a, 1)), None)
+    if not pats or src is None: print('   (no pattern clips / notes: skipped)'); return
+    p = pats[0] - 0x5000
+    def plen(x): return struct.unpack_from('<iii', x.r(pat_rec(x, p) + 0x48, 12))
+    def plens(x):
+        return sorted(struct.unpack_from('<I', r, 8)[0] for r in clips(x)[1] if struct.unpack_from('<I', r, 4)[0] >> 16 == 0x5000 + p)
+    r = bytearray(src); struct.pack_into('<I', r, 0, plen(a)[0] + 2 * 384); struct.pack_into('<H', r, 6, 0)
+    arr = a.call(0x12d16e0, p, 0); rec = a.alloc(24); a.w(rec, bytes(r)); a.call(va(a, a.q(a.q(arr) + 8)), arr, rec)
+    a.call(PATLENUPD, p, 1)
+    check('pattern longer by notes: B\'s length', lambda: plen(a), lambda: plen(b), wait=8)
+    check('pattern longer by notes: its clips', lambda: plens(a), lambda: plens(b), wait=8)
+
 def t_notes_playing():
     src = next(iter(notes(a, 1)), None)
     if src is None: print('   (no notes in pattern 1: skipped)'); return
@@ -615,7 +688,9 @@ def t_stress():
         t = rnd.choice(full); p.w(p.g(CURSLOT), struct.pack('<Q', fx_slot(p, t, 0))); p.call(0x1233b30, 1, 0)
     def note(p, k):
         r = bytearray(src); struct.pack_into('<I', r, 0, rnd.randrange(64) * 24); struct.pack_into('<H', r, 6, rnd.randrange(len(chans(p))))
-        arr = p.call(0x12d16e0, rnd.randrange(1, 12), 0); rec = p.alloc(24); p.w(rec, bytes(r)); p.call(va(p, p.q(p.q(arr) + 8)), arr, rec)
+        pat = rnd.randrange(1, 12)
+        arr = p.call(0x12d16e0, pat, 0); rec = p.alloc(24); p.w(rec, bytes(r)); p.call(va(p, p.q(p.q(arr) + 8)), arr, rec)
+        p.call(PATLENUPD, pat, 1)                               # as FL's own note editing: the pattern's length again
     def autoclip(p, k): p.call(0x1191a50, mix_id(inner(p), 0x1fc0), 1, 0, 1, 1)
     ops = [rename_ch, add_ch, del_ch, mute, mixname, vol, route, mixins, mixmove, fxmove, note, note, vol, mute, autoclip]
     n = int(os.environ.get('FLIM_STRESS_OPS', '40'))

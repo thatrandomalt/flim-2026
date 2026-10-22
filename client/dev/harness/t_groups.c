@@ -161,17 +161,46 @@ int main(void) {
         *(uint32_t *)(s1 + n) = 2; *(uint64_t *)(s1 + n + 4) = 25; rec2 = s1 + n + 12; n += 12 + 25;
         *(uint32_t *)(s1 + 18) = (uint32_t)(n - 22);
         ev212[16] = 0x41; *(int32_t *)(ev212 + 36) = 112; *(int32_t *)(ev212 + 40) = 168;    // open at 112,168
+        *(int32_t *)(ev212 + 44) = 236; *(int32_t *)(ev212 + 48) = 458;                    // 236x458
         *(int32_t *)(rec2 + 1) = 567; *(int32_t *)(rec2 + 5) = 805; rec2[12] = 0x7d;     // editor 567x805
         memcpy(s2, s1, n);
-        s2[ev212 - s1 + 16] = 0x40; *(int32_t *)(s2 + (ev212 - s1) + 36) = 300;            // closed, moved
+        s2[ev212 - s1 + 16] = 0x40; *(int32_t *)(s2 + (ev212 - s1) + 36) = 300;            // closed, moved,
+        *(int32_t *)(s2 + (ev212 - s1) + 44) = 235; *(int32_t *)(s2 + (ev212 - s1) + 48) = 457;   // a pixel smaller
         *(int32_t *)(s2 + (rec2 - s1) + 1) = 160; *(int32_t *)(s2 + (rec2 - s1) + 5) = 25;
         CHECK(state_hash(s1, n) == state_hash(s2, n));
         s2[rec2 - s1 + 12] = 0x7e;                                  // a real state byte
         CHECK(state_hash(s1, n) != state_hash(s2, n));
         winbytes_keep(s2, n, s1, n);                                // loading s2 while we have s1
         CHECK(s2[ev212 - s1 + 16] == 0x41 && *(int32_t *)(s2 + (ev212 - s1) + 36) == 112 && *(int32_t *)(s2 + (rec2 - s1) + 1) == 567);
+        CHECK(*(int32_t *)(s2 + (ev212 - s1) + 44) == 236 && *(int32_t *)(s2 + (ev212 - s1) + 48) == 458);
         winbytes_keep(s2, n, NULL, 0);                              // nothing of ours: editor stays closed
         CHECK(s2[ev212 - s1 + 16] == 0x40);
+    }
+    {   // a zip in plugin data (Kilohearts' states): saves 2 s apart hash the same, a real byte doesn't,
+        // and neither do the times in bytes that only look like an archive
+        static unsigned char s[2][160];
+        unsigned char *z = NULL;
+        size_t n = 0;
+        int k;
+        for (k = 0; k < 2; k++) {
+            unsigned char *x = s[k];
+            memcpy(x, "FLhd\x06\x00\x00\x00\x00\x00\x02\x00\x60\x00" "FLdt\x00\x00\x00\x00", 22); n = 22;
+            x[n++] = 213; x[n++] = 4 + 112; n += 4;                  // plugin data: 4 other bytes, then the archive
+            z = x + n; n += 112;
+            memcpy(z, "PK\3\4", 4); z[26] = 6; memcpy(z + 30, "s.json{}", 8);                 // local header, name, data
+            memcpy(z + 38, "PK\1\2", 4); z[38 + 28] = 6; memcpy(z + 38 + 46, "s.json", 6);    // its directory record (offset 0)
+            memcpy(z + 90, "PK\5\6", 4); z[90 + 8] = z[90 + 10] = 1; z[90 + 12] = 52; z[90 + 16] = 38;   // 1 entry, 52 bytes at 38
+            *(uint16_t *)(z + 10) = *(uint16_t *)(z + 38 + 12) = (uint16_t)(0x189d + k);       // DOS time: s[1] 2 s later
+            *(uint16_t *)(z + 12) = *(uint16_t *)(z + 38 + 14) = 0x5d56;
+            *(uint32_t *)(x + 18) = (uint32_t)(n - 22);
+        }
+        CHECK(state_hash(s[0], n) == state_hash(s[1], n));
+        CHECK(*(uint16_t *)(z + 10) == 0x189e);                      // (only state_hash's copy is cleared)
+        z[37] = ']';                                                  // a real state byte
+        CHECK(state_hash(s[0], n) != state_hash(s[1], n));
+        z[37] = '}';
+        s[0][z - s[1] + 90 + 10] = z[90 + 10] = 2;                    // the end record counts an entry that isn't there
+        CHECK(state_hash(s[0], n) != state_hash(s[1], n));
     }
     {   // mixer track structure on a fake mixer, with FL's record recycling as seen live: an insert
         // turns the old Current record into the first new track and adds a fresh Current; a delete

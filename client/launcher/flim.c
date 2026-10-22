@@ -200,6 +200,61 @@ static HANDLE launch(const wchar_t *flDir, const wchar_t *url, const wchar_t *pw
     return pi.hProcess;
 }
 
+// ---- an FL that was opened without flim ----
+// Started from its own shortcut, FL has no engine. Join / Connect then loads the engine into it (the
+// same LoadLibraryW remote thread as launch(), just later) instead of starting a second FL; the
+// engine settles, its task window appears and gets the connect from this window. Also the way round
+// FL starting badly with the engine already in it (reported under Wine).
+static DWORD plain_fl_pid(void) {                  // an FL main window whose process has no engine
+    HWND w = NULL;
+    while ((w = FindWindowExW(NULL, w, L"TFruityLoopsMainForm", NULL)) != NULL) {
+        DWORD pid = 0, ep = 0;
+        HWND e = NULL;
+        int has = 0;
+        GetWindowThreadProcessId(w, &pid);
+        while (!has && (e = FindWindowExW(HWND_MESSAGE, e, L"FlimTasks", NULL)) != NULL) { GetWindowThreadProcessId(e, &ep); has = ep == pid; }
+        if (!has) return pid;
+    }
+    return 0;
+}
+static HWND engine_window_of(DWORD pid) {
+    HWND e = NULL;
+    while ((e = FindWindowExW(HWND_MESSAGE, e, L"FlimTasks", NULL)) != NULL) {
+        DWORD ep = 0;
+        GetWindowThreadProcessId(e, &ep);
+        if (ep == pid) return e;
+    }
+    return NULL;
+}
+// Load the engine into a running FL. Returns its process handle (the caller tracks it) or NULL.
+static HANDLE attach_engine(DWORD pid, HWND gui) {
+    wchar_t dll[MAX_PATH], *slash;
+    HANDLE p, th;
+    void *remote;
+    SIZE_T nbytes;
+    GetModuleFileNameW(NULL, dll, MAX_PATH);
+    if ((slash = wcsrchr(dll, L'\\')) != NULL) wcscpy_s(slash + 1, MAX_PATH - (size_t)(slash + 1 - dll), L"flim_engine.dll");
+    if (GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES) { fail_box(gui, L"flim_engine.dll was not found next to flim.exe:\n%s", dll); return NULL; }
+    p = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ | PROCESS_QUERY_INFORMATION |
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_DUP_HANDLE | SYNCHRONIZE, FALSE, pid);
+    if (!p) { fail_box(gui, L"Could not open the running FL (error %lu). Close it and Join again: flim then starts FL itself.", GetLastError()); return NULL; }
+    nbytes = (wcslen(dll) + 1) * sizeof(wchar_t);
+    remote = VirtualAllocEx(p, NULL, nbytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    th = remote && WriteProcessMemory(p, remote, dll, nbytes, NULL)
+             ? CreateRemoteThread(p, NULL, 0, (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"), remote, 0, NULL)
+             : NULL;
+    if (!th) {
+        fail_box(gui, L"Could not load the flim engine into the running FL (error %lu).", GetLastError());
+        if (remote) VirtualFreeEx(p, remote, 0, MEM_RELEASE);
+        CloseHandle(p);
+        return NULL;
+    }
+    WaitForSingleObject(th, 15000);
+    VirtualFreeEx(p, remote, 0, MEM_RELEASE);
+    CloseHandle(th);
+    return p;
+}
+
 // ---------------- main window: join or host, and FL's status ----------------
 // Join: FL starts and connects to the address; while our FL runs, the button connects or
 // disconnects it instead. Host: flim.exe itself is the server (host.c), on this PC's port,
@@ -659,23 +714,58 @@ static void main_host_stop(void) {
     host_stop();
     if (g_upnpOn) { host_upnp(g_hostPort, 0, NULL, 0); g_upnpOn = 0; }   // close the port again
 }
-// Our FL connects to url: started connected, or (already running) told to connect.
+static void engine_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {   // "<url>\n<password>\n<name>"
+    wchar_t name[128], w[1200];
+    char m[3600];
+    flimcfg_get(L"name", name, 128);
+    swprintf_s(w, 1200, L"%s\n%s\n%s", url, pw, name);
+    wide_to_utf8(w, m, sizeof(m));
+    SecureZeroMemory(w, sizeof(w));
+    if (!engine_send(dlg, GUI_CONNECT, m)) fail_box(dlg, L"FL didn't answer: is it busy (a dialog open)?");
+    SecureZeroMemory(m, sizeof(m));
+}
+// An FL we loaded the engine into late: once the engine's task window is there (it waits for FL to
+// settle first), it is introduced to this window and told to connect.
+#define ATTACH_TIMER  7
+#define ATTACH_MAX_S  90
+static wchar_t g_attachUrl[512], g_attachPw[256];
+static int g_attachWait;
+static void attach_tick(HWND dlg) {
+    HWND e = fl_running() ? engine_window_of(g_flPid) : NULL;
+    if (!e && fl_running() && ++g_attachWait < ATTACH_MAX_S * 2) return;
+    KillTimer(dlg, ATTACH_TIMER);
+    if (e) {
+        g_engine = e;
+        engine_send(dlg, GUI_HELLO, NULL);
+        engine_connect(dlg, g_attachUrl, g_attachPw);
+    } else if (fl_running()) main_log(dlg, L"The flim engine didn't start in the running FL. Close FL and Join again: flim then starts FL itself.");
+    SecureZeroMemory(g_attachPw, sizeof(g_attachPw));
+}
+// Our FL connects to url: started connected, or (already running) told to connect. An FL opened
+// without flim gets the engine first.
 static void main_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {
     if (!fl_running()) {
+        DWORD pid = plain_fl_pid();
+        HANDLE p;
+        if (pid && (p = attach_engine(pid, dlg)) != NULL) {
+            fl_track(dlg, p);
+            g_engine = NULL;
+            g_netState = NET_OFF;
+            wcscpy_s(g_attachUrl, 512, url);
+            wcscpy_s(g_attachPw, 256, pw);
+            g_attachWait = 0;
+            SetTimer(dlg, ATTACH_TIMER, 500, NULL);
+            SetDlgItemTextW(dlg, IDC_S_STATUS, L"Starting flim in the FL that's already open...");
+            main_log(dlg, L"FL was already open: loaded flim into it. It joins in a few seconds.");
+            session_buttons(dlg);
+            return;
+        }
+        if (pid) return;                                      // attach_engine said why
         if (main_launch(dlg, url, pw)) main_log(dlg, L"Opened FL: it joins as soon as it has started.");
         return;
     }
     if (!g_engine) { fail_box(dlg, L"FL is still starting: try again in a moment."); return; }
-    {   // "<url>\n<password>\n<name>"
-        wchar_t name[128], w[1200];
-        char m[3600];
-        flimcfg_get(L"name", name, 128);
-        swprintf_s(w, 1200, L"%s\n%s\n%s", url, pw, name);
-        wide_to_utf8(w, m, sizeof(m));
-        SecureZeroMemory(w, sizeof(w));
-        if (!engine_send(dlg, GUI_CONNECT, m)) fail_box(dlg, L"FL didn't answer: is it busy (a dialog open)?");
-        SecureZeroMemory(m, sizeof(m));
-    }
+    engine_connect(dlg, url, pw);
 }
 static void main_join(HWND dlg) {
     wchar_t url[512], pw[256];
@@ -808,6 +898,9 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         SetWindowLongPtrW(dlg, DWLP_MSGRESULT, TRUE);
         return TRUE;
     }
+    case WM_TIMER:
+        if (wp == ATTACH_TIMER) { attach_tick(dlg); return TRUE; }
+        break;
     case WM_ALERT: {                     // the session leader left, the connection dropped...
         wchar_t *t = (wchar_t *)lp;
         ShowWindow(dlg, SW_RESTORE);

@@ -142,6 +142,7 @@ static unsigned char *recs_group(int isPat, const unsigned char *d, unsigned n, 
 static unsigned rec_group(int isPat, const unsigned char *r);
 static void clips_capture(int arr);
 static void pat_capture(int p);
+static int  pat_matches_base(int p);
 static void unit_revert(const char *key);
 static void units_capture_all(void);
 static int  closing_now(void);
@@ -155,6 +156,8 @@ static void meta_rebaseline(void);
 static void meta_rebase_type(int type);
 static void meta_rebase_patterns(void);
 static void meta_rebase_channels(void);
+static void digest_tick(DWORD now);
+static void pat_len_recalc(int p);
 static void meta_remap(int type, const int *from, int n);
 static void slots_rebase(const int *chFrom, int nch, const int *mixFrom, int nmix);
 static void notes_remap(const int *from, int n);
@@ -293,6 +296,7 @@ typedef void  (*clippurge_t)(void *arr);
 typedef void  (*hint_t)(void *form, const wchar_t *text, uint8_t flag);
 
 static presetfile_t g_savePreset, g_loadPreset;
+static int loadpreset_call(presetfile_t fn, const wchar_t *file, int mask, void *obj, int flags);
 static hasplugin_t  g_hasPlugin;
 static getplugin_t  g_getPlugin;
 static intfclear_t g_intfClear;
@@ -813,8 +817,9 @@ typedef struct {
     DWORD suppressUntil;     // remote state being applied: ignore local param changes
     DWORD absorbUntil;       // identity changes until then come from our own apply
     DWORD baselineAt;        // take a silent baseline at this tick
-    DWORD baseAt;            // when the current hash baseline was taken
+    DWORD baseAt;            // when the current hash baseline was taken (or a peer's state loaded)
     int editGen;             // bumped by local edits (params, sent states)
+    DWORD userAt;            // someone here last worked in this plugin: its params, its window, a preset (unit_touched)
     void *pcInst;            // plugin instance pcount was counted for (plug_param_count)
     int pcount;              //   its params worth watching
     void *pcAsked;           // count requested from the main thread for this instance, at:
@@ -827,7 +832,7 @@ typedef struct {
 #define SUPPRESS_MS      600     // after applying remote state: late async param updates from the plugin
 #define ABSORB_MS        2000    // identity changes this soon after our own apply are ours
 #define REBASE_MS        1500    // silent re-baseline of a unit this long after a remote apply
-#define INPUT_RECENT_MS  5000    // "someone is using FL": gate for sweeps and state sends
+#define INPUT_RECENT_MS  5000    // "someone is using FL": gate for sweeps (state sends: unit_touched)
 #define SWEEP_MS         700     // one round-robin state check per this interval
 #define STRUCT_MS        500     // channel list / plugin identity scan interval
 
@@ -845,6 +850,11 @@ static Unit *unit_ptr(int unit, int a, int b) {
     if (unit == U_CH) return (a >= 0 && a < MAX_CH) ? &g_chU[a] : NULL;
     return (a >= 0 && a < MAX_MIX && b >= 0 && b < MAX_FX_SLOTS) ? &g_fxU[a][b] : NULL;
 }
+
+// Someone here worked in this plugin since its baseline. A saved state that differs without that is
+// drift: plugins whose save is never byte-identical (and states automation moves) would otherwise go
+// out whenever anyone touched anything in FL, and each one reloads the plugin on the other side.
+static int unit_touched(const Unit *u) { return u->userAt && (!u->baseAt || (LONG)(u->userAt - u->baseAt) > 0); }
 
 // Unit a REC id belongs to (for activity tracking); returns 0 if none.
 static int unit_of_id(uint32_t id, int *unit, int *a, int *b) {
@@ -1007,15 +1017,16 @@ static int flp_walk(const unsigned char *d, size_t n, flpev_t cb, void *ctx);
 
 // ---- each person's plugin windows inside saved states ----
 // FL saves a plugin's window with the plugin: in the plugin record (event 212) flags +16 bit 0 =
-// editor open, +36 / +40 = editor x / y; a VST wrapper (event 201 "Fruity Wrapper") also keeps its
+// editor open, +36 / +40 = editor x / y, +44 / +48 = its width / height (FL corrects them by a pixel
+// when the editor first opens after a load); a VST wrapper (event 201 "Fruity Wrapper") also keeps its
 // editor size in record 2 of its data (bytes 1..8). That is one person's view, so it must not count
-// as a change, and loading someone's state must not open, close or move our windows.
+// as a change, and loading someone's state must not open, close, move or resize our windows.
 typedef struct { unsigned char *rec, *wrap; int wrapper; } WinBytes;
 static int winbytes_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end) {
     WinBytes *w = (WinBytes *)ctx;
     (void)at; (void)end;
     if (id == EV_PLUGNAME) w->wrapper = n >= 28 && memcmp(p, L"Fruity Wrapper", 28) == 0;
-    else if (id == EV_NEWPLUGIN && n >= 44 && !w->rec) w->rec = (unsigned char *)p;
+    else if (id == EV_NEWPLUGIN && n >= 52 && !w->rec) w->rec = (unsigned char *)p;
     else if (id == EV_PLUGIN_DATA && w->wrapper && !w->wrap) {
         size_t o = 4;                                         // 4-byte header, then [u32 id][u64 length][data]
         while (o + 12 <= n) {
@@ -1036,12 +1047,43 @@ static void winbytes_keep(unsigned char *d, size_t n, unsigned char *own, size_t
     winbytes_find(d, n, &a);
     if (own) winbytes_find(own, on, &b); else memset(&b, 0, sizeof(b));
     if (a.rec) a.rec[16] = (unsigned char)((a.rec[16] & ~1) | (b.rec ? b.rec[16] & 1 : 0));
-    if (a.rec && b.rec) memcpy(a.rec + 36, b.rec + 36, 8);
+    if (a.rec && b.rec) memcpy(a.rec + 36, b.rec + 36, 16);
     if (a.wrap && b.wrap) memcpy(a.wrap, b.wrap, 8);
 }
 
-// Hash of a saved .fst without its window bytes, skipping the 14-byte "FLhd" header: it embeds
-// the project's channel count, which would make every unit look changed on add/delete.
+// Zip archives inside plugin data (Kilohearts keeps its whole state as one) stamp each entry with
+// its save time: DOS time + date, 2 s steps, in the local header ("PK\3\4" +10) and the central
+// directory record ("PK\1\2" +12), so no two saves match. This clears them in each archive whose
+// end record ("PK\5\6") checks out: its directory ends right at it, holds exactly the entries it
+// counts, and each entry points at a local header with the same name. Other bytes stay as they are.
+static void zip_times_clear(unsigned char *p, size_t n) {
+    size_t e, cd, z, o, lh, nl, len;
+    uint32_t cds, cdo;
+    int cnt, k, pass;
+    for (e = 0; e + 22 <= n; e++) {
+        if (p[e] != 'P' || memcmp(p + e, "PK\5\6", 4) != 0) continue;
+        cnt = *(const uint16_t *)(p + e + 10);
+        cds = *(const uint32_t *)(p + e + 12);
+        cdo = *(const uint32_t *)(p + e + 16);
+        if (cds > e || cdo > e - cds) continue;
+        cd = e - cds; z = cd - cdo;                         // its offsets count from its own start
+        for (pass = 0; pass < 2; pass++) {                  // check every entry, then clear
+            for (k = 0, o = cd; k < cnt; k++, o += len) {
+                if (o + 46 > e || memcmp(p + o, "PK\1\2", 4) != 0) break;
+                nl = *(const uint16_t *)(p + o + 28);
+                len = 46 + nl + *(const uint16_t *)(p + o + 30) + *(const uint16_t *)(p + o + 32);
+                lh = z + *(const uint32_t *)(p + o + 42);
+                if (o + len > e || lh + 30 + nl > cd || memcmp(p + lh, "PK\3\4", 4) != 0 ||
+                    *(const uint16_t *)(p + lh + 26) != nl || memcmp(p + lh + 30, p + o + 46, nl) != 0) break;
+                if (pass) { memset(p + lh + 10, 0, 4); memset(p + o + 12, 0, 4); }
+            }
+            if (k < cnt || o != e) break;
+        }
+    }
+}
+
+// Hash of a saved .fst without its window bytes and zip entry times, skipping the 14-byte "FLhd"
+// header: it embeds the project's channel count, which would make every unit look changed on add/delete.
 // Events that only say which FL build saved it (199 version, 159 build, FL 2026's escaped "FL Studio
 // <build>"): people may run different builds, so they are never a change.
 #define EV_VERSION 199
@@ -1052,6 +1094,7 @@ static int hash_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t a
     size_t i;
     (void)at; (void)end;
     if (id == EV_VERSION || id == EV_BUILD || (uint32_t)id == EV_FLNAME) return 1;
+    if (id == EV_PLUGIN_DATA) zip_times_clear((unsigned char *)p, n);   // state_hash's own copy
     *h = (*h ^ (uint32_t)id) * 1099511628211ull;
     for (i = 0; i < n; i++) *h = (*h ^ p[i]) * 1099511628211ull;
     return 1;
@@ -1062,7 +1105,7 @@ static uint64_t state_hash(const unsigned char *d, size_t n) {
     uint64_t h = 1469598103934665603ull;
     memcpy(c, d, n);
     winbytes_find(c, n, &w);
-    if (w.rec) { w.rec[16] &= (unsigned char)~1; memset(w.rec + 36, 0, 8); }
+    if (w.rec) { w.rec[16] &= (unsigned char)~1; memset(w.rec + 36, 0, 16); }
     if (w.wrap) memset(w.wrap, 0, 8);
     if (!flp_walk(c, n, hash_cb, &h)) h = fnv64(c, n);
     free(c);
@@ -1182,7 +1225,7 @@ static void links_scan(DWORD now, int steady) {
             else { src = s[i].src; if (s[i++].h == prev[j++].h) continue; }
             if ((u = link_src_unit(src)) != NULL && now >= u->suppressUntil && !u->identAt) {
                 if (!u->lastAct) logmsg("LINKS of %s 0x%08x changed here: its state goes out", src < 0x70000000u ? "channel" : "mixer slot", src);
-                u->lastAct = now; u->burst = 1;
+                u->lastAct = u->userAt = now; u->burst = 1;
             }
         }
     free(prev); prev = s; nprev = ns; gen = g_structGen;
@@ -1412,10 +1455,10 @@ static void do_snap(const QItem *it) {
     if (!d) return;
     uint64_t h = state_hash(d, n);
     DWORD now = GetTickCount();
-    // Provenance: a state goes out only if the local user did something since this
-    // unit's baseline. Some plugins (Serum) never save byte-identical state twice;
-    // without this gate that drift ping-pongs full reloads between the peers.
-    int userSince = g_lastInput && (LONG)(g_lastInput - u->baseAt) > 0;
+    // Provenance: a state goes out only if someone here worked in this plugin since its baseline
+    // (unit_touched). Any input anywhere in FL used to do: two people busy elsewhere then sent a
+    // drifting VST's state back and forth, a reload (an audio glitch) on each side every sweep.
+    int userSince = unit_touched(u);
     int send = 0;
     char key[32];
     switch (it->mode) {
@@ -1425,7 +1468,7 @@ static void do_snap(const QItem *it) {
         // (a receiver that has it already doesn't reload).
         if (!u->hash || h != u->hash) {
             if (userSince) send = 1;
-            else logmsg("PLUG drift absorbed unit=%s %d/%d (no local input)", it->unit == U_CH ? "ch" : "fx", it->a, it->b);
+            else logmsg("PLUG drift absorbed unit=%s %d/%d (nobody worked in it here)", it->unit == U_CH ? "ch" : "fx", it->a, it->b);
         }
         break;
     case SNAP_FORCE:   send = 1; break;   // identity changed: always
@@ -1445,7 +1488,9 @@ static void do_snap(const QItem *it) {
     }
     plug_agreed_set(it->unit, it->a, it->b, d, n);
     u->hash = h;
-    u->baseAt = now;
+    // a check that sent nothing leaves the work in it open: a change the plugin makes a moment later
+    // (a file it loads in the background) still goes out with the sweep
+    if (send || it->mode != SNAP_IF_DIFF) u->baseAt = now;
     free(d);
 }
 
@@ -1518,6 +1563,7 @@ static void do_load(const QItem *it) {
     free(own);
     if (!(it->mode & LOAD_FORCE) && hown && hown == hin) {   // we have exactly this already: no reload, no glitch
         u->hash = hown;
+        u->baseAt = GetTickCount();
         free(in);
         logmsg("PLUG unit=%s %d/%d already identical: not reloaded", it->unit == U_CH ? "ch" : "fx", it->a, it->b);
         return;
@@ -1529,7 +1575,7 @@ static void do_load(const QItem *it) {
     if ((it->mode & LOAD_LINKS) || lf.has) links_drop(it->unit, it->a, it->b);   // the state's links replace this unit's
     progress_quiet(1);
     g_flimLoad = 1;
-    __try { r = g_loadPreset(w, unit_mask(it->unit), obj, LOADPRESET_NOEDITOR); }
+    __try { r = loadpreset_call(g_loadPreset, w, unit_mask(it->unit), obj, LOADPRESET_NOEDITOR); }
     __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("LOAD faulted unit=%d %d/%d", it->unit, it->a, it->b); }
     g_flimLoad = 0;
     if (lf.has) links_sort();
@@ -1705,7 +1751,7 @@ static void do_fxclear(const QItem *it) {
     wchar_t *w = dstr_new(g_fxDeletePreset);
     int r = -1;
     progress_quiet(1);
-    __try { r = g_loadPreset(w, MASK_FX, obj, 0); }
+    __try { r = loadpreset_call(g_loadPreset, w, MASK_FX, obj, 0); }
     __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("FX clear faulted %d/%d", it->a, it->b); }
     progress_quiet(0);
     dstr_free(w);
@@ -2113,6 +2159,7 @@ static void notes_apply(int p, const unsigned char *recs, unsigned n, int g) {
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("NOTES grid refresh faulted"); }
     }
+    pat_len_recalc(p);
     redraw_editors();
     // g_patSeen / g_patHash are left as they are: the scanner sees the change, and do_notesnap
     // finds this channel equal to its base (nothing echoed) but still sends a local edit that
@@ -2154,7 +2201,11 @@ static void notes_send_group(int p, int g, const unsigned char *d, unsigned n) {
 static void do_notesnap(const QItem *it) {
     int p = it->a, gs[GROUP_MAX], ng, i;
     unsigned n, bn;
-    unsigned char *d = notes_copy(p, &n), *b;
+    unsigned char *d, *b;
+    // FL renumbered notes that chan_rebase hasn't yet (queued just before a channel insert / delete):
+    // they'd go out under numbers the others don't have yet. The scanner tries again after it.
+    if (chan_list_changed()) { g_patChangedAt[p] = GetTickCount(); return; }
+    d = notes_copy(p, &n);
     if (d) notes_clear_sel(d, n);
     if (!unit_base(1, p, &b, &bn)) {              // no base yet: this is it
         unit_agreed(1, p, d, n, -1);
@@ -2234,17 +2285,29 @@ static void send_notes_full(void) {
 static void scan_notes(DWORD now) {
     static DWORD last = 0;
     static int pend[MAX_PAT];
-    int p, np = 0, i;
+    int p, np = 0, i, moving;
     if (now - last < NOTES_SCAN_MS || g_patDepth) return;
     last = now;
     if (!g_notesReady) { notes_rebaseline(); g_notesReady = 1; return; }
+    // a channel inserted / deleted renumbers the notes of every later channel: nothing settles before
+    // chan_rebase has renumbered the bases too (and its chan op went out)
+    moving = chan_list_changed();
     for (p = 1; p < MAX_PAT; p++) {
         uint64_t h = notes_hash(p);
         if (h != g_patSeen[p]) { g_patSeen[p] = h; g_patChangedAt[p] = now; }
-        if (g_patChangedAt[p] && now - g_patChangedAt[p] >= NOTES_SETTLE_MS) {
+        if (!moving && g_patChangedAt[p] && now - g_patChangedAt[p] >= NOTES_SETTLE_MS) {
             g_patChangedAt[p] = 0;
             if (g_patSeen[p] != g_patHash[p]) pend[np++] = p;
         }
+    }
+    if (np >= NOTES_BULK) {
+        // renumbered patterns still match their base: only the others are changes (an edit made in
+        // the same moment went into the bulk below with them, and was never sent)
+        int k = 0;
+        for (i = 0; i < np; i++)
+            if (pat_matches_base(pend[i])) g_patHash[pend[i]] = g_patSeen[pend[i]];
+            else pend[k++] = pend[i];
+        np = k;
     }
     if (np >= NOTES_BULK) {
         // project load/new: never broadcast as edits (the param bulk guard syncs the whole project)
@@ -2589,6 +2652,14 @@ typedef void (*markadd_t)(void *list, int pos, const wchar_t *name, int action, 
 typedef void (*dynsetlen_t)(void *arr, void *typeinfo, int64_t dims, int64_t len);
 typedef void (*setmod_t)(int on);
 typedef void (*patlenupd_t)(int pat, int flag);
+// FL caches a pattern's length in its record (+0x48 / +0x4c / +0x50 / +0x54 / +0x5c), works it out again
+// after its own note edits (PATLENUPD(p, 1), as PatternLengthChanged does) and sizes the pattern's playlist
+// clips from it. After notes applied from someone else it stayed stale: that FL cut the clips back to its
+// old length and fought the editor over them. Main thread.
+static void pat_len_recalc(int p) {
+    __try { ((patlenupd_t)(g_flBase + (PATLENUPD_VA - IMG_BASE)))(p, 1); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("NOTES pattern %d length update faulted", p); }
+}
 
 enum { M_MIX, M_ROUTE, M_CHAN, M_PAT, M_PLT, M_MARK, M_TSIG, M_PMARK, M_NTYPES };
 static const char *const M_TAG[M_NTYPES] = { "mx", "rt", "ch", "pt", "pl", "mk", "ts", "pm" };
@@ -5352,9 +5423,9 @@ static int unit_base(int isPat, int idx, unsigned char **d, unsigned *n) {
     LeaveCriticalSection(&g_ulockLock);
     return ok;
 }
-// Baseline of one pattern / the clips of one arrangement: the current state is agreed.
-// Unlocked, SEH-guarded reads (as the hash scan does); selection bits cleared.
-static void pat_capture(int p) {
+// Pattern p's notes now: unlocked, SEH-guarded reads (as the hash scan does), selection bits
+// cleared. 0 if the read faulted.
+static int pat_peek(int p, unsigned char **out, unsigned *on) {
     unsigned i, n = 0;
     unsigned char *d = NULL;
     __try {
@@ -5362,10 +5433,30 @@ static void pat_capture(int p) {
         n = a ? *(unsigned *)(a + NOTES_COUNT) : 0;
         if (n > 1000000) n = 0;
         if (n) { d = (unsigned char *)malloc((size_t)n * NOTE_SIZE); memcpy(d, *(unsigned char **)(a + NOTES_DATA), (size_t)n * NOTE_SIZE); }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { free(d); return; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { free(d); return 0; }
     for (i = 0; i < n; i++) d[(size_t)i * NOTE_SIZE + NOTE_SEL_OFS] &= (unsigned char)~NOTE_SEL_BIT;
+    *out = d; *on = n;
+    return 1;
+}
+// Baseline of one pattern / the clips of one arrangement: the current state is agreed.
+static void pat_capture(int p) {
+    unsigned char *d;
+    unsigned n;
+    if (!pat_peek(p, &d, &n)) return;
     unit_agreed(1, p, d, n, -1);
     free(d);
+}
+// Pattern p's notes equal its base (as sets, like do_notesnap compares): nothing to send. After a
+// channel insert / delete, chan_rebase renumbered the base along with FL's notes.
+static int pat_matches_base(int p) {
+    unsigned char *d, *b;
+    unsigned n, bn;
+    int g, k;
+    if (!unit_base(1, p, &b, &bn)) return 0;
+    if (!pat_peek(p, &d, &n)) { free(b); return 0; }
+    k = group_diff(1, d, n, b, bn, &g, 1);
+    free(d); free(b);
+    return !k;
 }
 static void clips_capture(int arr) {
     unsigned i, n = 0;
@@ -5462,10 +5553,10 @@ static void reload_poll(void) {
 // ---- plugin windows: state changes that move no parameter ----
 // Many plugins (third-party VSTs especially) change their state without touching an automatable
 // parameter: loading a sample or wavetable in their own browser, editing a mod matrix, drawing an
-// envelope. The round-robin sweep finds those eventually; this finds them right away: once the
-// user stops working in a plugin window, that plugin's state is compared with its baseline
-// (and sent if it changed). The window -> plugin mapping comes from FL's form object (VCL keeps
-// it in a window property) referencing the channel / mixer slot or its plugin instance.
+// envelope. Once the user stops working in a plugin window, that plugin's state is compared with its
+// baseline (and sent if it changed); the plugin counts as worked in (unit_touched), so the round-robin
+// sweep also sends a change that lands later. The window -> plugin mapping comes from FL's form object
+// (VCL keeps it in a window property) referencing the channel / mixer slot or its plugin instance.
 #define PLUGFOCUS_IDLE_MS  700
 #define PLUGFOCUS_LONG_MS  3000         // long sessions in one window: check this often meanwhile
 typedef struct { void *obj; int unit, a, b; } PlugRef;
@@ -5559,16 +5650,28 @@ static void do_plugfocus(const QItem *it) {
     logmsg("PLUGFOCUS: window %p is %s %d/%d (%d votes vs %d): checking its state", (void *)it->wnd,
            hit.unit == U_CH ? "ch" : "fx", hit.a, hit.b, V[best].votes, second);
     u = unit_ptr(hit.unit, hit.a, hit.b);
+    if (u) u->userAt = GetTickCount();          // worked in: what its state shows now or at the sweep's next look goes out
     if (!u || u->lastAct || u->identAt || u->baselineAt || GetTickCount() < u->suppressUntil) return;   // handled elsewhere
     enqueue_unit(T_SNAP, hit.unit, hit.a, hit.b, u->hash ? SNAP_IF_DIFF : SNAP_BASELINE, NULL);
+}
+static volatile HWND g_plugForm = NULL;    // plugin window the last input into one went to
+static volatile DWORD g_plugInputAt = 0;   //   when (stored after it)
+// Message hook: input that went into a plugin window. Only that is work in the plugin: keys, the wheel
+// and drags elsewhere after a click in one used to count too, and kept a drifting plugin going out
+// every PLUGFOCUS_LONG_MS while its user worked anywhere in FL.
+static void plugin_input(HWND h) {
+    while (h && h != g_mainForm && !wnd_class_is(h, "TPluginForm")) h = GetParent(h);
+    if (h && h != g_mainForm) { g_plugForm = h; g_plugInputAt = g_lastInput; }
 }
 // Poll thread: the user worked in a plugin window and paused (or has been at it for a while).
 static void plugfocus_poll(DWORD now) {
     static HWND form = NULL;
     static DWORD inputAt = 0, checkedInput = 0, checkedAt = 0;
-    HWND h = g_focusHwnd;
-    while (h && h != g_mainForm && !wnd_class_is(h, "TPluginForm")) h = GetParent(h);
-    if (h && h != g_mainForm && g_lastInput != inputAt) { form = h; inputAt = g_lastInput; }
+    DWORD t = g_plugInputAt;
+    if (t != inputAt) {                        // (t's window, or a later one's)
+        if (inputAt == checkedInput) checkedAt = now;   // work starts: a click is checked once, after it
+        form = g_plugForm; inputAt = t;
+    }
     if (!form || inputAt == checkedInput) return;
     if (now - g_lastInput >= PLUGFOCUS_IDLE_MS || now - checkedAt >= PLUGFOCUS_LONG_MS) {
         QItem q; memset(&q, 0, sizeof(q));
@@ -5723,6 +5826,17 @@ static volatile LONG g_hookCalls = 0;
 static int fl_presets_loading(void) {
     __try { return **(int **)(g_flBase + (FLLOADS_VA - IMG_BASE)) > 0; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+// FL's loader lowers that count only on its normal way out. A file that isn't a preset leaves it raised for
+// good: a sample dropped on a channel (LoadPresetFile returns 8, then the drop loads it as a sample), and so
+// does an exception in the loader. flim, waiting while FL loads, then waited forever on that FL. The call is
+// synchronous, so whatever it leaves above where it started is such a leak.
+static int loadpreset_call(presetfile_t fn, const wchar_t *file, int mask, void *obj, int flags) {
+    int *n = NULL, at = 0, r;
+    __try { n = *(int **)(g_flBase + (FLLOADS_VA - IMG_BASE)); at = *n; } __except (EXCEPTION_EXECUTE_HANDLER) { n = NULL; }
+    r = fn(file, mask, obj, flags);
+    __try { if (n && *n > at) *n = at; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return r;
 }
 static int replaces_plugins(int type) {
     return type == T_LOAD || type == T_ADDCH || type == T_DELCH || type == T_FXCLEAR || type == T_MIXSTRUCT || type == T_PROJLOAD;
@@ -6005,12 +6119,12 @@ static void delchan_detour_install(void) {
 // project. A channel FL is making (not in the known list yet) goes out as a new channel anyway.
 static presetfile_t g_loadPresetOrig;
 static int loadpreset_detour(const wchar_t *file, int mask, void *obj, int flags) {
-    int r = g_loadPresetOrig(file, mask, obj, flags), i, t, s, n = mix_count();
+    int r = loadpreset_call(g_loadPresetOrig, file, mask, obj, flags), i, t, s, n = mix_count();
     Unit *u = NULL;
     for (i = 0; i < g_nChKnown && !u; i++) if (g_chKnown[i] == obj) u = &g_chU[i];
     for (t = 0; t < n && t < MAX_MIX && !u; t++)
         for (s = 0; s < MAX_FX_SLOTS && !u; s++) if (fx_obj(t, s) == obj) u = &g_fxU[t][s];
-    if (u && mask) { u->lastAct = GetTickCount(); u->burst = 1; }
+    if (u && mask) { u->lastAct = u->userAt = GetTickCount(); u->burst = 1; }
     return r;
 }
 static void loadpreset_detour_install(void) {
@@ -6080,13 +6194,15 @@ static LRESULT CALLBACK getMsgHook(int code, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_KEYDOWN:
             g_focusHwnd = msg->hwnd;
             g_lastInput = GetTickCount();
+            plugin_input(msg->hwnd);
             break;
         case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MOUSEWHEEL: case WM_KEYUP:
         case WM_SYSKEYDOWN: case WM_LBUTTONDBLCLK:
             g_lastInput = GetTickCount();
+            plugin_input(msg->hwnd);
             break;
         case WM_MOUSEMOVE:
-            if (msg->wParam & (MK_LBUTTON | MK_RBUTTON)) g_lastInput = GetTickCount();   // drags
+            if (msg->wParam & (MK_LBUTTON | MK_RBUTTON)) { g_lastInput = GetTickCount(); plugin_input(msg->hwnd); }   // drags
             break;
         case WM_FL_OPENPROJ:
             if (msg->hwnd != g_mainForm) break;
@@ -6250,7 +6366,9 @@ static void schedule_units(DWORD now) {
             Unit *u = unit_ptr(unit, a, b);
             if (!u || (unit == U_FX && !u->inst)) continue;
             if (u->lastAct || u->identAt || u->baselineAt || now < u->suppressUntil) continue;
-            enqueue_unit(T_SNAP, unit, a, b, u->hash ? SNAP_IF_DIFF : SNAP_BASELINE, NULL);
+            // a plugin nobody worked in here can only have drifted: its turn passes without a look (a look
+            // would take the drift as its baseline, and with it an edit whose window check hasn't run yet)
+            if (!u->hash || unit_touched(u)) enqueue_unit(T_SNAP, unit, a, b, u->hash ? SNAP_IF_DIFF : SNAP_BASELINE, NULL);
             break;
         }
     }
@@ -6351,6 +6469,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
         scan_clips(now);
         scan_meta(now);
         state_digest(now);
+        digest_tick(now);
         focus_poll(now);
         cursor_poll(now);
         solo_poll(now);
@@ -6425,7 +6544,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
             int unit, a, b, j, cnt = 0;
             Unit *u;
             if (g_changes[i].self || !unit_of_id(g_changes[i].s->id, &unit, &a, &b) || !(u = unit_ptr(unit, a, b))) continue;
-            u->lastAct = now;
+            u->lastAct = u->userAt = now;
             u->editGen++;
             for (j = 0; j < nc; j++) {
                 int u2, a2, b2;
@@ -6685,6 +6804,194 @@ static void leader_signal(const char *m) {
     }
 }
 
+// ---------------- desync safety net ----------------
+// Whatever still slips through (two people changing structure in the same instant, an op lost to a crash or
+// a dropped connection) mustn't stay. While nothing is in flight the leader sends a fingerprint of the song
+// every DIGEST_NET_MS; a member whose own fingerprint differs in the same part twice in a row loads the
+// leader's project again (resync). Only what is the same for everyone goes in, compared by number, never by
+// memory address: no solo, selection, windows or plugin states, no automated knobs.
+#define DIGEST_NET_MS  15000
+#define QUIET_MS       5000         // no song op in or out this long: nothing is in flight
+#define DESYNC_MIN_MS  120000       // at most one such reload this often
+enum { DG_CH, DG_MX, DG_RT, DG_PAT, DG_PLT, DG_MARK, DG_TSIG, DG_PMARK, DG_NOTES, DG_CLIPS, DG_LINKS, DG_VOL, DG_N };
+static const char *const DG_TAG[DG_N] = { "channels", "mixer names", "routes", "patterns", "playlist tracks", "markers",
+                                          "time signature", "pattern markers", "notes", "clips", "automation links", "mixer volumes" };
+static volatile DWORD g_lastOpAt;          // last song op sent or received
+static uint32_t g_leaderDg[DG_N];          // the leader's last fingerprint (g_qLock), its arrangement, when it came
+static int      g_leaderArr;
+static volatile DWORD g_leaderDgAt;
+static int op_changes_song(const char *m) {
+    static const char *const QUIET[] = { "\"kind\":\"cur\"", "\"kind\":\"alive\"", "\"kind\":\"focus\"", "\"kind\":\"saving\"",
+                                         "\"kind\":\"hello\"", "\"kind\":\"shared.", "\"kind\":\"digest\"", "\"kind\":\"state.req\"" };
+    int i;
+    if (!strstr(m, "\"t\":\"op\"")) return 0;
+    for (i = 0; i < (int)(sizeof(QUIET) / sizeof(QUIET[0])); i++) if (strstr(m, QUIET[i])) return 0;
+    return 1;
+}
+static uint32_t fold64(uint64_t h) { return (uint32_t)(h ^ (h >> 32)); }
+// Poll thread (SEH-guarded unlocked reads, like the scanners).
+static void digest_take(uint32_t *d, int *arrOut) {
+    static const int MT[DG_N] = { M_CHAN, M_MIX, -1, M_PAT, M_PLT, M_MARK, M_TSIG, M_PMARK, -1, -1, -1, -1 };
+    int k, i, nm = mix_count(), t, s;
+    uint64_t h;
+    void **items;
+    for (k = 0; k < DG_N; k++) {
+        h = 1469598103934665603ull;
+        if (MT[k] >= 0)
+            for (i = 0; i < meta_cap(MT[k]); i++) {
+                uint64_t mh = meta_hash(MT[k], i);
+                if (mh) { h = fnv_add(h, &i, 4); h = fnv_add(h, &mh, 8); }
+            }
+        d[k] = fold64(h);
+    }
+    k = chan_list(&items); d[DG_CH] ^= (uint32_t)k * 2654435761u;
+    d[DG_MX] ^= (uint32_t)nm * 2654435761u;
+    __try {
+        h = 1469598103934665603ull;                            // routes by track number (meta_hash's are by identity)
+        for (t = 0; t < nm && t < MIX_ROUTE_MAX; t++) {
+            char *r = mix_rec(t);
+            for (i = 0; i < nm && i < MIX_ROUTE_MAX; i++) {
+                if (!r[MIX_ROUTE + i * 8 + 4]) continue;
+                h = fnv_add(h, &t, 4); h = fnv_add(h, &i, 4); h = fnv_add(h, r + MIX_ROUTE + i * 8, 4);
+            }
+        }
+        d[DG_RT] = fold64(h);
+        h = 1469598103934665603ull;                            // notes, in any order, selection left out
+        for (t = 1; t < MAX_PAT; t++) {
+            char *a = pat_notes_arr(t);
+            unsigned n = a ? *(unsigned *)(a + NOTES_COUNT) : 0, j;
+            const unsigned char *nd = a ? *(unsigned char **)(a + NOTES_DATA) : NULL;
+            uint64_t sum = 0;
+            if (!n || n > 1000000 || !nd) continue;
+            for (j = 0; j < n; j++) {
+                unsigned char r[NOTE_SIZE];
+                memcpy(r, nd + (size_t)j * NOTE_SIZE, NOTE_SIZE);
+                r[NOTE_SEL_OFS] &= (unsigned char)~NOTE_SEL_BIT;
+                sum += fnv64(r, NOTE_SIZE);
+            }
+            h = fnv_add(h, &t, 4); h = fnv_add(h, &sum, 8);
+        }
+        d[DG_NOTES] = fold64(h);
+        {                                                      // the current arrangement's clips: their saved part
+            int arr = cur_arr();
+            char *ca = arr_clips(arr);
+            unsigned n = ca ? *(unsigned *)(ca + CLIPS_COUNT) : 0, j;
+            const unsigned char *cd = ca ? *(unsigned char **)(ca + CLIPS_DATA) : NULL;
+            uint64_t sum = 0;
+            for (j = 0; cd && n <= 200000 && j < n; j++) {
+                unsigned char r[0x20];
+                memcpy(r, cd + (size_t)j * CLIP_SIZE, sizeof(r));
+                r[CLIP_SEL_OFS] &= (unsigned char)~CLIP_SEL_BIT;
+                sum += fnv64(r, sizeof(r));
+            }
+            d[DG_CLIPS] = fold64(sum ^ n);
+            *arrOut = arr;
+        }
+        {                                                      // automation links (not the MIDI ones: each person's own)
+            char *L = links_list(), **it = L ? *(char ***)(L + 8) : NULL;
+            int n = L ? *(int *)(L + 0x10) : 0;
+            uint64_t sum = 0;
+            for (i = 0; it && i < n && n <= 65536; i++) {
+                uint32_t rec[5];
+                if (!it[i]) continue;
+                memcpy(rec, it[i] + 8, 20); rec[1] = 0;
+                sum += fnv64((const unsigned char *)rec, sizeof(rec));
+            }
+            d[DG_LINKS] = fold64(sum ^ (uint64_t)n);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { d[DG_RT] = d[DG_NOTES] = d[DG_CLIPS] = d[DG_LINKS] = 0; }
+    h = 1469598103934665603ull;                                // mixer volume / pan, unless automation plays them
+    for (t = 0; t < nm; t++)
+        for (s = 0; s < 2; s++) {
+            uint32_t id = 0x70000000u + ((uint32_t)t << 22) + 0x1fc0u + (uint32_t)s, v;
+            if (auto_target(id)) continue;
+            v = read_value(id);
+            h = fnv_add(h, &id, 4); h = fnv_add(h, &v, 4);
+        }
+    d[DG_VOL] = fold64(h);
+}
+static int digest_quiet(DWORD now) {
+    // (input alone doesn't count: an edit not out yet makes one mismatch, and a reload takes two in a row)
+    return g_netState == NET_ON && !g_projBusy && g_qh == g_qt && g_metaReady && now - g_lastOpAt >= QUIET_MS;
+}
+// Inbound fingerprint (recv thread; the leader's only).
+static void on_digest(const char *m) {
+    const char *p = strstr(m, "\"d\":[");
+    uint32_t d[DG_N];
+    int k = 0, arr = -1;
+    if (g_isLeader || !p) return;
+    int_after(m, NULL, "\"arr\":", &arr);
+    for (p += 5; k < DG_N && *p && *p != ']'; k++) {
+        char *e;
+        d[k] = (uint32_t)strtoul(p, &e, 10);
+        p = *e == ',' ? e + 1 : e;
+    }
+    if (k != DG_N) return;                     // another build's fingerprint
+    EnterCriticalSection(&g_qLock);
+    memcpy(g_leaderDg, d, sizeof(d)); g_leaderArr = arr;
+    LeaveCriticalSection(&g_qLock);
+    g_leaderDgAt = GetTickCount() | 1;
+}
+// Poll thread: the leader sends, a member compares (each while nothing is in flight).
+static void digest_tick(DWORD now) {
+    static DWORD sentAt, resyncAt;
+    static int miss[DG_N];
+    static unsigned reloaded, unfixable;       // parts the last reload was for / that a reload didn't fix
+    uint32_t d[DG_N], ld[DG_N];
+    int arr = -1, larr, k, n = 0;
+    char why[256];
+    DWORD at = g_leaderDgAt;
+    if (g_isLeader) {
+        char m[64 + DG_N * 12];
+        int o;
+        if (now - sentAt < DIGEST_NET_MS || !digest_quiet(now)) return;
+        sentAt = now;
+        digest_take(d, &arr);
+        o = sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"digest\",\"arr\":%d,\"d\":[", arr);
+        for (k = 0; k < DG_N; k++) o += sprintf_s(m + o, sizeof(m) - o, "%s%u", k ? "," : "", d[k]);
+        sprintf_s(m + o, sizeof(m) - o, "]}}");
+        ws_send(m);
+        return;
+    }
+    if (!at) return;
+    if (now - at > 4000) { g_leaderDgAt = 0; return; }        // not quiet here while it was fresh: skipped
+    // (the leader was quiet for QUIET_MS before it sent, so everything it sent before is here already)
+    if (g_netState != NET_ON || g_projBusy || g_qh != g_qt || now - g_lastOpAt < 3000) return;
+    g_leaderDgAt = 0;
+    EnterCriticalSection(&g_qLock);
+    memcpy(ld, g_leaderDg, sizeof(ld)); larr = g_leaderArr;
+    LeaveCriticalSection(&g_qLock);
+    digest_take(d, &arr);
+    why[0] = 0;
+    for (k = 0; k < DG_N; k++) {
+        if (d[k] == ld[k] || (k == DG_CLIPS && arr != larr)) {
+            if (unfixable & (1u << k)) logmsg("DESYNC %s match the leader's again", DG_TAG[k]);
+            miss[k] = 0; reloaded &= ~(1u << k); unfixable &= ~(1u << k);
+            continue;
+        }
+        if (reloaded & (1u << k)) {               // still different right after the leader's project was loaded:
+            reloaded &= ~(1u << k);               // FL itself makes them differ (it normalizes some things on load)
+            unfixable |= 1u << k;
+            logmsg("DESYNC %s still differ after loading the leader's project: a reload doesn't fix that, not reloading for it again", DG_TAG[k]);
+        }
+        if (unfixable & (1u << k)) continue;
+        if (++miss[k] < 2) { logmsg("DESYNC check: %s differ from the leader's (checking again)", DG_TAG[k]); continue; }
+        sprintf_s(why + strlen(why), sizeof(why) - strlen(why), "%s%s", n++ ? ", " : "", DG_TAG[k]);
+    }
+    if (!n) return;
+    if (resyncAt && now - resyncAt < DESYNC_MIN_MS) {
+        memset(miss, 0, sizeof(miss));
+        logmsg("DESYNC %s still differ from the leader's (reloaded %lu s ago: not again yet)", why, (now - resyncAt) / 1000);
+        return;
+    }
+    for (k = 0; k < DG_N; k++) if (miss[k] >= 2) reloaded |= 1u << k;
+    memset(miss, 0, sizeof(miss));
+    resyncAt = now;
+    logmsg("DESYNC %s differ from the leader's twice in a row: loading the leader's project", why);
+    gui_push(GUI_LOG, "flim: this FL fell out of step with the session leader; reloading the leader's project");
+    resync(why);
+}
+
 // Everyone in a session needs the same flim: ops change between builds, and one can misread or skip what
 // another sends. Who joins says its version and build time ("ask":1), the others answer with theirs. (The
 // version is the push date, so two builds of one day share it.)
@@ -6721,7 +7028,11 @@ static void handle_msg_body(const char *m);
 static void sh_inbox(const char *m);
 static void sh_joined(void);
 // Whatever one network message queues is someone else's op (task_rebind, do_struct).
-static void handle_msg(const char *m) { log_op("in", m); t_peerMsg++; handle_msg_body(m); t_peerMsg--; }
+static void handle_msg(const char *m) {
+    log_op("in", m);
+    if (op_changes_song(m)) g_lastOpAt = GetTickCount();
+    t_peerMsg++; handle_msg_body(m); t_peerMsg--;
+}
 static void handle_msg_body(const char *m) {    uint32_t id, v;
     int unit, a, b;
     char *path;
@@ -6731,6 +7042,7 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
     }
     if (strstr(m, "\"t\":\"op\"") && (strstr(m, "\"kind\":\"alive\"") || strstr(m, "\"kind\":\"saving\""))) { leader_signal(m); return; }
     if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"hello\"")) { on_hello(m); return; }
+    if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"digest\"")) { on_digest(m); return; }
     if (strstr(m, "\"t\":\"op\"") && (strstr(m, "\"kind\":\"shared.files\"") || strstr(m, "\"kind\":\"shared.need\""))) {
         sh_inbox(m);                                     // not held during a project load: nothing of the song in it
         return;
@@ -8148,6 +8460,7 @@ static void ws_send(const char *msg) {
     static const char ALIVE[] = "{\"t\":\"op\",\"op\":{\"kind\":\"alive\"", CUR[] = "{\"t\":\"op\",\"op\":{\"kind\":\"cur\"";
     if (strncmp(msg, ALIVE, sizeof(ALIVE) - 1) == 0 || strncmp(msg, CUR, sizeof(CUR) - 1) == 0) { ws_send_now(msg); return; }
     log_op("out", msg);
+    if (op_changes_song(msg)) g_lastOpAt = GetTickCount();
     EnterCriticalSection(&g_outLock);
     if (g_outBusy || g_outHead || strlen(msg) > BIG_MSG) { out_push(_strdup(msg), NULL, 0); SetEvent(g_outEvt); }
     else ws_send_now(msg);
@@ -8159,6 +8472,7 @@ static void ws_send_samples(char *msg, const unsigned char *blob, size_t n) {
     unsigned char *copy;
     if (!g_ws) { free(msg); return; }
     log_op("out", msg);
+    g_lastOpAt = GetTickCount();
     copy = (unsigned char *)malloc(n ? n : 1);
     if (n) memcpy(copy, blob, n);
     EnterCriticalSection(&g_outLock);
@@ -9407,7 +9721,7 @@ static DWORD WINAPI shThread(LPVOID p) {
         if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - g_shBackups), L"Shared backups");
         for (i = 0; d[i]; i++) low[i] = towlower(d[i]);
         low[i] = 0;
-        if (!SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, g_shTable))) return 0;
+        if (!flim_appdata(g_shTable, MAX_PATH)) return 0;
         swprintf_s(g_shTable + wcslen(g_shTable), MAX_PATH - wcslen(g_shTable), L"\\flim\\shared-%08llx.tsv",
                    (unsigned long long)(fnv64((const unsigned char *)low, i * 2) & 0xffffffffull));
         wcscpy_s(g_shRoot, MAX_PATH, d);                    // in_shared from here on
