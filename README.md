@@ -48,7 +48,7 @@ samples) is kept in sync over the internet. It works a bit like [Drawpile](https
 | Mixer volume / pan / stereo separation / mute / built-in EQ; each effect slot's on/off and mix level | |
 | Mixer track names, colors and routing (sends on/off and send levels) | |
 | Inserting, deleting and trimming mixer tracks; moving one (as ordinary edits, so its effects reload on the other side) | |
-| Adding, deleting and reordering channels; channel names and colors | |
+| Adding (anywhere in the list, cloning too), deleting and reordering channels; channel names and colors | |
 | Adding, replacing and removing mixer effects | |
 | Notes in every pattern; pattern names, colors and length (so new patterns too) | |
 | Inserting, cloning, deleting and splitting patterns (later patterns move along) | |
@@ -74,7 +74,9 @@ you stop: about 0.6 s for a channel or mixer knob, 2 s for notes or a playlist t
 **10 s** by default. Each person sets their own plugin time (1–10 s, *Keep a plugin I change locked to
 me for … s* in flim's window): it is how long a plugin you're working on stays yours after your last change.
 Names, colors, routing, markers and the time signature have no locks; if two people change the same
-one at the same moment, the leader's change wins.
+one at the same moment, the leader's change wins. If the channel lists ever end up different anyway (say,
+two people add or delete channels at the very same moment), flim notices and reloads the leader's
+project for everyone instead of letting edits land on the wrong channels.
 
 **What isn't an edit:** values that move by themselves (automation playing back, a Patcher preset's
 own modulation, controllers linked inside FL) happen the same way on every PC, so flim only syncs a

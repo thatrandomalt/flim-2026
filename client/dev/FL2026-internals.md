@@ -76,8 +76,8 @@ Offsets that changed from FL 25.2.3.5171 are marked with the old value in bracke
 |---|---|---|---|
 | `CHANLIST_VA` | `0x15e2218` | global -> channel list: items `+8`, count `+0x10` | `channels.channelCount` (global) |
 | `CHANFILT_VA` | `0x15e0128` | same layout, the rack's current filter group | `channels.channelCount` (group) |
-| `ADDCHAN_VA` | `0x1004230` | `AddChannel(-1, 0, 1)` -> new channel (appended) | tutorial `addChannel` |
-| `DELCHAN_VA` | `0x1004a60` | `DeleteChannel(index, 0, flags)`; flags 1\|2 = no dialog | tutorial `removeChannel` |
+| `ADDCHAN_VA` | `0x1004230` | `AddChannel(pos, select, group)` -> new channel: appended, then moved to `pos` (`sub_FFEEE0`) unless `pos` is -1. FL's Clone (`ChanCloneMenuClick` `0x11F5F20`) calls `AddChannel(source + 1, 0, 0)` and copies the source in (`sub_1005590(source, new, 0)`: its state saved and loaded like a preset) | tutorial `addChannel` |
+| `DELCHAN_VA` | `0x1004a60` | `DeleteChannel(index, 0, flags)`; flags 1\|2 = no dialog. flim detours it (prologue `55 57 56 53 48 81 EC 88 00 00 00 48 8B EC`, the same in 26.1.5): see "The channel list" in section 5 | tutorial `removeChannel` |
 | `RESOLVER_VA` | `0x1005770` | `ResolveChannel(index, global, &obj)` | channel wrappers |
 | `MOVECHAN_VA` | `0x1042800` | `ReorderChannels(**MOVEOBJ 0x15e14a0, mode, **MOVEARG 0x15e3a60, flags)`: Alt+Up/Down and sorts; moves the selected channels | |
 | channel `+0x50` / `+0x78` | | name (UnicodeString) / color; vmt `+0x70` SetName, `+0x78` SetColor | `setChannelName/Color` |
@@ -400,6 +400,34 @@ load of Slicer 2 hung for good: main thread in `sub_F46490` (`0xf4c58f`) -> Slic
 `engine_x64.dll` waiting, no other thread in its code (plain FL, and flim without a session, never hung).
 The poll thread now skips while `FLLOADS_VA` > 0 or a project load runs.
 
+**The channel list.** flim knows channels only by their object's address: a channel has no ID (the
+only per-channel counter-like field is its index at `+0x794`). It used to sync only channels added at
+the end, plus pure reorders. A Clone puts the copy right after its source, undo puts deleted channels
+back where they were, and a drop lands where it is dropped. Such an insert was logged as "changed in an
+unsupported way" and dropped, and every channel after it was off by one from then on: later adds were
+skipped ("chan.add: expected index 8 but have 15 channels"), and states, notes and edits landed on the
+wrong channels (a tester's session lost a channel's plugin that way). How it works now (engine
+`chan_struct_local`, `do_addch`, `do_delch`):
+- A change goes out as steps the others replay with FL's own functions. First the deleted channels
+  (highest index first), then the rest's new order (`chan.order`), then each new channel at its index,
+  lowest first (`chan.add` with its state, then its notes, then its settled state 1.5 s later). The
+  receiver inserts with `AddChannel(pos, 0, 1)`, as Clone does.
+- Each op carries `n0`, the channel count it applies to. A receiver whose count differs is out of step:
+  a member asks for the leader's project again, the leader sends its project to everyone
+  (`resync`, at most once every 10 s).
+- FL hands a deleted channel's memory to the next channel it makes, so a delete and an add between two
+  checks looked like one channel moving. The `DeleteChannel` detour notes each deleted channel, and the
+  check (now within one poll pass, about 30 ms, after FL's list changes) counts one of those found
+  again as new.
+- A peer's channel index means a place in the list everyone has (`g_chKnown`), which this FL keeps up
+  to date op by op, even while its own change isn't sent yet. Peer loads bind to a channel when they
+  run, not when they arrive behind other queued channel ops. This FL's own structural change waits
+  until the peers' ops that came before it are applied (up to 2 s).
+- A state check queued before channels or tracks moved is dropped (a moved unit has no baseline yet,
+  and its index-dependent state looked like an edit) and taken again later.
+- Tests: `live_test.py chan_insert` (an insert, a burst of three, a delete and an insert together, a
+  Clone) and `chan_race` (both insert at the same moment). The old engine failed all but the first.
+
 ## 6. Threads and locks
 
 - Call FL only from its main thread. flim runs that work from a **message-only window's WndProc**
@@ -437,8 +465,8 @@ The poll thread now skips while `FLLOADS_VA` > 0 or a project load runs.
 - `live_test.py` makes a change in one FL through FL's own functions and checks the other. It covers
   params, mixer names/mute/routes/colors, notes, patterns and pattern ops, markers, time signatures,
   channels (add, rename, reorder, delete, with a sample), clips, VST state, an SF2 Player soundfont,
-  mixer insert, delete, append and move, solo staying local, and a plugin someone else is editing
-  (51 checks). Run it after every port.
+  mixer insert, delete, append and move, solo staying local, a plugin someone else is editing, and
+  channels inserted mid-list, quickly and by both at once (57 checks). Run it after every port.
 - The engine writes `%TEMP%\flim_crash_<pid>.dmp` on the first jump into unloaded code (on by default,
   `FLIM_CRASHDUMP=0` turns it off); flim.exe puts it into the crash report, and saves a hang report
   (a small dump of FL) after 20 s without an answer (`hang_watch`; `IsHungAppWindow` doesn't notice a

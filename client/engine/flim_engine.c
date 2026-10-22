@@ -154,6 +154,8 @@ static void mix_known_take(void);
 static void mix_struct(void);
 static int  unit_params(int unit, int a, int b);
 static int  chan_list_changed(void);
+static void resync(const char *why);
+static void notes_send_channel(int c);
 static wchar_t *dstr_keep(const wchar_t *s);
 static int int_after(const char *p, const char *end, const char *key, int *out);
 static void ws_send(const char *msg);
@@ -302,22 +304,29 @@ enum { T_PARAM, T_SNAP, T_LOAD, T_ADDCH, T_DELCH, T_STRUCT, T_FULL, T_ORDER, T_F
        T_CLIPSNAP, T_CLIPS, T_UNITREVERT, T_HINT, T_METASNAP, T_META, T_PATOP, T_RELOADU, T_PLUGFOCUS,
        T_MIXSTRUCT, T_NAMEPROJ, T_PCOUNT };
 enum { U_CH, U_FX };
-enum { SNAP_BASELINE, SNAP_IF_DIFF, SNAP_FORCE, SNAP_ADD, SNAP_COLLECT };
+enum { SNAP_BASELINE, SNAP_IF_DIFF, SNAP_FORCE, SNAP_COLLECT };
 #define QCAP 16384
 typedef struct {
     int type;
     uint32_t id, v;          // T_PARAM
     int unit, a, b;          // unit kind + (channel) or (track, slot)
-    int mode;                // T_SNAP mode / T_LOAD: 1 = skip if identical / T_PARAM: 1 = someone else's edit
+    int mode;                // T_SNAP mode / T_LOAD: 1 = skip if identical / T_PARAM: 1 = someone else's edit /
+                             // T_ADDCH, T_DELCH: the sender's channel count before it (-1: not sent)
     char *path;              // T_LOAD / T_ADDCH: inbound .fst file (owned; deleted after use)
     int *order;              // T_ORDER: [n, from0..from(n-1)]; T_FXSYNC/T_NOTESYNC: bitmap;
                              // T_NOTES: note records, it->mode = count (owned)
     HWND wnd;                // T_PLUGFOCUS: the plugin window the user worked in
     void *chobj;             // channel tasks: the channel object at index a when queued (see run_task)
+    int peer;                // someone else's op: channel index a is in the list as everyone has it (g_chKnown)
+                             // when it runs, after the ops before it
+    LONG gen;                // g_structGen when queued: a state check queued before channels moved is stale
 } QItem;
 static void run_task_inner(const QItem *it);
 static QItem g_q[QCAP];
 static int g_qh = 0, g_qt = 0;
+static __declspec(thread) int t_peerMsg;   // inside handle_msg: what gets queued is someone else's op
+static volatile LONG g_peerQueued = 0;     // such tasks still waiting in the queue
+static volatile LONG g_structGen;          // (with the units below)
 
 static void gui_log(const char *line);
 static void logmsg(const char *fmt, ...) {
@@ -621,7 +630,8 @@ static void enqueue(const QItem *it) {
         int i;
         for (i = g_qh; i != g_qt; i = (i + 1) % QCAP) {
             QItem *q = &g_q[i];
-            if (q->type == T_LOAD && q->unit == it->unit && q->a == it->a && q->b == it->b) {
+            if (q->type == T_LOAD && q->unit == it->unit && q->a == it->a && q->b == it->b &&
+                q->peer == (it->peer || t_peerMsg) && q->chobj == it->chobj) {
                 DeleteFileA(q->path); free(q->path);
                 q->path = it->path; q->mode = it->mode;
                 LeaveCriticalSection(&g_qLock);
@@ -631,8 +641,14 @@ static void enqueue(const QItem *it) {
         }
     }
     int nt = (g_qt + 1) % QCAP;
-    if (nt != g_qh) { g_q[g_qt] = *it; g_qt = nt; }
-    else logmsg("queue full, dropped task type %d", it->type);
+    if (nt != g_qh) {
+        QItem *q = &g_q[g_qt];
+        *q = *it;
+        q->peer = q->peer || t_peerMsg;
+        q->gen = g_structGen;
+        if (q->peer) InterlockedIncrement(&g_peerQueued);
+        g_qt = nt;
+    } else logmsg("queue full, dropped task type %d", it->type);
     LeaveCriticalSection(&g_qLock);
     wake_main();
 }
@@ -647,11 +663,18 @@ static int chan_list(void ***items);
 static void enqueue_unit(int type, int unit, int a, int b, int mode, char *path) {
     QItem it; memset(&it, 0, sizeof(it));
     it.type = type; it.unit = unit; it.a = a; it.b = b; it.mode = mode; it.path = path;
-    if (unit == U_CH && (type == T_LOAD || type == T_SNAP || type == T_RELOADU || type == T_DELCH)) {
+    if (unit == U_CH && (type == T_LOAD || type == T_SNAP || type == T_RELOADU)) {
         void **items;
         int n = chan_list(&items);
         if (items && a >= 0 && a < n) it.chobj = items[a];   // which channel this is for, whatever its index later
     }
+    enqueue(&it);
+}
+// A peer's op for a channel: its index can't be bound now, while channel ops queued before it (a burst of
+// inserts) haven't run yet; task_rebind binds it when it runs.
+static void enqueue_peer(int type, int unit, int a, int b, int mode, char *path) {
+    QItem it; memset(&it, 0, sizeof(it));
+    it.type = type; it.unit = unit; it.a = a; it.b = b; it.mode = mode; it.path = path; it.peer = 1;
     enqueue(&it);
 }
 
@@ -665,7 +688,6 @@ typedef struct {
     DWORD lastAct;           // last local param activity (0 = idle)
     int burst;               // a preset-sized param burst happened in this activity
     DWORD identAt;           // identity changed locally at (send after settle)
-    DWORD addAt;             // channel appended locally at (send chan.add after settle)
     DWORD suppressUntil;     // remote state being applied: ignore local param changes
     DWORD absorbUntil;       // identity changes until then come from our own apply
     DWORD baselineAt;        // take a silent baseline at this tick
@@ -993,6 +1015,14 @@ static void do_snap(const QItem *it) {
     Unit *u = unit_ptr(it->unit, it->a, it->b);
     size_t n = 0;
     if (!u) return;
+    if ((it->mode == SNAP_IF_DIFF || it->mode == SNAP_BASELINE) && it->gen != g_structGen) {
+        // queued before channels or tracks moved: moved units have no baseline (hash 0), and a check
+        // would take their index-dependent state for an edit to send. A silent baseline comes later.
+        static LONG said = -1;
+        if (said != g_structGen) { said = g_structGen; logmsg("PLUG state checks queued before channels / tracks moved: retaken later"); }
+        u->baselineAt = GetTickCount() + REBASE_MS;
+        return;
+    }
     // States go out by channel index: while FL's channel list differs from the last structure scan (a
     // reorder the scan hasn't sent yet), index a may be another channel already. A burst / sweep snapshot
     // waits for the scan, which re-baselines the moved channels anyway.
@@ -1021,7 +1051,6 @@ static void do_snap(const QItem *it) {
         }
         break;
     case SNAP_FORCE:   send = 1; break;   // identity changed: always
-    case SNAP_ADD:     send_unit("chan.add", it->unit, it->a, it->b, d, n, NULL); break;
     default: break;
     }
     if (send) {
@@ -1160,34 +1189,92 @@ static void units_shift_after_delete(int idx, int n) {
     plug_agreed_reset(1, 0);
     InterlockedIncrement(&g_structGen);
 }
+// A channel came in at idx (n before): the later channels' bookkeeping moves up one.
+static void units_insert(int idx, int n) {
+    int i;
+    for (i = n < MAX_CH - 1 ? n : MAX_CH - 1; i > idx; i--) g_chU[i] = g_chU[i - 1];
+    if (idx < MAX_CH) memset(&g_chU[idx], 0, sizeof(Unit));
+    for (i = idx; i < MAX_CH; i++) {
+        g_chanPlugN[i] = 0;
+        g_chU[i].hash = 0;
+    }
+    plug_agreed_reset(1, 0);
+    InterlockedIncrement(&g_structGen);
+}
+
+// Channels FL deleted since the last structure check (delchan_detour; main thread): one of these
+// in FL's list again is a new channel in its memory.
+#define CH_DEAD_MAX 64
+static void *g_chDead[CH_DEAD_MAX];
+static int   g_nChDead = 0;
 
 static void known_from_list(void) {
     void **items; int n = chan_list(&items), i;
+    if (n > MAX_CH) n = MAX_CH;
     for (i = 0; i < n; i++) g_chKnown[i] = items[i];
     g_nChKnown = n;
+    g_nChDead = 0;
 }
 
+static int index_of(void **list, int n, void *o) {
+    int i;
+    for (i = 0; i < n; i++) if (list[i] == o) return i;
+    return -1;
+}
+
+// A peer's new channel at index a of the channel list everyone has (g_chKnown; it->mode = that list's
+// length then). FL's AddChannel(pos) puts it there, as FL's Clone does. A channel added here that isn't
+// sent yet stays put: the peer's goes next to the channel it follows in the shared list.
 static void do_addch(const QItem *it) {
-    void **items; int n = chan_list(&items);
-    if (n != it->a) { logmsg("chan.add: expected index %d but have %d channels; skipped", it->a, n); return; }
+    void **items; int n = chan_list(&items), nk = g_nChKnown, a = it->a, pos;
     void *obj = NULL;
-    __try { obj = g_addChannel(-1, 0, 1); } __except (EXCEPTION_EXECUTE_HANDLER) { obj = NULL; }
-    if (!obj) { logmsg("chan.add: AddChannel failed"); return; }
-    known_from_list();
-    memset(&g_chU[it->a], 0, sizeof(Unit));
-    g_chU[it->a].absorbUntil = GetTickCount() + SUPPRESS_MS + SETTLE_IDENT_MS;
-    logmsg("CHAN added index %d (remote)", it->a);
-    enqueue_unit(T_LOAD, U_CH, it->a, 0, 0, it->path);    // load its plugin on a later tick
+    if (nk >= MAX_CH) { logmsg("chan.add: more than %d channels aren't synced", MAX_CH); DeleteFileA(it->path); free(it->path); return; }
+    if (it->mode >= 0 ? (nk != it->mode || a < 0 || a > nk) : a != nk) {
+        logmsg("chan.add: index %d of %d channels, but this FL has %d", a, it->mode >= 0 ? it->mode : a, nk);
+        DeleteFileA(it->path); free(it->path);
+        resync("a channel added to another channel list");
+        return;
+    }
+    pos = a < nk ? index_of(items, n, g_chKnown[a]) : (nk ? index_of(items, n, g_chKnown[nk - 1]) + 1 : 0);
+    if (!items || pos < 0) {                                // its neighbour was deleted here and that isn't sent yet
+        DeleteFileA(it->path); free(it->path);
+        resync("a channel added next to one deleted here");
+        return;
+    }
+    __try { obj = g_addChannel(pos < n ? pos : -1, 0, 1); } __except (EXCEPTION_EXECUTE_HANDLER) { obj = NULL; }
+    if (!obj) { logmsg("chan.add: AddChannel failed"); DeleteFileA(it->path); free(it->path); resync("a channel FL didn't add"); return; }
+    memmove(g_chKnown + a + 1, g_chKnown + a, sizeof(void *) * (size_t)(nk - a));
+    g_chKnown[a] = obj;
+    g_nChKnown = nk + 1;
+    units_insert(a, nk);
+    g_chU[a].inst = plugin_inst(obj);
+    g_chU[a].absorbUntil = GetTickCount() + SUPPRESS_MS + SETTLE_IDENT_MS;
+    if (a < nk) notes_rebaseline();                         // the channels after it moved up: FL renumbered their notes
+    logmsg("CHAN added index %d (remote)", a);
+    {   // its state loads on a later tick, into this channel wherever it is by then
+        QItem q; memset(&q, 0, sizeof(q));
+        q.type = T_LOAD; q.unit = U_CH; q.a = pos < n ? pos : n; q.path = it->path; q.chobj = obj;
+        enqueue(&q);
+    }
 }
 
+// A peer deleted channel a of the list everyone has (it->mode = that list's length then).
 static void do_delch(const QItem *it) {
-    void **items; int n = chan_list(&items);
-    if (it->a < 0 || it->a >= n) { logmsg("chan.del: index %d out of range (%d)", it->a, n); return; }
-    __try { g_delChannel((unsigned)it->a, 0, DELCHAN_FLAGS); } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("chan.del faulted"); }
-    units_shift_after_delete(it->a, n);
-    known_from_list();
+    void **items; int n = chan_list(&items), nk = g_nChKnown, a = it->a, j;
+    if ((it->mode >= 0 && nk != it->mode) || a < 0 || a >= nk) {
+        logmsg("chan.del: index %d of %d channels, but this FL has %d", a, it->mode, nk);
+        resync("a channel deleted from another channel list");
+        return;
+    }
+    j = index_of(items, n, g_chKnown[a]);                  // -1: deleted here too, not sent yet
+    if (j >= 0) {
+        __try { g_delChannel((unsigned)j, 0, DELCHAN_FLAGS); } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("chan.del faulted"); }
+    }
+    units_shift_after_delete(a, nk);
+    memmove(g_chKnown + a, g_chKnown + a + 1, sizeof(void *) * (size_t)(nk - a - 1));
+    g_nChKnown = nk - 1;
     notes_rebaseline();
-    logmsg("CHAN deleted index %d (remote)", it->a);
+    logmsg("CHAN deleted index %d (remote)", a);
 }
 
 // Channels changed places: carry each channel's unit bookkeeping (plugin identity etc.)
@@ -1242,12 +1329,6 @@ static void do_fxsync(const QItem *it) {
     if (n) logmsg("PLUG join: clearing %d effect slots the leader has empty", n);
 }
 
-static int index_of(void **list, int n, void *o) {
-    int i;
-    for (i = 0; i < n; i++) if (list[i] == o) return i;
-    return -1;
-}
-
 // Remote reorder: rebuild the peer's order with FL's own "move selected up", one
 // channel at a time (select only it, move, repeat), then restore our selection.
 // Works on the rack's filter-group list like FL does; channels outside the group
@@ -1259,7 +1340,11 @@ static void do_order(const QItem *it) {
     static void *M[MAX_CH], *T[MAX_CH], *D[MAX_CH];
     static unsigned char sel[MAX_CH];
     int nm = chan_list(&items);
-    if (!items || nm != n || g_nChKnown != n) { logmsg("chan.order: have %d channels (known %d), peer %d; skipped", nm, g_nChKnown, n); return; }
+    if (!items || nm != n || g_nChKnown != n || chan_list_changed()) {    // (changed: a reorder here crossed it)
+        logmsg("chan.order: have %d channels (known %d), peer %d", nm, g_nChKnown, n);
+        resync("channels reordered in another channel list");
+        return;
+    }
     {
         unsigned char seen[MAX_CH] = { 0 };
         for (i = 0; i < n; i++) {
@@ -1310,12 +1395,80 @@ static void do_order(const QItem *it) {
     known_from_list();
     notes_rebaseline();
     logmsg("CHAN reordered (remote): %d moves, %s", steps, ok ? "order matches" : "ORDER MISMATCH");
+    if (!ok) resync("FL didn't reorder the channels as asked");
+}
+
+// A new channel goes out at once, at its index i (n0: the others' channel count before it), with
+// the state it has now; its settled state follows (identAt), as FL may still be loading its plugin.
+static void chan_add_send(int i, int n0) {
+    size_t n = 0, cap;
+    unsigned char *d = unit_save(U_CH, i, 0, &n);
+    char *f, *m, nm[80];
+    if (!d) { resync("a new channel's state couldn't be saved"); return; }
+    f = unit_json_fields(U_CH, i, 0, d, n);
+    cap = strlen(f) + 128;
+    m = (char *)malloc(cap);
+    sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"chan.add\",\"n0\":%d,%s}}", n0, f);
+    ws_send_samples(m, d, n);                       // lists (and uploads) the samples the state uses
+    logmsg("CHAN added locally: index %d of %d%s (sent, %zu bytes)", i, n0 + 1, unit_name_note(U_CH, i, nm, sizeof(nm)), n);
+    free(f); free(d);
+}
+
+// FL's channel list changed here: tell the others in steps they replay with FL's own functions.
+// Deleted channels first (highest index first), then the rest's new order, then each new channel at
+// its index, lowest first: FL's Clone puts the copy right after its source, undo puts deleted channels
+// back where they were, a drop lands where it is dropped, Add appends. Each op carries the channel
+// count it applies to, so a peer whose list differs notices (resync) instead of editing the wrong channels.
+static void chan_struct_local(void **items, int n, DWORD now) {
+    static void *K[MAX_CH];
+    static int from[MAX_CH], added[MAX_CH];
+    int nk = g_nChKnown, k, i, j, nc = 0, na = 0;
+    char m[64 + MAX_CH * 5];
+    if (n > MAX_CH) n = MAX_CH;
+    memcpy(K, g_chKnown, sizeof(void *) * (size_t)nk);
+    for (k = nk - 1; k >= 0; k--) {
+        if (index_of(items, n, K[k]) >= 0 && index_of(g_chDead, g_nChDead, K[k]) < 0) continue;   // (dead: its memory is a new channel's)
+        sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"chan.del\",\"ch\":%d,\"n0\":%d}}", k, nk);
+        ws_send(m);
+        logmsg("CHAN deleted locally: index %d (sent)", k);
+        units_shift_after_delete(k, nk);
+        memmove(K + k, K + k + 1, sizeof(void *) * (size_t)(nk - k - 1));
+        nk--;
+    }
+    for (i = 0; i < n; i++) if ((j = index_of(K, nk, items[i])) >= 0) from[nc++] = j;
+    for (i = 0; i < nc && from[i] == i; i++) {}
+    if (i < nc) {
+        // moved (up/down, sort): the peers replay it with FL's own move, so channels keep their state
+        int len = sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"chan.order\",\"n\":%d,\"from\":[", nc);
+        for (i = 0; i < nc; i++) len += sprintf_s(m + len, sizeof(m) - len, "%s%d", i ? "," : "", from[i]);
+        strcat_s(m, sizeof(m), "]}}");
+        ws_send(m);
+        units_permute(from, nc);
+        logmsg("CHAN list reordered locally (sent chan.order)");
+    }
+    for (i = 0, k = nc; i < n; i++) {                 // k: how many channels the others have
+        if (index_of(K, nk, items[i]) >= 0) continue;
+        units_insert(i, k);
+        g_chU[i].inst = plugin_inst(items[i]);
+        g_chU[i].identAt = now;
+        chan_add_send(i, k);
+        added[na++] = i;
+        k++;
+    }
+    known_from_list();
+    notes_rebaseline();                               // the peers replay the same change
+    for (i = 0; i < na; i++) notes_send_channel(added[i]);
+    InterlockedIncrement(&g_structGen);
 }
 
 // Compare FL's channel list and plugin instances with what we knew.
+#define STRUCT_DEFER_MS 2000
+static volatile LONG g_structQueued = 0;  // the poll thread queued a structure check for a channel change
 static void do_struct(void) {
     void **items; int n = chan_list(&items), i, t, s;
     DWORD now = GetTickCount();
+    static DWORD deferSince = 0;
+    InterlockedExchange(&g_structQueued, 0);
     if (!items) return;
     if (g_nChKnown < 0) {
         known_from_list();
@@ -1333,54 +1486,13 @@ static void do_struct(void) {
         if (!common) { proj_begin("channel list replaced"); return; }
     }
     if (closing_now()) return;
-    int prefixSame = 1;
-    for (i = 0; i < n && i < g_nChKnown; i++) if (items[i] != g_chKnown[i]) { prefixSame = 0; break; }
-    if (n > g_nChKnown && prefixSame) {
-        for (i = g_nChKnown; i < n; i++) {
-            memset(&g_chU[i], 0, sizeof(Unit));
-            g_chU[i].addAt = now;
-            logmsg("CHAN appended locally: index %d", i);
-        }
-        known_from_list();
-    } else if (n != g_nChKnown || !prefixSame) {
-        // find deleted channels (known objects no longer in the list), highest index first
-        int k, j, deleted = 0;
-        for (k = g_nChKnown - 1; k >= 0; k--) {
-            for (j = 0; j < n && items[j] != g_chKnown[k]; j++) {}
-            if (j == n) {
-                char m[96];
-                sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"chan.del\",\"ch\":%d}}", k);
-                ws_send(m);
-                logmsg("CHAN deleted locally: index %d (sent)", k);
-                units_shift_after_delete(k, g_nChKnown - deleted);
-                deleted++;
-            }
-        }
-        if (!deleted && n == g_nChKnown) {
-            // Reorder (move up/down, sort): send the permutation; the peer replays it
-            // with FL's own move, so channels keep their state and params as they travel.
-            int from[MAX_CH], moved = 0, ok = 1;
-            char m[64 + MAX_CH * 5];
-            int len = sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"chan.order\",\"n\":%d,\"from\":[", n);
-            for (i = 0; i < n; i++) {
-                for (j = 0; j < n && g_chKnown[j] != items[i]; j++) {}
-                if (j == n) { ok = 0; break; }
-                from[i] = j;
-                if (j != i) moved++;
-                len += sprintf_s(m + len, sizeof(m) - len, "%s%d", i ? "," : "", j);
-            }
-            if (ok) {
-                strcat_s(m, sizeof(m), "]}}");
-                ws_send(m);
-                units_permute(from, n);
-                logmsg("CHAN list reordered locally: %d channels moved (sent chan.order)", moved);
-            } else logmsg("CHAN list reordered with unknown channels; not synced");
-            known_from_list();
-        } else if (!deleted) logmsg("CHAN list changed in an unsupported way (count %d -> %d)", g_nChKnown, n);
-        known_from_list();
-        notes_rebaseline();          // the peer replays the same structural change
-        InterlockedIncrement(&g_structGen);
-    }
+    if (!chan_list_changed()) deferSince = 0;
+    else if (g_peerQueued > 0 && (!deferSince || now - deferSince < STRUCT_DEFER_MS)) {
+        // the others' ops that came before this change still wait in the queue: they go first, as their
+        // channel numbers don't count it yet (unless they keep coming for STRUCT_DEFER_MS)
+        if (!deferSince) deferSince = now;
+        return;
+    } else { deferSince = 0; chan_struct_local(items, n, now); }
     mix_struct();                    // before the slot checks: inserted / deleted tracks move plugins along
     // plugin identity (add/replace) per channel and mixer slot
     for (i = 0; i < n; i++) {
@@ -1388,7 +1500,7 @@ static void do_struct(void) {
         Unit *u = &g_chU[i];
         if (inst != u->inst) {
             u->inst = inst;
-            if (now < u->absorbUntil || u->addAt) continue;
+            if (now < u->absorbUntil) continue;
             if (inst) { u->identAt = now; logmsg("PLUG identity changed: ch %d", i); }
         }
     }
@@ -1608,6 +1720,24 @@ static char *notes_json_item(int p, int g, const unsigned char *d, unsigned n) {
 
 #define GROUP_MAX 1024
 
+// Channel g's notes in pattern p (d: the pattern's records) go out under that channel's lock.
+static void notes_send_group(int p, int g, const unsigned char *d, unsigned n) {
+    char key[32], *f, *m;
+    unsigned gn;
+    unsigned char *gd;
+    size_t cap;
+    sprintf_s(key, sizeof(key), "pat:%d:%d", p, g);
+    if (!unit_before_send(key, 1, p, d, n, g)) { unit_revert(key); return; }
+    gd = recs_group(1, d, n, g, &gn);
+    f = notes_json_item(p, g, gd, gn);
+    cap = strlen(f) + 96;
+    m = (char *)malloc(cap);
+    sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"notes.set\",\"key\":\"%s\",%s}}", key, f);
+    ws_send(m);
+    free(m); free(f); free(gd);
+    logmsg("NOTES sent pattern %d channel %d (%u notes)", p, g, gn);
+}
+
 // A pattern's notes settled: send each channel whose notes differ from what was last
 // sent or applied, under that channel's lock.
 static void do_notesnap(const QItem *it) {
@@ -1623,23 +1753,24 @@ static void do_notesnap(const QItem *it) {
     }
     ng = group_diff(1, d, n, b, bn, gs, GROUP_MAX);
     free(b);
-    for (i = 0; i < ng; i++) {
-        char key[32];
-        unsigned gn;
-        unsigned char *gd;
-        sprintf_s(key, sizeof(key), "pat:%d:%d", p, gs[i]);
-        if (!unit_before_send(key, 1, p, d, n, gs[i])) { unit_revert(key); continue; }
-        gd = recs_group(1, d, n, gs[i], &gn);
-        char *f = notes_json_item(p, gs[i], gd, gn);
-        size_t cap = strlen(f) + 96;
-        char *m = (char *)malloc(cap);
-        sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"notes.set\",\"key\":\"%s\",%s}}", key, f);
-        ws_send(m);
-        free(m); free(f); free(gd);
-        logmsg("NOTES sent pattern %d channel %d (%u notes)", p, gs[i], gn);
-    }
+    for (i = 0; i < ng; i++) notes_send_group(p, gs[i], d, n);
     g_patHash[p] = n ? notes_fnv(d, n) : 0;
     free(d);
+}
+
+// A channel FL just inserted may come with notes (a clone of one that has some): after its chan.add,
+// they go out like an edit (the rebaseline took them as known).
+static void notes_send_channel(int c) {
+    int p;
+    for (p = 1; p < MAX_PAT; p++) {
+        unsigned n, gn = 0;
+        unsigned char *d, *gd;
+        if (!notes_hash(p) || !(d = notes_copy(p, &n))) continue;
+        notes_clear_sel(d, n);
+        gd = recs_group(1, d, n, c, &gn);
+        if (gn) notes_send_group(p, c, d, n);
+        free(gd); free(d);
+    }
 }
 
 // it->b: the channel (-1 = the whole pattern)
@@ -1932,12 +2063,6 @@ static void do_clips(const QItem *it) {
     logmsg("CLIPS applied arrangement %d track %d (%d clips)", it->a, it->b, it->mode);
 }
 
-// A locally added channel whose chan.add has not been queued yet (poll thread).
-static int chan_add_pending(void) {
-    int i;
-    for (i = 0; i < g_nChKnown && i < MAX_CH; i++) if (g_chU[i].addAt) return 1;
-    return 0;
-}
 
 // Poll thread: the current arrangement's clips changed locally and settled?
 static void scan_clips(DWORD now) {
@@ -1952,7 +2077,7 @@ static void scan_clips(DWORD now) {
     if (h != g_clipSeen) { g_clipSeen = h; g_clipChangedAt = now; }
     if (g_clipChangedAt && now - g_clipChangedAt >= NOTES_SETTLE_MS) {
         // a new automation clip / audio clip channel: its chan.add must go out first
-        if (chan_add_pending()) return;
+        if (chan_list_changed()) return;
         g_clipChangedAt = 0;
         if (g_clipSeen != g_clipHash) enqueue_unit(T_CLIPSNAP, 0, arr, 0, 0, NULL);
     }
@@ -2480,7 +2605,7 @@ static void scan_meta(DWORD now) {
             g_mAt[t][i] = 0;
             if (g_mSeen[t][i] == g_mHash[t][i]) continue;
             if (!g_mSeen[t][i] || !g_mHash[t][i] ||   // gone / just appeared: structural sync handles it
-                (t == M_CHAN && (g_chU[i].addAt || (LONG)(now - g_chU[i].absorbUntil) < 0))) {
+                (t == M_CHAN && (LONG)(now - g_chU[i].absorbUntil) < 0)) {
                 g_mHash[t][i] = g_mSeen[t][i];        // new / remotely loaded channel: its name came with its state
                 continue;
             }
@@ -3333,6 +3458,21 @@ static void do_projload(const QItem *it) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("PROJECT load faulted"); }
     if (it->mode) set_project_file(path);                     // named: Ctrl+S saves the member's own copy
     logmsg("PROJECT opened %S ret=%d in %lu ms", path, r, GetTickCount() - t0);
+}
+
+// This FL's channel list no longer matches the others' (an op made for another list): carrying on,
+// every later channel op would land on the wrong channel. The leader's project is the reference: a
+// member asks for it again, the leader sends it to everyone. At most once every RESYNC_MS.
+#define RESYNC_MS 10000
+static void resync(const char *why) {
+    static DWORD at = 0;
+    DWORD now = GetTickCount();
+    if (at && now - at < RESYNC_MS) return;
+    at = now;
+    logmsg("SYNC out of step with the others (%s): %s", why,
+           g_isLeader ? "sending everyone the leader's project" : "loading the leader's project again");
+    if (!g_isLeader) ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");
+    else if (!g_projBusy) enqueue_unit(T_PROJSNAP, 0, 0, 0, 0, NULL);
 }
 
 // Leader: a member asked for the project (join or re-sync).
@@ -4777,7 +4917,7 @@ static void do_plugfocus(const QItem *it) {
     logmsg("PLUGFOCUS: window %p is %s %d/%d (%d votes vs %d): checking its state", (void *)it->wnd,
            hit.unit == U_CH ? "ch" : "fx", hit.a, hit.b, V[best].votes, second);
     u = unit_ptr(hit.unit, hit.a, hit.b);
-    if (!u || u->lastAct || u->identAt || u->addAt || u->baselineAt || GetTickCount() < u->suppressUntil) return;   // handled elsewhere
+    if (!u || u->lastAct || u->identAt || u->baselineAt || GetTickCount() < u->suppressUntil) return;   // handled elsewhere
     enqueue_unit(T_SNAP, hit.unit, hit.a, hit.b, u->hash ? SNAP_IF_DIFF : SNAP_BASELINE, NULL);
 }
 // Poll thread: the user worked in a plugin window and paused (or has been at it for a while).
@@ -4846,6 +4986,16 @@ static void sel_restore(void) {
 static int task_rebind(QItem *it) {
     void **items;
     int n, j;
+    if (it->peer && it->unit == U_CH && it->type == T_LOAD) {
+        // a peer's channel index: the channel at that place in the list everyone has (not FL's list,
+        // which may hold a change of ours that isn't sent yet)
+        if (it->a < 0 || it->a >= g_nChKnown) {
+            logmsg("TASK type=%d for channel %d: there is no such channel here, dropped", it->type, it->a);
+            DeleteFileA(it->path); free(it->path);
+            return 0;
+        }
+        it->chobj = g_chKnown[it->a];
+    }
     if (!it->chobj) return 1;
     n = chan_list(&items);
     for (j = 0; j < n && items && items[j] != it->chobj; j++) {}
@@ -4985,6 +5135,7 @@ static void drain_queue_mainthread(void) {
         EnterCriticalSection(&g_qLock);
         g_qh = (g_qh + 1) % QCAP;                       // only this thread takes from the queue: still `it`
         LeaveCriticalSection(&g_qLock);
+        if (it.peer) InterlockedDecrement(&g_peerQueued);
 
         if (g_projBusy && it.type != T_PROJLOAD && it.type != T_PROJDONE && it.type != T_PROJSNAP) {
             if (it.type == T_LOAD || it.type == T_ADDCH) { if (it.path) { DeleteFileA(it.path); free(it.path); } }
@@ -5091,25 +5242,46 @@ static char save_detour(const wchar_t *path, uint8_t flag) {
     if (tell) { ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"saving\",\"on\":0}}"); logmsg("PROJECT saved (the others were held off meanwhile)"); }
     return r;
 }
-// Once FL is up: the first 12 bytes of FL's writer (its prologue, position-independent) move to a
-// trampoline; a jump to save_detour takes their place.
-static void save_detour_install(void) {
-    static const unsigned char PRO[12] = { 0x55, 0x53, 0x48, 0x81, 0xEC, 0x98, 0, 0, 0, 0x48, 0x8B, 0xEC };   // push rbp/rbx; sub rsp,98h; mov rbp,rsp
-    unsigned char *fn = (unsigned char *)(g_flBase + (SAVEPROJ_VA - IMG_BASE)), *t;
+// FL's function fn starts with the n bytes pro (n >= 12, whole position-independent instructions):
+// they move to a trampoline that runs the original, and a jump to target takes their place.
+// Returns the trampoline (NULL: fn looks different, left alone).
+static void *detour_tramp(unsigned char *fn, const unsigned char *pro, int n, void *target) {
     unsigned char jmp[12] = { 0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0 };     // mov rax, imm64; jmp rax
-    void *target = (void *)save_detour, *back = fn + 12;
+    unsigned char *t, *back = fn + n;
     DWORD old;
-    if (memcmp(fn, PRO, 12) != 0) { logmsg("SAVE: FL's project writer looks different: saves aren't announced"); return; }
-    if (!(t = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))) return;
-    memcpy(t, fn, 12);
+    if (memcmp(fn, pro, (size_t)n) != 0) return NULL;
+    if (!(t = (unsigned char *)VirtualAlloc(NULL, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE))) return NULL;
+    memcpy(t, fn, (size_t)n);
     memcpy(jmp + 2, &back, 8);
-    memcpy(t + 12, jmp, 12);
-    g_saveprojOrig = (saveproj_t)t;
+    memcpy(t + n, jmp, 12);
     memcpy(jmp + 2, &target, 8);
-    if (!VirtualProtect(fn, 12, PAGE_EXECUTE_READWRITE, &old)) return;
+    if (!VirtualProtect(fn, 12, PAGE_EXECUTE_READWRITE, &old)) return NULL;
     memcpy(fn, jmp, 12);
     VirtualProtect(fn, 12, old, &old);
     FlushInstructionCache(GetCurrentProcess(), fn, 12);
+    return t;
+}
+// Once FL is up: FL's project writer goes through save_detour.
+static void save_detour_install(void) {
+    static const unsigned char PRO[12] = { 0x55, 0x53, 0x48, 0x81, 0xEC, 0x98, 0, 0, 0, 0x48, 0x8B, 0xEC };   // push rbp/rbx; sub rsp,98h; mov rbp,rsp
+    g_saveprojOrig = (saveproj_t)detour_tramp((unsigned char *)(g_flBase + (SAVEPROJ_VA - IMG_BASE)), PRO, 12, (void *)save_detour);
+    if (!g_saveprojOrig) logmsg("SAVE: FL's project writer looks different: saves aren't announced");
+}
+
+// FL deletes a channel (its menu, undo...): note which. FL may give that memory to the next channel it
+// makes, and a delete and an add between two structure checks would look like one channel moving.
+static delchan_t g_delchanOrig;
+static void delchan_detour(unsigned idx, char force, uint64_t flags) {
+    void **items;
+    int n = chan_list(&items);
+    if (items && idx < (unsigned)n && g_nChDead < CH_DEAD_MAX) g_chDead[g_nChDead++] = items[idx];
+    g_delchanOrig(idx, force, flags);
+}
+static void delchan_detour_install(void) {
+    static const unsigned char PRO[14] = { 0x55, 0x57, 0x56, 0x53, 0x48, 0x81, 0xEC, 0x88, 0, 0, 0, 0x48, 0x8B, 0xEC };   // push rbp/rdi/rsi/rbx; sub rsp,88h; mov rbp,rsp
+    g_delchanOrig = (delchan_t)detour_tramp((unsigned char *)(g_flBase + (DELCHAN_VA - IMG_BASE)), PRO, 14, (void *)delchan_detour);
+    if (g_delchanOrig) g_delChannel = g_delchanOrig;      // a peer's delete (do_delch) isn't one of ours
+    else logmsg("CHAN: FL's channel delete looks different: a delete and an add right after it may sync as a move");
 }
 static LRESULT CALLBACK savepop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_TIMER) { if (!host_saving()) DestroyWindow(h); return 0; }
@@ -5298,7 +5470,7 @@ static int input_recent(DWORD now) {
 static int chan_list_changed(void) {
     void **items; int n = chan_list(&items), i;
     if (g_nChKnown < 0 || !items) return 0;
-    if (n != g_nChKnown) return 1;
+    if (n != g_nChKnown || g_nChDead) return 1;          // (dead: a delete whose memory a new channel may have)
     for (i = 0; i < n; i++) if (items[i] != g_chKnown[i]) return 1;
     return 0;
 }
@@ -5317,10 +5489,7 @@ static void schedule_units(DWORD now) {
         Unit *u = unit_ptr(unit, a, b);
         if (!u) continue;
         if (unit == U_FX && !u->inst && !u->identAt) continue;
-        if (u->addAt && now - u->addAt > SETTLE_IDENT_MS) {
-            u->addAt = 0; u->identAt = 0; u->lastAct = 0;
-            enqueue_unit(T_SNAP, unit, a, b, SNAP_ADD, NULL);
-        } else if (u->identAt && now - u->identAt > SETTLE_IDENT_MS) {
+        if (u->identAt && now - u->identAt > SETTLE_IDENT_MS) {
             u->identAt = 0; u->lastAct = 0;
             enqueue_unit(T_SNAP, unit, a, b, SNAP_FORCE, NULL);
         } else if (!u->identAt && u->lastAct && now - u->lastAct > SETTLE_ACT_MS) {
@@ -5343,7 +5512,7 @@ static void schedule_units(DWORD now) {
             int a = k < nch ? k : (k - nch) / MAX_FX_SLOTS, b = k < nch ? 0 : (k - nch) % MAX_FX_SLOTS;
             Unit *u = unit_ptr(unit, a, b);
             if (!u || (unit == U_FX && !u->inst)) continue;
-            if (u->lastAct || u->identAt || u->addAt || u->baselineAt || now < u->suppressUntil) continue;
+            if (u->lastAct || u->identAt || u->baselineAt || now < u->suppressUntil) continue;
             enqueue_unit(T_SNAP, unit, a, b, u->hash ? SNAP_IF_DIFF : SNAP_BASELINE, NULL);
             break;
         }
@@ -5422,7 +5591,10 @@ static DWORD WINAPI pollThread(LPVOID p) {
         if (chan_list_changed() || mix_count_changed()) {
             // A channel or mixer track was added/removed and the main thread hasn't processed it
             // yet: REC ids of later channels / tracks have shifted, so diffs would be garbage.
+            // The structure check runs now, not at its next turn (a delete and an add between two
+            // checks are harder to tell apart, and the others should hear of it before anything else).
             int k;
+            if (!InterlockedExchange(&g_structQueued, 1)) enqueue_unit(T_STRUCT, 0, 0, 0, 0, NULL);
             for (k = 0; k < g_nslot; k++) g_slots[k].last = read_value(g_slots[k].id);
             schedule_units(now);
             Sleep(POLL_MS);
@@ -5707,15 +5879,15 @@ static void apply_plug_full(const char *m) {
     void **list;
     int local = chan_list(&list);
     int_after(m, NULL, "\"nch\":", &nch);
-    for (k = local - 1; k >= nch; k--) enqueue_unit(T_DELCH, U_CH, k, 0, 0, NULL);  // extra channels
+    for (k = local - 1; k >= nch; k--) enqueue_peer(T_DELCH, U_CH, k, 0, -1, NULL);  // extra channels
     if (local > nch) local = nch;
     const char *p = strstr(m, "\"items\":[");
     unsigned char *keep = (unsigned char *)calloc(MAX_MIX * MAX_FX_SLOTS, 1);
     while (p && (p = parse_unit(p, &unit, &a, &b, &path)) != NULL) {
         if (!path) continue;
         if (unit == U_FX && a >= 0 && a < MAX_MIX && b >= 0 && b < MAX_FX_SLOTS) keep[a * MAX_FX_SLOTS + b] = 1;
-        if (unit == U_CH && a >= local) { enqueue_unit(T_ADDCH, U_CH, a, 0, 0, path); local++; }
-        else enqueue_unit(T_LOAD, unit, a, b, 1, path);
+        if (unit == U_CH && a >= local) { enqueue_peer(T_ADDCH, U_CH, a, 0, -1, path); local++; }
+        else enqueue_peer(T_LOAD, unit, a, b, 1, path);
         items++;
     }
     {
@@ -5745,7 +5917,10 @@ static void leader_signal(const char *m) {
     }
 }
 
-static void handle_msg(const char *m) {    uint32_t id, v;
+static void handle_msg_body(const char *m);
+// Whatever one network message queues is someone else's op (task_rebind, do_struct).
+static void handle_msg(const char *m) { t_peerMsg++; handle_msg_body(m); t_peerMsg--; }
+static void handle_msg_body(const char *m) {    uint32_t id, v;
     int unit, a, b;
     char *path;
     if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"project.load\"")) {
@@ -5760,15 +5935,19 @@ static void handle_msg(const char *m) {    uint32_t id, v;
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"plug.full\"")) {
         if (!g_isLeader) apply_plug_full(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"plug.state\"")) {
-        if (parse_unit(m, &unit, &a, &b, &path) && path) enqueue_unit(T_LOAD, unit, a, b, 0, path);
+        if (parse_unit(m, &unit, &a, &b, &path) && path) enqueue_peer(T_LOAD, unit, a, b, 0, path);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"chan.add\"")) {
-        if (parse_unit(m, &unit, &a, &b, &path) && path) enqueue_unit(T_ADDCH, U_CH, a, 0, 0, path);
+        int n0 = -1;                                         // -1: an older flim (appends only)
+        int_after(m, NULL, "\"n0\":", &n0);
+        if (parse_unit(m, &unit, &a, &b, &path) && path) enqueue_peer(T_ADDCH, U_CH, a, 0, n0, path);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"mix.struct\"")) {
         QItem q; memset(&q, 0, sizeof(q));
         q.type = T_MIXSTRUCT; q.path = _strdup(m);
         enqueue(&q);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"chan.del\"")) {
-        if (int_after(m, NULL, "\"ch\":", &a)) enqueue_unit(T_DELCH, U_CH, a, 0, 0, NULL);
+        int n0 = -1;
+        int_after(m, NULL, "\"n0\":", &n0);
+        if (int_after(m, NULL, "\"ch\":", &a)) enqueue_peer(T_DELCH, U_CH, a, 0, n0, NULL);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"notes.set\"")) {
         parse_notes_item(strstr(m, "\"kind\":\"notes.set\""), NULL);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"clips.set\"")) {
@@ -8159,6 +8338,7 @@ static DWORD WINAPI engineMain(LPVOID p) {
         }
         patops_install();
         save_detour_install();
+        delchan_detour_install();
         InterlockedExchange(&g_uiWanted, 1);
         PostMessageW(g_mainWnd, WM_NULL, 0, 0);
     }

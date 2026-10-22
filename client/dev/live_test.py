@@ -99,9 +99,9 @@ def t_mixer_name():
     check('mixer name', lambda: mix_name(a, 2), lambda: mix_name(b, 2))
 
 def t_mixer_mute():
-    for on, nm in ((0, 'mixer mute'), (1, 'mixer unmute')):
+    for on, nm in ((0, 'mixer mute'), (1, 'mixer unmute')):          # (FL fades a mute in: both reach it a moment later)
         a.call(0x127b9b0, 3, on)
-        check(nm, lambda: a.r(mix_rec(a, 3) + 0x18, 1), lambda: b.r(mix_rec(b, 3) + 0x18, 1))
+        check(nm, lambda: (a.r(mix_rec(a, 3) + 0x18, 1), b.r(mix_rec(b, 3) + 0x18, 1)), lambda on=on: (bytes([on]),) * 2, wait=4)
 
 def t_route():
     mixer = a.q(a.g(0x15e22d8))
@@ -351,6 +351,31 @@ def t_fd3_lock():
     bad = [l[13:110] for l in log_since(pos, A) if 'snapped back' in l or 'PLUG applied unit=' + u in l]
     bad += [l[13:110] for l in log_since(pos, B) if u + ': reverting' in l or 'PLUG sent plug.state unit=' + u in l]
     check('FD3: B leaves A\'s plugin alone', lambda: bad[:2], lambda: [])
+
+# Channels FL puts in the middle, quickly: Clone inserts its copy right after the source
+# (AddChannel(source + 1, ...), then the source's state copied in), undo puts deleted ones back in place.
+ADDCH, CHCOPY = 0x1004230, 0x1005590                            # AddChannel(pos or -1, select, group) -> channel; Clone's copy(src, dst, 0)
+def add_named(p, pos, name):
+    c = p.call(ADDCH, pos, 0, 0)
+    p.call(va(p, p.q(p.q(c) + 0x70)), c, p.mkstr(name))
+    return c
+
+def t_chan_insert():
+    add_named(a, 1, 'Ins1')
+    check('channel inserted at 1', lambda: chan_names(a), lambda: chan_names(b), wait=8)
+    for k, pos in enumerate((0, 3, -1)): add_named(a, pos, 'Burst%d' % k)    # faster than flim's 0.5 s scan
+    check('3 channels inserted at once', lambda: chan_names(a), lambda: chan_names(b), wait=10)
+    a.call(0x1004a60, 2, 0, 3); add_named(a, 1, 'AfterDel')                  # a delete and an insert together
+    check('delete + insert at once', lambda: chan_names(a), lambda: chan_names(b), wait=10)
+    last = len(chans(a)) - 1
+    rec_set(a, last << 16, 4321); time.sleep(1)                              # something for the clone to copy: volume
+    src = chans(a)[last]; c = a.call(ADDCH, 1, 0, 0); a.call(CHCOPY, src, c, 0)   # what Clone does
+    check('clone into 1: names', lambda: chan_names(a), lambda: chan_names(b), wait=10)
+    check('clone into 1: its volume', lambda: rec_get(a, 1 << 16), lambda: rec_get(b, 1 << 16), wait=10)
+
+def t_chan_race():
+    for p, nm in ((a, 'RaceA'), (b, 'RaceB')): add_named(p, 1, nm)            # both at once: one side re-syncs
+    check('both insert at once: same list after', lambda: chan_names(a), lambda: chan_names(b), wait=30)
 
 if __name__ == '__main__':
     T = {k[2:]: v for k, v in list(globals().items()) if k.startswith('t_')}
