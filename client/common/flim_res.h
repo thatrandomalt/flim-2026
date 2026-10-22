@@ -16,6 +16,7 @@
 #define IDC_M_PROJECTS   1107      // open the projects folder (song folders, their backups)
 #define IDC_M_CRASHES    1108      // open the crash reports folder
 #define IDC_M_PROJDIR    1109      // pick another projects folder
+#define IDC_M_SHARED     1116      // open the shared folder
 #define IDC_M_SONG       1115      // song name for an untitled project (optional)
 #define IDC_J_URL        1110
 #define IDC_J_PW         1111
@@ -33,6 +34,8 @@
 #define IDC_S_STATUS     1130      // session: the status FL reports (connection, people, transfers)
 #define IDC_S_LOG        1131      //          the log (FL's and the host's)
 #define IDC_S_LOCK       1132      //          seconds a plugin stays ours after our last change
+#define IDC_S_DETAIL     1133      //          the detailed log on / off
+#define IDC_S_EXPORT     1134      //          save the logs as a zip to send
 
 // Engine: flim's startup splash (shown instead of FL's Title.png, only in flim's FL)
 #define IDR_SPLASH       301

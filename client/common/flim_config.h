@@ -8,6 +8,7 @@
 //   backup_on / backup_min  project backup zips (<song folder>\Backups), every N minutes
 //   projects_dir   where the song folders go (default Documents\flim\Projects)
 //   song_name      name for an untitled project the session leader starts with (optional)
+//   log_detailed   1: the detailed log (every op, a structure digest; flim's window shows nearly every line)
 // The file is created as UTF-16 so the profile API keeps non-ASCII paths and names.
 #pragma once
 #include <windows.h>
@@ -81,6 +82,12 @@ static int flimcfg_lock_s(void) {
     return s < 1 ? 1 : s > FLIM_LOCK_S_MAX ? FLIM_LOCK_S_MAX : s;
 }
 
+static int flimcfg_log_detailed(void) {
+    wchar_t v[8];
+    flimcfg_get(L"log_detailed", v, 8);
+    return v[0] && _wtoi(v) != 0;
+}
+
 // Documents\flim (crash reports, flim's own sample cache) and the projects folder (flim.ini
 // projects_dir, default Documents\flim\Projects): one folder per song, see the engine's song folders.
 static void flimcfg_flim_dir(wchar_t *out, int cap) {
@@ -91,6 +98,15 @@ static void flimcfg_flim_dir(wchar_t *out, int cap) {
 static void flimcfg_projects_dir(wchar_t *out, int cap) {
     flimcfg_get(L"projects_dir", out, cap);
     if (!out[0]) { flimcfg_flim_dir(out, cap); wcscat_s(out, cap, L"\\Projects"); }
+}
+// The shared folder: Public Documents\flim\Shared (C:\Users\Public\Documents\flim\Shared), the same path
+// on every PC, so a plugin's path to a file in it is right everywhere. Not a setting for that reason;
+// FLIM_SHARED_DIR moves it for tests (two FLs on one PC).
+static void flimcfg_shared_dir(wchar_t *out, int cap) {
+    wchar_t d[MAX_PATH];
+    if (GetEnvironmentVariableW(L"FLIM_SHARED_DIR", out, cap) - 1u < (DWORD)cap - 1) return;
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_COMMON_DOCUMENTS, NULL, 0, d))) wcscpy_s(d, MAX_PATH, L"C:\\Users\\Public\\Documents");
+    swprintf_s(out, cap, L"%s\\flim\\Shared", d);
 }
 
 #define FLIM_BACKUP_MIN_DEF 10

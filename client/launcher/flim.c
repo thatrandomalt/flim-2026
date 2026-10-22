@@ -217,7 +217,7 @@ static wchar_t g_lan[64];
 static HANDLE g_flProc;                  // our FL (one at a time)
 static HWND g_engine;                    // its engine (task window), once it has reported
 static int g_netState = NET_OFF;         // as it last reported
-static int g_logW;                       // widest log line so far (horizontal scroll)
+static DWORD g_flPid;                    // our FL (the last one: Export log takes its lines)
 
 static int fl_running(void) { return g_flProc && WaitForSingleObject(g_flProc, 0) == WAIT_TIMEOUT; }
 static DWORD WINAPI fl_watch(LPVOID p) {
@@ -234,6 +234,7 @@ static void fl_track(HWND dlg, HANDLE proc) {
     HANDLE *a = (HANDLE *)malloc(3 * sizeof(HANDLE)), *h = (HANDLE *)malloc(2 * sizeof(HANDLE));
     if (g_flProc) CloseHandle(g_flProc);
     g_flProc = proc;
+    g_flPid = GetProcessId(proc);
     a[1] = (HANDLE)dlg; a[2] = proc;
     if (!DuplicateHandle(GetCurrentProcess(), proc, GetCurrentProcess(), &a[0], SYNCHRONIZE, FALSE, 0)) free(a);
     else CloseHandle(CreateThread(NULL, 0, fl_watch, a, 0, NULL));
@@ -324,26 +325,40 @@ static int main_launch(HWND dlg, const wchar_t *url, const wchar_t *pw) {
     session_buttons(dlg);
     return 1;
 }
-// One log for FL's events and the host's, newest at the bottom.
+// One log for FL's events and the host's, newest at the bottom: a read-only text box, so any of it can
+// be selected and copied (Ctrl+C, right-click > Copy, Ctrl+A for all). A new line doesn't move a view
+// scrolled up to read, nor a selection. The oldest quarter goes once it holds LOG_KEEP_CHARS.
+#define LOG_KEEP_CHARS 500000
 static void main_log(HWND dlg, const wchar_t *line) {
-    HWND lb = GetDlgItem(dlg, IDC_S_LOG);
+    HWND ed = GetDlgItem(dlg, IDC_S_LOG);
     wchar_t s[1100];
     SYSTEMTIME t;
-    LRESULT n;
+    DWORD a = 0, b = 0;
+    SCROLLINFO si;
+    int len = GetWindowTextLengthW(ed), first = (int)SendMessageW(ed, EM_GETFIRSTVISIBLELINE, 0, 0), hpos = GetScrollPos(ed, SB_HORZ), follow;
+    si.cbSize = sizeof(si); si.fMask = SIF_ALL;
+    follow = !GetScrollInfo(ed, SB_VERT, &si) || si.nPos + (int)si.nPage > si.nMax;    // at the bottom (or not scrolling yet)
     GetLocalTime(&t);
-    swprintf_s(s, 1100, L"%02d:%02d  %s", t.wHour, t.wMinute, line);
-    n = SendMessageW(lb, LB_ADDSTRING, 0, (LPARAM)s);
-    if (SendMessageW(lb, LB_GETCOUNT, 0, 0) > 500) { SendMessageW(lb, LB_DELETESTRING, 0, 0); n--; }
-    SendMessageW(lb, LB_SETTOPINDEX, (WPARAM)n, 0);
-    {   // long lines (file paths) scroll sideways
-        HDC dc = GetDC(lb);
-        HGDIOBJ of = SelectObject(dc, (HFONT)SendMessageW(lb, WM_GETFONT, 0, 0));
-        SIZE sz;
-        GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);
-        SelectObject(dc, of);
-        ReleaseDC(lb, dc);
-        if (sz.cx + 8 > g_logW) { g_logW = sz.cx + 8; SendMessageW(lb, LB_SETHORIZONTALEXTENT, g_logW, 0); }
+    swprintf_s(s, 1100, L"%s%02d:%02d:%02d  %s", len ? L"\r\n" : L"", t.wHour, t.wMinute, t.wSecond, line);
+    SendMessageW(ed, EM_GETSEL, (WPARAM)&a, (LPARAM)&b);
+    SendMessageW(ed, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(ed, EM_SETSEL, len, len);
+    SendMessageW(ed, EM_REPLACESEL, FALSE, (LPARAM)s);
+    if (len > LOG_KEEP_CHARS) {
+        int cut = (int)SendMessageW(ed, EM_LINEINDEX, SendMessageW(ed, EM_GETLINECOUNT, 0, 0) / 4, 0);
+        int lines = (int)SendMessageW(ed, EM_LINEFROMCHAR, cut, 0);
+        SendMessageW(ed, EM_SETSEL, 0, cut);
+        SendMessageW(ed, EM_REPLACESEL, FALSE, (LPARAM)L"");
+        a = a > (DWORD)cut ? a - cut : 0;
+        b = b > (DWORD)cut ? b - cut : 0;
+        first = first > lines ? first - lines : 0;
     }
+    SendMessageW(ed, EM_SETSEL, a, b);
+    if (follow) SendMessageW(ed, WM_VSCROLL, SB_BOTTOM, 0);
+    else SendMessageW(ed, EM_LINESCROLL, 0, first - (int)SendMessageW(ed, EM_GETFIRSTVISIBLELINE, 0, 0));
+    SendMessageW(ed, WM_HSCROLL, MAKEWPARAM(SB_THUMBPOSITION, hpos), 0);
+    SendMessageW(ed, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(ed, NULL, TRUE);
 }
 static void crash_dir(wchar_t *out, int cap) { flimcfg_flim_dir(out, cap); wcscat_s(out, cap, L"\\Crash reports"); }
 static void open_folder(const wchar_t *d) {
@@ -419,8 +434,9 @@ static int engine_log_of(DWORD pid, DWORD code, const wchar_t *out) {
 // ---- hang reports ----
 // FL "not responding" for HANG_REPORT_S: a small dump of it (every thread's stack and what it points
 // at, so a deadlock can be read) and flim's log go into Documents\flim\Crash reports\FL hang
-// <date time>.zip. Once per hang; FL may well come back.
-#define HANG_REPORT_S 20
+// <date time>.zip. Once per hang; FL may well come back. The dump stays in %TEMP% until FL exits: if it
+// is closed while not responding, it goes into that report too (people close it long before 20 s).
+#define HANG_REPORT_S 8
 static DWORD WINAPI hang_watch(LPVOID p) {
     HANDLE *a = (HANDLE *)p;                  // { process (ours to close), window }
     HANDLE proc = a[0];
@@ -467,8 +483,7 @@ static DWORD WINAPI hang_watch(LPVOID p) {
                 swprintf_s(msg, MAX_PATH * 2 + 200, L"FL has not responded for %d s. Saved a hang report: %s (\"Crash reports\" opens the folder)", hungFor, zip);
                 PostMessageW(dlg, WM_HOST_LOG, 0, (LPARAM)msg);      // the log, as the host's lines are
             }
-            DeleteFileW(dmp);
-            DeleteFileW(log);
+            DeleteFileW(log);                         // (the dump: crash_collect)
         }
     }
     CloseHandle(proc);
@@ -479,11 +494,14 @@ static void crash_collect(HWND dlg, HANDLE proc) {
     FILETIME start, e, k, u;
     DWORD code = 0, pid = GetProcessId(proc), sz = sizeof(wchar_t) * MAX_PATH;
     wchar_t ud[MAX_PATH], dir[MAX_PATH * 2], tmp[MAX_PATH], log[MAX_PATH], zip[MAX_PATH * 2], msg[MAX_PATH * 3];
+    wchar_t hang[MAX_PATH];
     FileList L;
     SYSTEMTIME t;
-    int i, n, crashed;
+    int i, n, crashed, closedHung;
     memset(&L, 0, sizeof(L));
-    if (!GetExitCodeProcess(proc, &code) || !GetProcessTimes(proc, &start, &e, &k, &u)) return;
+    GetTempPathW(MAX_PATH, tmp);
+    swprintf_s(hang, MAX_PATH, L"%sflim_hang_%lu.dmp", tmp, GetProcessId(proc));
+    if (!GetExitCodeProcess(proc, &code) || !GetProcessTimes(proc, &start, &e, &k, &u)) { DeleteFileW(hang); return; }
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Image-Line\\Shared\\Paths", L"Shared data", RRF_RT_REG_SZ, NULL, ud, &sz) != ERROR_SUCCESS) {
         SHGetFolderPathW(NULL, CSIDL_PERSONAL, NULL, 0, ud);
         wcscat_s(ud, MAX_PATH, L"\\Image-Line");
@@ -494,23 +512,112 @@ static void crash_collect(HWND dlg, HANDLE proc) {
     GetTempPathW(MAX_PATH, tmp);
     swprintf_s(dir, MAX_PATH * 2, L"%sflim_crash_%lu.dmp", tmp, pid);
     if (GetFileAttributesW(dir) != INVALID_FILE_ATTRIBUTES) list_add(&L, dir, NULL);
-    crashed = L.n > 0 || (code >= 0xC0000000u && code < 0xD0000000u);      // an exception code (killed = 1 / -1)
+    // 0xCFFFFFFF: Windows closed FL while it wasn't responding ("Close the program"); Task Manager gives 1
+    closedHung = code == 0xCFFFFFFFu;
+    crashed = L.n > 0 || (code >= 0xC0000000u && code < 0xD0000000u);      // an exception code
     if (crashed) {
         swprintf_s(dir, MAX_PATH * 2, L"%s\\FL Studio\\Support\\Logs\\Startup", ud);
         add_newer(&L, dir, &start, 1);
         swprintf_s(log, MAX_PATH, L"%sflim_log_%lu.txt", tmp, pid);
         if (engine_log_of(pid, code, log)) list_add(&L, log, L"flim_engine.log");
+        if (GetFileAttributesW(hang) != INVALID_FILE_ATTRIBUTES) list_add(&L, hang, L"FL64 not responding.dmp");
         crash_dir(dir, MAX_PATH * 2);
         SHCreateDirectoryExW(NULL, dir, NULL);
         GetLocalTime(&t);
-        swprintf_s(zip, MAX_PATH * 2, L"%s\\FL crash %04d-%02d-%02d %02d%02d%02d.zip", dir, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        swprintf_s(zip, MAX_PATH * 2, L"%s\\FL %s %04d-%02d-%02d %02d%02d%02d.zip", dir, closedHung ? L"not responding" : L"crash",
+                   t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
         n = flim_zip(zip, L.n, (const wchar_t *const *)L.src, (const wchar_t *const *)L.name);
         DeleteFileW(log);
-        if (n > 0) swprintf_s(msg, MAX_PATH * 3, L"FL crashed (exit code 0x%08lX). Crash report: %s  (\"Crash reports\" opens the folder: send it to whoever helps you with flim)", code, zip);
-        else swprintf_s(msg, MAX_PATH * 3, L"FL crashed (exit code 0x%08lX). The crash report could not be written.", code);
+        if (n > 0) swprintf_s(msg, MAX_PATH * 3, L"%s (exit code 0x%08lX). Report: %s  (\"Crash reports\" opens the folder: send it to whoever helps you with flim)",
+                              closedHung ? L"FL stopped responding and was closed" : L"FL crashed", code, zip);
+        else swprintf_s(msg, MAX_PATH * 3, L"%s (exit code 0x%08lX). The report could not be written.", closedHung ? L"FL stopped responding and was closed" : L"FL crashed", code);
         main_log(dlg, msg);
     }
+    DeleteFileW(hang);
     for (i = 0; i < L.n; i++) { free(L.src[i]); free(L.name[i]); }
+}
+
+// ---- Export log ----
+// What helps find out what went wrong in a session, as one zip to send: flim's log lines of our FL (the
+// end of the whole log file if there's no FL of ours to pick out), this window's log, the built-in
+// host's log, and the versions and settings (never a password). Documents\flim\Logs\flim log <time>.zip.
+static int file_tail(const wchar_t *src, const wchar_t *dst, long long keep) {   // the last `keep` bytes, from a line start
+    FILE *in = NULL, *o = NULL;
+    char buf[65536];
+    size_t n;
+    long long sz;
+    if (_wfopen_s(&in, src, L"rb") != 0 || !in) return 0;
+    _fseeki64(in, 0, SEEK_END);
+    sz = _ftelli64(in);
+    _fseeki64(in, sz > keep ? sz - keep : 0, SEEK_SET);
+    if (sz > keep) { int c; while ((c = fgetc(in)) != EOF && c != '\n') {} }
+    if (_wfopen_s(&o, dst, L"wb") != 0 || !o) { fclose(in); return 0; }
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, o);
+    fclose(o); fclose(in);
+    return 1;
+}
+static int write_utf8(const wchar_t *path, const wchar_t *text) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+    char *u = (char *)malloc(n > 0 ? n : 1);
+    FILE *o = NULL;
+    if (n <= 0 || !WideCharToMultiByte(CP_UTF8, 0, text, -1, u, n, NULL, NULL) || _wfopen_s(&o, path, L"wb") != 0 || !o) { free(u); return 0; }
+    fwrite("\xEF\xBB\xBF", 1, 3, o);
+    fwrite(u, 1, (size_t)n - 1, o);
+    fclose(o);
+    free(u);
+    return 1;
+}
+static void export_log(HWND dlg) {
+    wchar_t tmp[MAX_PATH], src[MAX_PATH], eng[MAX_PATH], win[MAX_PATH], info[MAX_PATH], host[MAX_PATH], dir[MAX_PATH * 2], zip[MAX_PATH * 2];
+    wchar_t msg[MAX_PATH * 3], *text, fl[600], name[128], url[600], proj[MAX_PATH * 2], prod[128] = L"", ver[64] = L"", build[32] = L"";
+    FileList L;
+    SYSTEMTIME t;
+    DWORD sz;
+    int i, n, len, on, bmin = flimcfg_backup_min(&on);
+    memset(&L, 0, sizeof(L));
+    GetTempPathW(MAX_PATH, tmp);
+    GetLocalTime(&t);
+    swprintf_s(src, MAX_PATH, L"%sflim_engine.log", tmp);
+    swprintf_s(eng, MAX_PATH, L"%sflim_export_engine.log", tmp);
+    if ((g_flPid && engine_log_of(g_flPid, 0, eng)) || file_tail(src, eng, 16 << 20)) list_add(&L, eng, L"flim_engine.log");
+    len = GetWindowTextLengthW(GetDlgItem(dlg, IDC_S_LOG));
+    text = (wchar_t *)malloc(((size_t)len + 1) * sizeof(wchar_t));
+    GetDlgItemTextW(dlg, IDC_S_LOG, text, len + 1);
+    swprintf_s(win, MAX_PATH, L"%sflim_export_window.log", tmp);
+    if (write_utf8(win, text)) list_add(&L, win, L"flim_window.log");
+    free(text);
+    swprintf_s(host, MAX_PATH, L"%sflim_host.log", tmp);
+    if (GetFileAttributesW(host) != INVALID_FILE_ATTRIBUTES) list_add(&L, host, L"flim_host.log");
+    sz = sizeof(prod); RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"ProductName", RRF_RT_REG_SZ, NULL, prod, &sz);
+    sz = sizeof(ver); RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"DisplayVersion", RRF_RT_REG_SZ, NULL, ver, &sz);
+    sz = sizeof(build); RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"CurrentBuild", RRF_RT_REG_SZ, NULL, build, &sz);
+    GetDlgItemTextW(dlg, IDC_M_FLINFO, fl, 600);
+    flimcfg_get(L"name", name, 128);
+    flimcfg_get(L"server_url", url, 600);
+    flimcfg_projects_dir(proj, MAX_PATH * 2);
+    text = (wchar_t *)malloc(4096 * sizeof(wchar_t));
+    swprintf_s(text, 4096,
+        L"flim v.%s\r\n%s\r\n%s %s, build %s\r\nExported %04d-%02d-%02d %02d:%02d:%02d (this PC's time)\r\n"
+        L"FL: %s (pid %lu)\r\nDetailed log: %s\r\nName: %s\r\nServer: %s\r\nProjects folder: %s\r\n"
+        L"Plugin lock: %d s; project backups: %s, every %d min\r\n",
+        FLIM_VERSION_W, fl, prod, ver, build, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond,
+        fl_running() ? L"running" : L"not running", g_flPid, flimcfg_log_detailed() ? L"on" : L"off", name, url, proj,
+        flimcfg_lock_s(), on ? L"on" : L"off", bmin);
+    swprintf_s(info, MAX_PATH, L"%sflim_export_info.txt", tmp);
+    if (write_utf8(info, text)) list_add(&L, info, L"info.txt");
+    free(text);
+    flimcfg_flim_dir(dir, MAX_PATH * 2);
+    wcscat_s(dir, MAX_PATH * 2, L"\\Logs");
+    SHCreateDirectoryExW(NULL, dir, NULL);
+    swprintf_s(zip, MAX_PATH * 2, L"%s\\flim log %04d-%02d-%02d %02d%02d%02d.zip", dir, t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    n = L.n ? flim_zip(zip, L.n, (const wchar_t *const *)L.src, (const wchar_t *const *)L.name) : 0;
+    DeleteFileW(eng); DeleteFileW(win); DeleteFileW(info);
+    for (i = 0; i < L.n; i++) { free(L.src[i]); free(L.name[i]); }
+    if (n <= 0) { fail_box(dlg, L"The log could not be saved."); return; }
+    swprintf_s(msg, MAX_PATH * 3, L"Log exported: %s (send this file to whoever helps you with flim)", zip);
+    main_log(dlg, msg);
+    swprintf_s(msg, MAX_PATH * 3, L"/select,\"%s\"", zip);
+    ShellExecuteW(NULL, L"open", L"explorer.exe", msg, NULL, SW_SHOWNORMAL);
 }
 
 static void main_people(HWND dlg) {
@@ -667,6 +774,8 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         main_host_controls(dlg, 0);
         SetDlgItemInt(dlg, IDC_S_LOCK, flimcfg_lock_s(), FALSE);
         SendDlgItemMessageW(dlg, IDC_S_LOCK, EM_LIMITTEXT, 2, 0);
+        SendDlgItemMessageW(dlg, IDC_S_LOG, EM_SETLIMITTEXT, 0, 0);
+        CheckDlgButton(dlg, IDC_S_DETAIL, flimcfg_log_detailed() ? BST_CHECKED : BST_UNCHECKED);
         {
             int on, m = flimcfg_backup_min(&on);
             CheckDlgButton(dlg, IDC_M_BACKUP, on ? BST_CHECKED : BST_UNCHECKED);
@@ -717,6 +826,10 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         session_buttons(dlg);
         return TRUE;
     case WM_CTLCOLORSTATIC:              // the status in the color of the connection
+        if ((HWND)lp == GetDlgItem(dlg, IDC_S_LOG)) {            // the log reads as a text box, not as greyed out
+            SetBkColor((HDC)wp, GetSysColor(COLOR_WINDOW));
+            return (INT_PTR)GetSysColorBrush(COLOR_WINDOW);
+        }
         if ((HWND)lp == GetDlgItem(dlg, IDC_S_STATUS)) {
             HDC dc = (HDC)wp;
             SetTextColor(dc, g_netState == NET_ON ? RGB(0x1e, 0x8e, 0x3e) : g_netState == NET_CONNECTING ? RGB(0xb0, 0x6d, 0x00)
@@ -793,9 +906,19 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         case IDC_M_SONG:                 // typed in while FL runs: an untitled project gets it now
             if (HIWORD(wp) == EN_KILLFOCUS) { main_save_song(dlg); engine_send(dlg, GUI_SETTINGS, NULL); }
             return TRUE;
+        case IDC_S_DETAIL: {
+            int on = IsDlgButtonChecked(dlg, IDC_S_DETAIL) == BST_CHECKED;
+            flimcfg_set(L"log_detailed", on ? L"1" : NULL);
+            engine_send(dlg, GUI_SETTINGS, NULL);
+            main_log(dlg, on ? L"Detailed log on: every change sent and received goes into flim's log file, and this window "
+                               L"shows nearly everything. \"Export log...\" saves it all to send."
+                             : L"Detailed log off.");
+            return TRUE; }
+        case IDC_S_EXPORT: export_log(dlg); return TRUE;
         case IDC_M_PROJECTS: { wchar_t d[MAX_PATH * 2]; flimcfg_projects_dir(d, MAX_PATH * 2); open_folder(d); return TRUE; }
         case IDC_M_PROJDIR: pick_projects_dir(dlg); return TRUE;
         case IDC_M_CRASHES: { wchar_t d[MAX_PATH * 2]; crash_dir(d, MAX_PATH * 2); open_folder(d); return TRUE; }
+        case IDC_M_SHARED: { wchar_t d[MAX_PATH * 2]; flimcfg_shared_dir(d, MAX_PATH * 2); open_folder(d); return TRUE; }
         case IDC_M_CHANGEFL:
             if (DialogBoxParamW(g_inst, MAKEINTRESOURCEW(IDD_SETUP), dlg, setup_proc, 0) == IDOK) {
                 wchar_t v[128];

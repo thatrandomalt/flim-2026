@@ -131,6 +131,48 @@ int main(void) {
         free(d);
         DeleteFileW(sf2local);
     }
+    {   // the shared folder: what's in it (any slashes or case, not Shared2), and the names peers may send
+        static const struct { const wchar_t *rel; int ok; } R[] = {
+            { L"kick.wav", 1 }, { L"Drums\\808 kick.wav", 1 }, { L"a b\\c.d\\e f.flac", 1 }, { L"x.fxp", 1 },
+            { L"..\\x.wav", 0 }, { L"a\\..\\x.wav", 0 }, { L".\\x.wav", 0 }, { L"\\x.wav", 0 }, { L"a\\\\x.wav", 0 },
+            { L"C:\\x.wav", 0 }, { L"x.wav:evil", 0 }, { L"a/x.wav", 0 }, { L"x.exe", 0 }, { L"x.dll", 0 },
+            { L"x.vst3", 0 }, { L"x.lnk", 0 }, { L"noext", 0 }, { L"CON.wav", 0 }, { L"con", 0 }, { L"nul.txt", 0 },
+            { L"a\\COM1.wav", 0 }, { L"LPT9.mp3", 0 }, { L"COM10.wav", 1 }, { L"CONX.wav", 1 }, { L"x.wav.", 0 },
+            { L"dir.\\x.wav", 0 }, { L"dir \\x.wav", 0 }, { L"x?.wav", 0 }, { L"x\x01.wav", 0 }, { L"", 0 },
+            { L"desktop.ini", 0 }, { L"a\\Thumbs.db", 0 }, { L"x.wav.part", 0 }, { L"~flim-0123.part", 0 }, { L"pack.zip.crdownload", 0 },
+            { L"~$x.wav", 0 }, { L"x.hta", 0 }, { L"x.reg", 0 }, { L"x.js", 0 }, { L"x.url", 0 }, { L"Kits\\desktop.ini.wav", 1 },
+        };
+        int k;
+        wchar_t t[MAX_PATH];
+        wcscpy_s(g_shRoot, MAX_PATH, L"C:\\Users\\Public\\Documents\\flim\\Shared");
+        if (!in_shared(L"c:/users/public/documents/flim/shared/Drums/kick.wav") || !in_shared(L"C:\\Users\\Public\\Documents\\flim\\Shared\\x.wav") ||
+            in_shared(L"C:\\Users\\Public\\Documents\\flim\\Shared2\\x.wav") || in_shared(L"C:\\Users\\Public\\Documents\\flim\\Shared") ||
+            in_shared(L"D:\\x.wav")) { printf("in_shared wrong\n"); fails++; }
+        for (k = 0; k < (int)(sizeof(R) / sizeof(R[0])); k++)
+            if (sh_rel_ok(R[k].rel) != R[k].ok) { printf("sh_rel_ok(\"%S\") should be %d\n", R[k].rel, R[k].ok); fails++; }
+        if (!sh_target(L"Drums\\kick.wav", t, MAX_PATH) || wcscmp(t, L"C:\\Users\\Public\\Documents\\flim\\Shared\\Drums\\kick.wav") != 0) { printf("sh_target wrong\n"); fails++; }
+        g_shRoot[0] = 0;
+    }
+    {   // a stuck main thread is reported with its stack: a thread parked in Sleep stands in for it
+        DWORD tid;
+        HANDLE th = CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)Sleep, (LPVOID)(uintptr_t)3000, 0, &tid);
+        char last[2048] = "", line[2048];
+        FILE *f = NULL;
+        wchar_t lp[MAX_PATH];
+        Sleep(300);
+        g_mainTid = tid; g_runType = T_SNAP; g_runUnit = 1; g_runA = 4; g_runB = 2;
+        main_stuck(6000);
+        WaitForSingleObject(th, INFINITE);
+        CloseHandle(th);
+        GetTempPathW(MAX_PATH, lp);
+        wcscat_s(lp, MAX_PATH, L"flim_engine.log");
+        if (_wfopen_s(&f, lp, L"rb") == 0 && f) {
+            while (fgets(line, sizeof(line), f)) if (strstr(line, "STUCK main thread:")) strcpy_s(last, sizeof(last), line);
+            fclose(f);
+        }
+        printf("stuck report: %.200s", last);
+        if (!strstr(last, "ntdll.dll+") || !strstr(last, "KERNEL")) { printf("no stack in the stuck report\n"); fails++; }
+    }
     printf(fails ? "FAIL (%d)\n" : "OK\n", fails);
     return fails;
 }

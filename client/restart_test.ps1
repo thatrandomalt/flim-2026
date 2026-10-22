@@ -12,8 +12,11 @@ Remove-Item "$env:TEMP\flim_engine.log" -ErrorAction SilentlyContinue
 $exe = "$PSScriptRoot\out\flim.exe"
 $style = if ($Minimized) { "Minimized" } else { "Normal" }
 $env:FLIM_AUTOCONNECT = $Url; $env:FLIM_PASSWORD = $Password
+# each its own shared folder (one PC: the real one would be the same folder for both)
+$env:FLIM_SHARED_DIR = "$env:TEMP\flim_shared_A"
 $env:FLIM_NAME = "A"; Start-Process $exe -WorkingDirectory (Split-Path $exe) -WindowStyle $style
 Start-Sleep 12
 if ($NoLocalB) { $env:FLIM_SAMPLE_NOLOCAL = "1" }
+$env:FLIM_SHARED_DIR = "$env:TEMP\flim_shared_B"
 $env:FLIM_NAME = "B"; Start-Process $exe -WorkingDirectory (Split-Path $exe) -WindowStyle $style
 "build ok, launched A and B -> $Url"

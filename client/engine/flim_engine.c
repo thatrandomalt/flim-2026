@@ -122,8 +122,10 @@ static const uint32_t SUBS[] = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 1
 // Mixer track: vol, pan, stereo separation, then the built-in EQ: 3 bands of gain, freq, Q.
 static const uint32_t MIX_SUBS[] = { 0x1fc0, 0x1fc1, 0x1fc2,
                                      0x1fd0, 0x1fd1, 0x1fd2, 0x1fd8, 0x1fd9, 0x1fda, 0x1fe0, 0x1fe1, 0x1fe2 };
-// Project-wide: main volume, swing, main pitch, tempo.
-static const uint32_t GLOBAL_SUBS[] = { 0, 1, 2, 5 };
+// Project-wide: swing, main pitch, tempo. The main volume (sub 0) is each person's own listening
+// level, like solo: not synced.
+static const uint32_t GLOBAL_SUBS[] = { 1, 2, 5 };
+#define MAIN_VOL_ID GLOBAL_ID(0)
 
 typedef void (*setenabled_t)(int track, int enabled);
 static void retry_pending(void);
@@ -150,6 +152,13 @@ static void plug_agreed_reset(int channels, int fx);
 static void plug_revert_state(int unit, int a, int b);
 static void plug_undo(const char *key, int apply);
 static void meta_rebaseline(void);
+static void meta_rebase_type(int type);
+static void meta_rebase_patterns(void);
+static void meta_rebase_channels(void);
+static void meta_remap(int type, const int *from, int n);
+static void slots_rebase(const int *chFrom, int nch, const int *mixFrom, int nmix);
+static void notes_remap(const int *from, int n);
+static void chan_rebase(const int *from, int n);
 static void mix_known_take(void);
 static void mix_struct(void);
 static int  unit_params(int unit, int a, int b);
@@ -304,13 +313,14 @@ enum { T_PARAM, T_SNAP, T_LOAD, T_ADDCH, T_DELCH, T_STRUCT, T_FULL, T_ORDER, T_F
        T_CLIPSNAP, T_CLIPS, T_UNITREVERT, T_HINT, T_METASNAP, T_META, T_PATOP, T_RELOADU, T_PLUGFOCUS,
        T_MIXSTRUCT, T_NAMEPROJ, T_PCOUNT };
 enum { U_CH, U_FX };
-enum { SNAP_BASELINE, SNAP_IF_DIFF, SNAP_FORCE, SNAP_COLLECT };
+enum { SNAP_BASELINE, SNAP_IF_DIFF, SNAP_FORCE, SNAP_COLLECT, SNAP_RESEND };   // RESEND: FORCE, for links_resend_into
 #define QCAP 16384
 typedef struct {
     int type;
     uint32_t id, v;          // T_PARAM
     int unit, a, b;          // unit kind + (channel) or (track, slot)
-    int mode;                // T_SNAP mode / T_LOAD: 1 = skip if identical / T_PARAM: 1 = someone else's edit /
+    int mode;                // T_SNAP mode / T_LOAD: 1 = skip if identical / T_PARAM: 1 = someone else's edit,
+                             // 2 = a mute put back after FL's fade, unless another value was applied since (MUTE_FADE_MS) /
                              // T_ADDCH, T_DELCH: the sender's channel count before it (-1: not sent)
     char *path;              // T_LOAD / T_ADDCH: inbound .fst file (owned; deleted after use)
     int *order;              // T_ORDER: [n, from0..from(n-1)]; T_FXSYNC/T_NOTESYNC: bitmap;
@@ -327,6 +337,10 @@ static int g_qh = 0, g_qt = 0;
 static __declspec(thread) int t_peerMsg;   // inside handle_msg: what gets queued is someone else's op
 static volatile LONG g_peerQueued = 0;     // such tasks still waiting in the queue
 static volatile LONG g_structGen;          // (with the units below)
+// The detailed log (flim.ini log_detailed, "Detailed log" in flim's window): every op sent and received,
+// and a digest of the project's structure every DIGEST_MS. Two people's logs side by side then show
+// where they stopped matching (ops in carry the server's sequence number: same order for everyone).
+static volatile LONG g_logDetailed = 0;
 
 static void gui_log(const char *line);
 static void logmsg(const char *fmt, ...) {
@@ -347,6 +361,28 @@ static void logmsg(const char *fmt, ...) {
         }
     }
     gui_log(line);
+}
+
+// Detailed log: an op sent or received, its data cut down to its size. The arrows, the leader's
+// "alive" and who-is-where would drown everything else out.
+static void log_op(const char *dir, const char *m) {
+    static const char *const QUIET[] = { "\"kind\":\"cur\"", "\"kind\":\"alive\"", "\"kind\":\"focus\"" };
+    char s[480];
+    size_t o = 0;
+    const char *p = m;
+    int i;
+    if (!g_logDetailed) return;
+    for (i = 0; i < 3; i++) if (strstr(m, QUIET[i])) return;
+    while (*p && o + 32 < sizeof(s)) {
+        if (strncmp(p, "\"data\":\"", 8) == 0) {
+            const char *e = strchr(p + 8, '"');
+            if (!e) break;
+            o += sprintf_s(s + o, sizeof(s) - o, "\"data\":<%zu>", (size_t)(e - p - 8));
+            p = e + 1;
+        } else s[o++] = *p++;
+    }
+    s[o] = 0;
+    logmsg("OP %s %s%s", dir, s, *p ? " ..." : "");
 }
 
 static unsigned hash_id(uint32_t id) { return (id * 2654435761u) % HASH_SIZE; }
@@ -489,6 +525,82 @@ static void rescan(void) {
         logmsg("rescan: watching %ld params (+%ld), mixer tracks=%d", g_nslot, g_nslot - before, nm);
 }
 
+static int rebase_slot_id(uint32_t id, int chMap, const int *chToNew, int mixMap, const int *mixToNew, uint32_t *nid) {
+    *nid = id;
+    if (IS_MUTE_ID(id)) {
+        int t = (int)(id & 0xFFFFFu), nt;
+        if (!mixMap || t >= MAX_MIX) return 1;
+        nt = mixToNew[t];
+        if (nt < 0) return 0;
+        *nid = 0xF0000000u | (uint32_t)nt;
+        return 1;
+    }
+    if (id >= 0x70000000u && id < 0xF0000000u) {
+        uint32_t rel = id - 0x70000000u, sub = rel & 0xFFFFu;
+        int t = (int)(rel >> 22), slot = (int)((rel >> 16) & 63u), nt;
+        if (!mixMap || t >= MAX_MIX) return 1;
+        nt = mixToNew[t];
+        if (nt < 0) return 0;
+        if (slot == 0 && sub >= 0x2000u && sub < 0x2000u + MAX_MIX) {
+            int dst = (int)(sub - 0x2000u), ndst = mixToNew[dst];
+            if (ndst < 0) return 0;
+            sub = 0x2000u + (uint32_t)ndst;
+        }
+        *nid = 0x70000000u + (((((uint32_t)nt << 6) | (uint32_t)slot) << 16) + sub);
+        return 1;
+    }
+    if (id < 0x70000000u && (id >> 16) < MAX_CH) {
+        int ch = (int)(id >> 16), nch;
+        if (!chMap) return 1;
+        nch = chToNew[ch];
+        if (nch < 0) return 0;
+        *nid = ((uint32_t)nch << 16) | (id & 0xFFFFu);
+        return 1;
+    }
+    return 1;
+}
+
+static void slots_rebase(const int *chFrom, int nch, const int *mixFrom, int nmix) {
+    int chToNew[MAX_CH], mixToNew[MAX_MIX], oldN, w = 0, i, j;
+    Slot ns;
+    uint32_t nid;
+    for (j = 0; j < MAX_CH; j++) chToNew[j] = -1;
+    for (j = 0; j < MAX_MIX; j++) mixToNew[j] = -1;
+    if (chFrom) for (j = 0; j < nch; j++) if (chFrom[j] >= 0 && chFrom[j] < MAX_CH) chToNew[chFrom[j]] = j;
+    if (mixFrom) for (j = 0; j < nmix; j++) if (mixFrom[j] >= 0 && mixFrom[j] < MAX_MIX) mixToNew[mixFrom[j]] = j;
+    EnterCriticalSection(&g_slotLock);
+    oldN = (int)g_nslot;
+    memset(g_hash, 0, sizeof(g_hash));
+    for (i = 0; i < oldN; i++) {
+        Slot *s = &g_slots[i];
+        if (!rebase_slot_id(s->id, chFrom != NULL, chToNew, mixFrom != NULL, mixToNew, &nid)) continue;
+        ns = *s;
+        ns.id = nid;
+        InterlockedIncrement(&ns.gen);
+        ns.echoAt = 0;
+        g_slots[w] = ns;
+        unsigned h = hash_id(nid);
+        while (g_hash[h] && g_slots[g_hash[h] - 1].id != nid) h = (h + 1) % HASH_SIZE;
+        if (g_hash[h]) continue;
+        g_hash[h] = w + 1;
+        w++;
+    }
+    for (i = w; i < oldN; i++) memset(&g_slots[i], 0, sizeof(g_slots[i]));
+    g_nslot = w;
+    LeaveCriticalSection(&g_slotLock);
+}
+// No map to carry them through (a project load, an order FL didn't follow): every value is taken as it is.
+static void slots_reread(void) {
+    int k;
+    for (k = 0; k < g_nslot; k++) {
+        EnterCriticalSection(&g_slotLock);
+        g_slots[k].last = read_value(g_slots[k].id);
+        g_slots[k].lockedByMe = 0;
+        InterlockedIncrement(&g_slots[k].gen);
+        LeaveCriticalSection(&g_slotLock);
+    }
+}
+
 // ---------------- websocket ----------------
 static void b64enc(const unsigned char *in, int n, char *out) {
     static const char *T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -624,10 +736,20 @@ static void wake_main(void) {
 }
 
 static void enqueue(const QItem *it) {
+    int i;
     EnterCriticalSection(&g_qLock);
+    if (it->type == T_PARAM && it->mode == 1 && IS_MUTE_ID(it->id)) {
+        // someone's newer mute for a track that has one queued takes its place: held up behind other work,
+        // a mute and its unmute would run back to back, and FL's mute fade swallows the second (MUTE_FADE_MS)
+        for (i = g_qh; i != g_qt; i = (i + 1) % QCAP)
+            if (g_q[i].type == T_PARAM && g_q[i].id == it->id) {
+                g_q[i].v = it->v; g_q[i].mode = 1;
+                LeaveCriticalSection(&g_qLock);
+                return;
+            }
+    }
     if (it->type == T_LOAD) {
         // a newer state for a unit that still has a load queued replaces it (latest wins)
-        int i;
         for (i = g_qh; i != g_qt; i = (i + 1) % QCAP) {
             QItem *q = &g_q[i];
             if (q->type == T_LOAD && q->unit == it->unit && q->a == it->a && q->b == it->b &&
@@ -653,9 +775,9 @@ static void enqueue(const QItem *it) {
     wake_main();
 }
 
-static void enqueue_apply(uint32_t id, uint32_t v, int remote) {
+static void enqueue_apply(uint32_t id, uint32_t v, int mode) {
     QItem it; memset(&it, 0, sizeof(it));
-    it.type = T_PARAM; it.id = id; it.v = v; it.mode = remote;
+    it.type = T_PARAM; it.id = id; it.v = v; it.mode = mode;
     enqueue(&it);
 }
 
@@ -757,6 +879,17 @@ static void *fx_obj(int t, int s) {
         char *arr = *(char **)(g_flBase + (MIXARR_VA - IMG_BASE));
         return *(void **)(arr + (size_t)t * MIX_STRIDE + MIX_SLOTS_OFF + (size_t)s * 8);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
+}
+// A mixer track's identity: the lowest of its effect slot objects. FL's track moves carry them all along;
+// moving an effect up / down swaps two of them inside the track (sub_1233B30), so slot 0's alone won't do.
+static void *mix_tid(int t) {
+    void *m = NULL;
+    int s;
+    __try {
+        char *r = *(char **)(g_flBase + (MIXARR_VA - IMG_BASE)) + (size_t)t * MIX_STRIDE + MIX_SLOTS_OFF;
+        for (s = 0; s < MAX_FX_SLOTS; s++) { void *o = *(void **)(r + (size_t)s * 8); if (o && (!m || o < m)) m = o; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
+    return m;
 }
 static void *unit_obj(int unit, int a, int b) { return unit == U_CH ? chan_obj(a) : fx_obj(a, b); }
 static int   unit_mask(int unit) { return unit == U_CH ? MASK_CHAN : MASK_FX; }
@@ -952,7 +1085,239 @@ static char *tmp_path(const char *tag) {
     return p;
 }
 
-// Save a unit's full state with FL's preset saver. Main thread only.
+// ---- automation and controller links ----
+// FL keeps the links of automation clips and of internal controllers (Peak, Formula, LFO...) in one list
+// and saves it only with whole projects (FLP event 227, the mapping formula in 230 after it): *LINKS ->
+// { MIDI list (226: each person's own hardware, never synced), internal list }, each a TList (items +8,
+// count +0x10) of 28-byte records: +0 formula object, +8 source (the clip's or controller's REC base:
+// channel index << 16, or its mixer slot's), +0xC runtime, +0x10 target REC id, +0x14 flags (8 internal),
+// +0x18 smoothing. FL renumbers both ends itself on every structural change flim replays.
+// - A target's value comes from its clip or controller on each FL as it plays: it is never sent or applied
+//   as a param (one person playing moved everyone's automated knob).
+// - Links travel with their source's state: unit_save appends the unit's own links as 227 (+230), sent
+//   in a field of their own ("lk": an older flim never loads them). A load of a state with links first
+//   drops the unit's links (LINKDEL), as FL's loader appends the ones in a state whatever its mask, and
+//   then sorts the list (links_sort), as FL's loader doesn't for a channel or slot. Link edits made here
+//   send the unit's state (links_scan). Before, a clip made, cloned or merged in a session reached the
+//   others unlinked, link edits never went out, and a re-sync put everyone on the leader's links.
+#define LINKS_VA     FLVA(LINKS)     // global -> { MIDI list, internal list }
+#define LINKDEL_VA   FLVA(LINKDEL)   // DeleteLinksFrom(lo, hi): internal links with source in [lo, hi] (takes SONGLOCK)
+#define FORMTEXT_VA  FLVA(FORMTEXT)  // FormulaText(formula, string *out, 0): what the project writer saves as 230
+#define EV_LINK      227
+#define EV_LINKFORM  230
+typedef void (*linkdel_t)(uint32_t lo, uint32_t hi);
+typedef void (*formtext_t)(void *formula, void **out, uint64_t zero);
+static CRITICAL_SECTION g_autoLock;
+static uint32_t *g_autoT; static int g_nautoT;  // targets of internal links, sorted (g_autoLock)
+#define LINK_QUIET_MS 1500
+static volatile DWORD g_linkQuiet;               // last load / structure op: FL renumbers or deletes links then itself
+
+static char *links_list(void) {
+    __try { char **l = *(char ***)(g_flBase + (LINKS_VA - IMG_BASE)); return l ? l[1] : NULL; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
+}
+static uint32_t unit_rec_base(int unit, int a, int b) {
+    return unit == U_CH ? (uint32_t)a << 16 : 0x70000000u + ((uint32_t)((a << 6) | b) << 16);
+}
+static int u32_cmp(const void *x, const void *y) {
+    uint32_t p = *(const uint32_t *)x, q = *(const uint32_t *)y;
+    return p < q ? -1 : p > q;
+}
+static Unit *link_src_unit(uint32_t src) {
+    uint32_t ts = (src - 0x70000000u) >> 16;
+    return src < 0x70000000u ? unit_ptr(U_CH, (int)(src >> 16), 0) : unit_ptr(U_FX, (int)(ts >> 6), (int)(ts & 63));
+}
+// Poll thread, every 250 ms: the params a clip or controller drives here, and whose links changed. A
+// change made here (add / remove a target, a formula) counts as an edit of the source unit: its state,
+// which carries its links, goes out as after a preset-sized burst. steady = no channels / tracks moving:
+// FL renumbers links itself then (on everyone's FL), and a load's links are someone else's.
+typedef struct { uint32_t src; uint64_t h; } LinkSum;
+static void links_scan(DWORD now, int steady) {
+    static DWORD at;
+    static LinkSum *prev;
+    static int nprev = -1;
+    static LONG gen;
+    uint32_t *t = NULL;
+    LinkSum *s = NULL;
+    int n = 0, ns = 0, i, j, k, cnt;
+    char *L, **items;
+    if (now - at < 250) return;
+    if (now - at > 1000 || now - g_linkQuiet < LINK_QUIET_MS) steady = 0;   // skipped meanwhile (a load, channels
+                                                        // moving) or a load / structure op just ran: re-baseline
+    at = now;
+    L = links_list();
+    __try {
+        if (L && (cnt = *(int *)(L + 0x10)) > 0 && cnt <= 65536 && (items = *(char ***)(L + 8)) != NULL) {
+            t = (uint32_t *)malloc(sizeof(uint32_t) * (size_t)cnt);
+            s = (LinkSum *)malloc(sizeof(LinkSum) * (size_t)cnt);
+            for (i = 0; i < cnt; i++) {
+                char *r = items[i];
+                uint32_t rec[6];
+                if (!r) continue;
+                memcpy(rec, r + 8, 20); rec[1] = 0;                 // (runtime state)
+                memcpy(rec + 5, r, 4);                              // low half of the formula object: a new formula
+                t[n++] = rec[2];
+                s[ns].src = rec[0] & 0xFFFF0000u;
+                s[ns++].h = fnv64((const unsigned char *)rec, sizeof(rec));
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { n = ns = 0; }
+    if (n > 1) qsort(t, (size_t)n, sizeof(uint32_t), u32_cmp);
+    EnterCriticalSection(&g_autoLock);
+    free(g_autoT); g_autoT = t; g_nautoT = n;
+    LeaveCriticalSection(&g_autoLock);
+    // one sum per source (records in any order), sorted by source
+    if (ns > 1) qsort(s, (size_t)ns, sizeof(LinkSum), u32_cmp);
+    for (i = k = 0; i < ns; i++) {
+        if (k && s[k - 1].src == s[i].src) s[k - 1].h += s[i].h;
+        else s[k++] = s[i];
+    }
+    ns = k;
+    if (steady && nprev >= 0 && gen == g_structGen)
+        for (i = j = 0; i < ns || j < nprev; ) {
+            uint32_t src;
+            Unit *u;
+            if (j >= nprev || (i < ns && s[i].src < prev[j].src)) src = s[i++].src;
+            else if (i >= ns || prev[j].src < s[i].src) src = prev[j++].src;
+            else { src = s[i].src; if (s[i++].h == prev[j++].h) continue; }
+            if ((u = link_src_unit(src)) != NULL && now >= u->suppressUntil && !u->identAt) {
+                if (!u->lastAct) logmsg("LINKS of %s 0x%08x changed here: its state goes out", src < 0x70000000u ? "channel" : "mixer slot", src);
+                u->lastAct = now; u->burst = 1;
+            }
+        }
+    free(prev); prev = s; nprev = ns; gen = g_structGen;
+}
+static int auto_target(uint32_t id) {
+    int lo = 0, hi, r = 0;
+    EnterCriticalSection(&g_autoLock);
+    for (hi = g_nautoT - 1; lo <= hi && !r; ) {
+        int m = (lo + hi) / 2;
+        if (g_autoT[m] == id) r = 1; else if (g_autoT[m] < id) lo = m + 1; else hi = m - 1;
+    }
+    LeaveCriticalSection(&g_autoLock);
+    return r;
+}
+// A Delphi string (Ansi or Unicode: its header says which) -> UTF-16; chars, 0 = none.
+static int dstr_wide(const void *s, wchar_t *out, int cap) {
+    const unsigned char *p = (const unsigned char *)s;
+    int len = *(const int32_t *)(p - 4), es = *(const uint16_t *)(p - 10), cp = *(const uint16_t *)(p - 12), k;
+    if (len <= 0 || len >= cap) return 0;
+    if (es == 2) { memcpy(out, s, (size_t)len * 2); out[len] = 0; return len; }
+    k = MultiByteToWideChar(cp ? cp : CP_ACP, 0, (const char *)s, len, out, cap - 1);
+    out[k > 0 ? k : 0] = 0;
+    return k > 0 ? k : 0;
+}
+static void ev_put(unsigned char **o, size_t *on, size_t *cap, int id, const void *p, size_t n) {
+    size_t v = n;
+    if (*on + n + 8 > *cap) { *cap = (*on + n + 8) * 2; *o = (unsigned char *)realloc(*o, *cap); }
+    (*o)[(*on)++] = (unsigned char)id;
+    do { unsigned char c = (unsigned char)(v & 0x7f); v >>= 7; (*o)[(*on)++] = (unsigned char)(c | (v ? 0x80 : 0)); } while (v);
+    memcpy(*o + *on, p, n);
+    *on += n;
+}
+// Main thread (unit_save): the unit's own links into its saved state, as FL's project writer writes them.
+static void links_append(int unit, int a, int b, unsigned char **d, size_t *n) {
+    uint32_t base = unit_rec_base(unit, a, b);
+    char *L = links_list(), **items;
+    unsigned char *o = NULL;
+    size_t on = 0, cap = 0, dt = *n >= 8 ? 8 + (size_t)*(uint32_t *)(*d + 4) : 0;
+    int i, cnt;
+    if (!L || !dt || dt + 8 > *n || memcmp(*d + dt, "FLdt", 4) != 0) return;
+    __try {
+        cnt = *(int *)(L + 0x10);
+        items = *(char ***)(L + 8);
+        for (i = 0; items && i < cnt && cnt <= 65536; i++) {
+            char *r = items[i];
+            uint32_t ev[5];
+            void *txt = NULL;
+            wchar_t w[512];
+            int k;
+            if (!r || (*(uint32_t *)(r + 8) & 0xFFFF0000u) != base) continue;
+            memcpy(ev, r + 8, 20);
+            ev[1] = 0;                                          // (runtime state)
+            ev_put(&o, &on, &cap, EV_LINK, ev, 20);
+            if (*(void **)r) {
+                // ponytail: the string FL makes here is never released, a few bytes per formula and save
+                ((formtext_t)(g_flBase + (FORMTEXT_VA - IMG_BASE)))(*(void **)r, &txt, 0);
+                if (txt && (k = dstr_wide(txt, w, 512)) > 0) ev_put(&o, &on, &cap, EV_LINKFORM, w, (size_t)(k + 1) * 2);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("LINKS reading this unit's links faulted"); free(o); return; }
+    if (!on) return;
+    *d = (unsigned char *)realloc(*d, *n + on);
+    memcpy(*d + *n, o, on);
+    *n += on;
+    *(uint32_t *)(*d + dt + 4) += (uint32_t)on;                 // the FLdt chunk's length
+    free(o);
+}
+// A state's links, before it loads: their source becomes this unit (whatever index it had where it was
+// saved), and has = it brings any.
+typedef struct { uint32_t base; int has; } LinkFix;
+static int linkfix_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end) {
+    LinkFix *f = (LinkFix *)ctx;
+    (void)at; (void)end;
+    if (id == EV_LINK && n == 20) {
+        uint32_t *src = (uint32_t *)p;
+        *src = f->base | (*src & 0xFFFF);
+        f->has = 1;
+    }
+    return 1;
+}
+// Main thread, before loading a state into a unit: its own links go (the state brings the ones it has).
+static void links_drop(int unit, int a, int b) {
+    uint32_t base = unit_rec_base(unit, a, b);
+    __try { ((linkdel_t)(g_flBase + (LINKDEL_VA - IMG_BASE)))(base, base | 0xFFFF); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("LINKS dropping a unit's links faulted"); }
+}
+static CRITICAL_SECTION *song_lock(void);
+// Main thread, after a load appended links: FL's loader sorts the list only after a whole project, and
+// playback finds a source's links by binary search (sub_F82660), so unsorted some would drive nothing.
+// Sorted by source, stable, as FL's own sub_F825B0 does after adding one.
+static void links_sort(void) {
+    char *L = links_list();
+    if (!L) return;
+    EnterCriticalSection(song_lock());
+    __try {
+        char **it = *(char ***)(L + 8);
+        int n = *(int *)(L + 0x10), i, j;
+        for (i = 1; it && i < n && n <= 65536; i++) {
+            char *r = it[i];
+            for (j = i; j > 0 && *(uint32_t *)(it[j - 1] + 8) > *(uint32_t *)(r + 8); j--) it[j] = it[j - 1];
+            it[j] = r;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("LINKS sorting faulted"); }
+    LeaveCriticalSection(song_lock());
+}
+// Where a saved state's links (links_append) start. They travel apart ("lk", unit_json_fields): an older
+// flim would load them on top of the ones it has, again with every state.
+static int linkat_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end) {
+    (void)p; (void)n; (void)end;
+    if (id == EV_LINK || id == EV_LINKFORM) { *(size_t *)ctx = at; return 0; }
+    return 1;
+}
+static size_t links_at(const unsigned char *d, size_t n) { size_t at = n; flp_walk(d, n, linkat_cb, &at); return at; }
+// Main thread, after a unit's new plugin went out: FL deletes the links into a plugin it replaces, and a
+// clip or controller pointing into the new one may have reached the others before it (a chan.add goes
+// at once, a new plugin's state SETTLE_IDENT_MS later). Their states go again, after it.
+static void links_resend_into(int unit, int a, int b) {
+    uint32_t lo = unit_rec_base(unit, a, b) + 0x8000, hi = lo + 0x7FFF, last = 1;
+    char *L = links_list(), **items;
+    int i, cnt;
+    if (!L) return;
+    __try {
+        cnt = *(int *)(L + 0x10);
+        items = *(char ***)(L + 8);
+        for (i = 0; items && i < cnt && cnt <= 65536; i++) {
+            uint32_t t = *(uint32_t *)(items[i] + 0x10), src = *(uint32_t *)(items[i] + 8) & 0xFFFF0000u, ts = (src - 0x70000000u) >> 16;
+            if (t < lo || t > hi || src == last) continue;
+            last = src;
+            if (src < 0x70000000u) enqueue_unit(T_SNAP, U_CH, (int)(src >> 16), 0, SNAP_RESEND, NULL);
+            else enqueue_unit(T_SNAP, U_FX, (int)(ts >> 6), (int)(ts & 63), SNAP_RESEND, NULL);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("LINKS reading the links into a unit faulted"); }
+}
+
+// Save a unit's full state with FL's preset saver, with its links (above). Main thread only.
 // Returns malloc'd bytes (caller frees) or NULL (empty slot / failure).
 static unsigned char *unit_save(int unit, int a, int b, size_t *n) {
     void *obj = unit_obj(unit, a, b);
@@ -967,19 +1332,31 @@ static unsigned char *unit_save(int unit, int a, int b, size_t *n) {
     __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("SAVE faulted unit=%d %d/%d", unit, a, b); r = -1; }
     dstr_free(w);
     if (r != 0) return NULL;
-    return read_file(path, n);
+    {
+        unsigned char *d = read_file(path, n);
+        if (d) links_append(unit, a, b, &d, n);
+        return d;
+    }
 }
 
 static void b64enc(const unsigned char *in, int n, char *out);
 
-// Serialize {"unit":"ch","ch":i | "unit":"fx","trk":t,"slot":s, "data":"<b64>"} fields.
+// Serialize {"unit":"ch","ch":i | "unit":"fx","trk":t,"slot":s, "data":"<b64>","lk":"<b64>"} fields: the
+// state without its links, and its links (links_at; "" = it has none, LOAD_LINKS), which parse_unit puts back.
 static char *unit_json_fields(int unit, int a, int b, const unsigned char *data, size_t n) {
-    size_t cap = 96 + (n + 2) / 3 * 4 + 1;
+    size_t cap = 112 + (n + 2) / 3 * 4 + 1, k = links_at(data, n), dt = n >= 8 ? 8 + (size_t)*(const uint32_t *)(data + 4) : 0;
     char *j = (char *)malloc(cap);
+    unsigned char *c = (unsigned char *)malloc(k ? k : 1);
     int o = unit == U_CH ? sprintf_s(j, cap, "\"unit\":\"ch\",\"ch\":%d,\"data\":\"", a)
                          : sprintf_s(j, cap, "\"unit\":\"fx\",\"trk\":%d,\"slot\":%d,\"data\":\"", a, b);
-    b64enc(data, (int)n, j + o);
+    memcpy(c, data, k);
+    if (k < n && dt + 8 <= k) *(uint32_t *)(c + dt + 4) -= (uint32_t)(n - k);   // the FLdt chunk's length without them
+    b64enc(c, (int)k, j + o);
+    o += (int)strlen(j + o);
+    o += sprintf_s(j + o, cap - o, "\",\"lk\":\"");
+    b64enc(data + k, (int)(n - k), j + o);
     strcat_s(j, cap, "\"");
+    free(c);
     return j;
 }
 
@@ -1020,7 +1397,8 @@ static void do_snap(const QItem *it) {
         // would take their index-dependent state for an edit to send. A silent baseline comes later.
         static LONG said = -1;
         if (said != g_structGen) { said = g_structGen; logmsg("PLUG state checks queued before channels / tracks moved: retaken later"); }
-        u->baselineAt = GetTickCount() + REBASE_MS;
+        if (it->mode == SNAP_IF_DIFF) { u->lastAct = GetTickCount(); u->burst = 1; }   // an edit's check: again, not dropped
+        else u->baselineAt = GetTickCount() + REBASE_MS;
         return;
     }
     // States go out by channel index: while FL's channel list differs from the last structure scan (a
@@ -1051,6 +1429,7 @@ static void do_snap(const QItem *it) {
         }
         break;
     case SNAP_FORCE:   send = 1; break;   // identity changed: always
+    case SNAP_RESEND:  send = 1; break;
     default: break;
     }
     if (send) {
@@ -1062,6 +1441,7 @@ static void do_snap(const QItem *it) {
         }
         send_unit("plug.state", it->unit, it->a, it->b, d, n, key);
         u->editGen++;
+        if (it->mode == SNAP_FORCE) links_resend_into(it->unit, it->a, it->b);
     }
     plug_agreed_set(it->unit, it->a, it->b, d, n);
     u->hash = h;
@@ -1087,7 +1467,8 @@ static int g_flimProjLoad = 0;            // main thread: inside our load of the
 // placeholder (Slicer fits its slices to the sample it has). Kept per channel / slot object, and
 // only used if nothing was edited here since (editGen). Main thread.
 #define PHLOAD_MAX 64
-#define LOAD_FORCE 2                      // T_LOAD mode: load even if we have exactly this state already
+#define LOAD_FORCE 2                      // T_LOAD mode bits: load even if we have exactly this state already
+#define LOAD_LINKS 4                      //   the sender puts the unit's links in its states: none in it = none
 typedef struct { void *obj; unsigned char *d; size_t n; int editGen; } PhLoad;
 static PhLoad g_phLoads[PHLOAD_MAX];
 static int g_nPhLoads = 0;
@@ -1122,7 +1503,11 @@ static void do_load(const QItem *it) {
     void *obj = unit_obj(it->unit, it->a, it->b);
     if (!u || !obj) { logmsg("LOAD: no target unit=%d %d/%d", it->unit, it->a, it->b); return; }
     size_t n = 0, m = 0;
-    unsigned char *in = read_file(it->path, &n), *own = unit_save(it->unit, it->a, it->b, &m);
+    unsigned char *in = read_file(it->path, &n), *own;
+    LinkFix lf;
+    lf.base = unit_rec_base(it->unit, it->a, it->b); lf.has = 0;
+    if (in) flp_walk(in, n, linkfix_cb, &lf);
+    own = unit_save(it->unit, it->a, it->b, &m);
     uint64_t hin = in ? state_hash(in, n) : 0, hown = own ? state_hash(own, m) : 0;
     if (in) {
         FILE *f = NULL;
@@ -1131,7 +1516,7 @@ static void do_load(const QItem *it) {
         if (fopen_s(&f, it->path, "wb") == 0 && f) { fwrite(in, 1, n, f); fclose(f); }
     }
     free(own);
-    if (it->mode != LOAD_FORCE && hown && hown == hin) {     // we have exactly this already: no reload, no glitch
+    if (!(it->mode & LOAD_FORCE) && hown && hown == hin) {   // we have exactly this already: no reload, no glitch
         u->hash = hown;
         free(in);
         logmsg("PLUG unit=%s %d/%d already identical: not reloaded", it->unit == U_CH ? "ch" : "fx", it->a, it->b);
@@ -1141,11 +1526,13 @@ static void do_load(const QItem *it) {
     u->suppressUntil = GetTickCount() + 60000;  // the params this load moves aren't local edits (set properly below)
     wchar_t *w = dstr_new(it->path);
     int r = -1;
+    if ((it->mode & LOAD_LINKS) || lf.has) links_drop(it->unit, it->a, it->b);   // the state's links replace this unit's
     progress_quiet(1);
     g_flimLoad = 1;
     __try { r = g_loadPreset(w, unit_mask(it->unit), obj, LOADPRESET_NOEDITOR); }
     __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("LOAD faulted unit=%d %d/%d", it->unit, it->a, it->b); }
     g_flimLoad = 0;
+    if (lf.has) links_sort();
     progress_quiet(0);
     dstr_free(w);
     if (in) phload_note(obj, in, n, u->editGen);
@@ -1185,6 +1572,7 @@ static void units_shift_after_delete(int idx, int n) {
     for (i = idx; i < MAX_CH; i++) {
         g_chanPlugN[i] = 0;          // param ranges re-probed by rescan
         g_chU[i].hash = 0;           // saved state is index-dependent: re-baseline, don't send
+        g_chU[i].baselineAt = GetTickCount() + REBASE_MS;   // (without one, the sweep sent every moved channel's state)
     }
     plug_agreed_reset(1, 0);
     InterlockedIncrement(&g_structGen);
@@ -1197,6 +1585,7 @@ static void units_insert(int idx, int n) {
     for (i = idx; i < MAX_CH; i++) {
         g_chanPlugN[i] = 0;
         g_chU[i].hash = 0;
+        if (i > idx) g_chU[i].baselineAt = GetTickCount() + REBASE_MS;
     }
     plug_agreed_reset(1, 0);
     InterlockedIncrement(&g_structGen);
@@ -1249,7 +1638,12 @@ static void do_addch(const QItem *it) {
     units_insert(a, nk);
     g_chU[a].inst = plugin_inst(obj);
     g_chU[a].absorbUntil = GetTickCount() + SUPPRESS_MS + SETTLE_IDENT_MS;
-    if (a < nk) notes_rebaseline();                         // the channels after it moved up: FL renumbered their notes
+    {   // the channels after it moved up (FL renumbered their notes and clips): baselines follow them
+        static int from[MAX_CH];
+        int i;
+        for (i = 0; i <= nk; i++) from[i] = i < a ? i : i == a ? -1 : i - 1;
+        chan_rebase(from, nk + 1);
+    }
     logmsg("CHAN added index %d (remote)", a);
     {   // its state loads on a later tick, into this channel wherever it is by then
         QItem q; memset(&q, 0, sizeof(q));
@@ -1273,7 +1667,12 @@ static void do_delch(const QItem *it) {
     units_shift_after_delete(a, nk);
     memmove(g_chKnown + a, g_chKnown + a + 1, sizeof(void *) * (size_t)(nk - a - 1));
     g_nChKnown = nk - 1;
-    notes_rebaseline();
+    {
+        static int from[MAX_CH];
+        int i;
+        for (i = 0; i < nk - 1; i++) from[i] = i < a ? i : i + 1;
+        chan_rebase(from, nk - 1);
+    }
     logmsg("CHAN deleted index %d (remote)", a);
 }
 
@@ -1287,8 +1686,9 @@ static void units_permute(const int *from, int n) {
     memcpy(old, g_chU, sizeof(Unit) * (size_t)n);
     for (i = 0; i < n; i++) {
         g_chU[i] = old[from[i]];
-        if (from[i] != i) {
-            g_chU[i].hash = 0; g_chU[i].identAt = 0; g_chU[i].lastAct = 0; g_chU[i].burst = 0;
+        if (from[i] != i) {                           // (pending sends go with the channel)
+            g_chU[i].hash = 0;
+            if (!g_chU[i].identAt && !g_chU[i].lastAct) g_chU[i].baselineAt = GetTickCount() + REBASE_MS;
             g_chanPlugN[i] = 0;
         }
     }
@@ -1390,10 +1790,15 @@ static void do_order(const QItem *it) {
         // out of step with the peer's order: keep our bookkeeping consistent with what FL has
         for (i = 0; i < nm; i++) { g_chU[i].hash = 0; g_chU[i].inst = plugin_inst(items[i]); g_chanPlugN[i] = 0; }
         plug_agreed_reset(1, 0);
-        InterlockedIncrement(&g_structGen);
     }
     known_from_list();
-    notes_rebaseline();
+    if (ok) chan_rebase(from, n);
+    else {                                            // no map to carry baselines through: take them as they are
+        slots_reread();
+        notes_rebaseline();
+        meta_rebase_channels();
+        InterlockedIncrement(&g_structGen);
+    }
     logmsg("CHAN reordered (remote): %d moves, %s", steps, ok ? "order matches" : "ORDER MISMATCH");
     if (!ok) resync("FL didn't reorder the channels as asked");
 }
@@ -1421,11 +1826,12 @@ static void chan_add_send(int i, int n0) {
 // count it applies to, so a peer whose list differs notices (resync) instead of editing the wrong channels.
 static void chan_struct_local(void **items, int n, DWORD now) {
     static void *K[MAX_CH];
-    static int from[MAX_CH], added[MAX_CH];
+    static int from[MAX_CH], added[MAX_CH], O[MAX_CH], all[MAX_CH];   // O: each K's index before this change
     int nk = g_nChKnown, k, i, j, nc = 0, na = 0;
     char m[64 + MAX_CH * 5];
     if (n > MAX_CH) n = MAX_CH;
     memcpy(K, g_chKnown, sizeof(void *) * (size_t)nk);
+    for (k = 0; k < nk; k++) O[k] = k;
     for (k = nk - 1; k >= 0; k--) {
         if (index_of(items, n, K[k]) >= 0 && index_of(g_chDead, g_nChDead, K[k]) < 0) continue;   // (dead: its memory is a new channel's)
         sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"chan.del\",\"ch\":%d,\"n0\":%d}}", k, nk);
@@ -1433,8 +1839,10 @@ static void chan_struct_local(void **items, int n, DWORD now) {
         logmsg("CHAN deleted locally: index %d (sent)", k);
         units_shift_after_delete(k, nk);
         memmove(K + k, K + k + 1, sizeof(void *) * (size_t)(nk - k - 1));
+        memmove(O + k, O + k + 1, sizeof(int) * (size_t)(nk - k - 1));
         nk--;
     }
+    for (i = 0; i < n; i++) all[i] = (j = index_of(K, nk, items[i])) >= 0 ? O[j] : -1;   // new index -> old, the whole change
     for (i = 0; i < n; i++) if ((j = index_of(K, nk, items[i])) >= 0) from[nc++] = j;
     for (i = 0; i < nc && from[i] == i; i++) {}
     if (i < nc) {
@@ -1456,9 +1864,8 @@ static void chan_struct_local(void **items, int n, DWORD now) {
         k++;
     }
     known_from_list();
-    notes_rebaseline();                               // the peers replay the same change
+    chan_rebase(all, n);                              // the peers replay the same change; edits made meanwhile still go out
     for (i = 0; i < na; i++) notes_send_channel(added[i]);
-    InterlockedIncrement(&g_structGen);
 }
 
 // Compare FL's channel list and plugin instances with what we knew.
@@ -1643,7 +2050,7 @@ static void notes_rebaseline(void) {
     int p;
     for (p = 1; p < MAX_PAT; p++) { g_patSeen[p] = g_patHash[p] = notes_hash(p); g_patChangedAt[p] = 0; }
     clips_rebaseline();          // audio clips reference channels: same structural events
-    meta_rebaseline();           // channel names/colors move with their channels
+    meta_rebase_patterns();      // pattern names / markers move with pattern ops (the rest: chan_rebase, mix_rebaseline)
     units_capture_all();         // and it is the state a lock conflict reverts to
 }
 
@@ -1660,9 +2067,13 @@ static void notes_apply(int p, const unsigned char *recs, unsigned n, int g) {
     unsigned char *in = recs_group(1, recs, n, g, &n);
     unsigned char *old = NULL, *now;
     if (in) notes_clear_sel(in, n);
+    // Creating a pattern's note array takes FL's song lock and then the note lock, the order FL's
+    // audio thread uses too: create it before taking the note lock, or a pattern's first notes
+    // arriving during playback deadlock FL (hang report 2026-10-21 175345).
+    __try { if (n) g_noteArr(p, 1); } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("NOTES create faulted pat %d", p); }
     EnterCriticalSection(note_lock());
     __try {
-        char *a = (char *)g_noteArr(p, 1);
+        char *a = pat_notes_arr(p);
         if (a) {
             noteadd_t add = (noteadd_t)(*(void ***)a)[NOTEADD_VSLOT];
             unsigned c = *(unsigned *)(a + NOTES_COUNT);
@@ -2274,11 +2685,18 @@ static uint64_t meta_hash(int type, int i) {
         case M_ROUTE: {
             char *r = mix_rec(i);
             int d, nm = mix_count();
+            uint64_t sum = 0;
             for (d = 0; d < nm && d < MIX_ROUTE_MAX; d++) {
                 unsigned char on = (unsigned char)r[MIX_ROUTE + d * 8 + 4];
-                h = fnv_add(h, &on, 1);
-                if (on) h = fnv_add(h, r + MIX_ROUTE + d * 8, 4);
+                if (on) {
+                    uint64_t e = 1469598103934665603ull;
+                    void *tid = mix_tid(d);
+                    e = fnv_add(e, &tid, sizeof(tid));
+                    e = fnv_add(e, r + MIX_ROUTE + d * 8, 4);
+                    sum += e;
+                }
             }
+            h = fnv_add(h, &sum, sizeof(sum));
             break; }
         case M_CHAN: {
             void **items;
@@ -2319,10 +2737,39 @@ static uint64_t meta_hash(int type, int i) {
     return h > 2 ? h : 3;
 }
 
+static void meta_rebase_type(int type) {
+    int i;
+    for (i = 0; i < meta_cap(type); i++) { g_mSeen[type][i] = g_mHash[type][i] = meta_hash(type, i); g_mAt[type][i] = 0; }
+}
+static void meta_rebase_patterns(void) { meta_rebase_type(M_PAT); meta_rebase_type(M_PMARK); }
+static void meta_rebase_channels(void) { meta_rebase_type(M_CHAN); }
+
+// Channels / tracks renumbered: each entity keeps the hashes (and a pending local edit) it had under its
+// old number, so an edit made in the same moment still goes out. A new entity is taken as it is.
+static void meta_remap(int type, const int *from, int n) {
+    int cap = meta_cap(type), i;
+    static uint64_t oldH[1024], oldSeen[1024];
+    static DWORD oldAt[1024], oldSent[1024];
+    if (!from || cap > 1024) { meta_rebase_type(type); return; }
+    for (i = 0; i < cap; i++) {
+        oldH[i] = g_mHash[type][i]; oldSeen[i] = g_mSeen[type][i];
+        oldAt[i] = g_mAt[type][i]; oldSent[i] = g_mSentAt[type][i];
+    }
+    for (i = 0; i < cap; i++) {
+        int f = i < n ? from[i] : -1;
+        if (f >= 0 && f < cap) {
+            g_mHash[type][i] = oldH[f]; g_mSeen[type][i] = oldSeen[f];
+            g_mAt[type][i] = oldAt[f]; g_mSentAt[type][i] = oldSent[f];
+        } else {
+            g_mHash[type][i] = g_mSeen[type][i] = meta_hash(type, i);
+            g_mAt[type][i] = g_mSentAt[type][i] = 0;
+        }
+    }
+}
+
 static void meta_rebaseline(void) {
-    int t, i;
-    for (t = 0; t < M_NTYPES; t++)
-        for (i = 0; i < meta_cap(t); i++) { g_mSeen[t][i] = g_mHash[t][i] = meta_hash(t, i); g_mAt[t][i] = 0; }
+    int t;
+    for (t = 0; t < M_NTYPES; t++) meta_rebase_type(t);
 }
 
 // After applying a remote change: FL's setters touch other entities too (a mixer rename
@@ -2343,10 +2790,14 @@ static void meta_absorb(void) {
 // numbers]}, which the others replay with FL's own functions (they also renumber sends, channel
 // targets and linked playlist tracks); then both sides re-take their per-track baselines silently.
 // Track identity: FL moves whole track records (sub_12A4030 copies all 502 through a permutation),
-// so a track's effect slot objects go with it, and slot 0's object names the track. Master (0) and
+// so a track's effect slot objects go with it, and they name the track (mix_tid). Master (0) and
 // Current (last) never move; FL recycles the Current record as the first inserted track and the
-// first deleted track's record as the new Current. Moved tracks (same tracks, new order) keep
-// travelling as ordinary edits, which is heavier: their plugins reload on the other side.
+// first deleted track's record as the new Current. Moved tracks travel in the same op as the order
+// after the inserts and deletes ("perm"), which the others replay with FL's own "move selected": sent
+// track by track instead, each track's sends were applied against a half-moved matrix, FL refused
+// the ones that made a loop, and a bus with many senders went over META_BULK and wasn't sent at all.
+// The poll thread sends nothing while the order differs from the last known one either (values read
+// mid-move would go out by number and be moved a second time by the others' replay).
 // ponytail: ops someone else sends in the same instant still carry the old numbers and can land on
 // the neighbouring track; rebasing in-flight ops on structural ones would fix that.
 #define MIXINS_VA     FLVA(MIXINS) // InsertMixerTracks(pos, count, flags): 1 undo step, 2 select + scroll, 4 dock
@@ -2356,24 +2807,37 @@ static void meta_absorb(void) {
                                    //   also delete linked playlist instrument tracks + channels (menu: 0x12 | 4 or 8)
 #define MIXINS_FLAGS  4            // the menu's resulting state, without the undo step and scrolling
 #define MIXDEL_FLAGS  2            // channels the sender's FL deleted along arrive as chan.del
+#define MIXMOVE_VA    FLVA(MIXMOVE) // MoveSelectedMixerTracks(dir, undo, scroll): the selected tracks and the focused one,
+                                   //   one step (permute + FL's whole refresh)
+#define MIXFOCUS_VA   FLVA(MIXFOCUS) // int global: the focused mixer track
+#define MIX_SELECTED  0x19         // byte: the track is selected (in the record, so it moves with it)
 typedef void (*mixins_t)(unsigned pos, unsigned count, unsigned char flags);
 typedef void (*mixdel_t)(const int *idx, int64_t last, unsigned char flags);
+typedef void (*mixmove_t)(int dir, unsigned char undo, unsigned char scroll);
 
 static void *g_mixKnown[MAX_MIX];               // track identities the main thread last saw
 static volatile LONG g_nMixKnown = -1;
 
 static void mix_known_take(void) {
     int n = mix_count(), t;
-    for (t = 0; t < n; t++) g_mixKnown[t] = fx_obj(t, 0);
+    for (t = 0; t < n; t++) g_mixKnown[t] = mix_tid(t);
     InterlockedExchange(&g_nMixKnown, n);
 }
 // Poll thread: tracks inserted / deleted that the main thread hasn't handled yet.
 static int mix_count_changed(void) { return g_nMixKnown >= 0 && mix_count() != g_nMixKnown; }
+// ... or moved.
+static int mix_layout_changed(void) {
+    int n = mix_count(), t;
+    if (g_nMixKnown < 0) return 0;
+    if (n != g_nMixKnown) return 1;
+    for (t = 1; t < n - 1; t++) if (mix_tid(t) != g_mixKnown[t]) return 1;
+    return 0;
+}
 // Order-sensitive hash of the track identities: changes when tracks are inserted, deleted or moved.
 static uint64_t mix_ids_hash(void) {
     int n = mix_count(), t;
     uint64_t h = fnv_add(1469598103934665603ull, &n, 4);
-    for (t = 0; t < n; t++) { void *id = fx_obj(t, 0); h = fnv_add(h, &id, sizeof(id)); }
+    for (t = 0; t < n; t++) { void *id = mix_tid(t); h = fnv_add(h, &id, sizeof(id)); }
     return h;
 }
 
@@ -2386,7 +2850,7 @@ static int mix_diff(void *const *old, int n0, int *del, int *nd, int *ins, int *
     if (n > 0) from[0] = 0;
     if (n > 1 && n0 > 1) from[n - 1] = n0 - 1;
     for (j = 1; j < n - 1; j++) {
-        void *id = fx_obj(j, 0);
+        void *id = mix_tid(j);
         for (i = 1; i < n0 - 1 && old[i] != id; i++) {}
         if (i < n0 - 1) from[j] = i; else ins[(*ni)++] = j;
     }
@@ -2397,8 +2861,9 @@ static int mix_diff(void *const *old, int n0, int *del, int *nd, int *ins, int *
     return n;
 }
 
-// Tracks renumbered: each effect slot's bookkeeping follows its track (the plugin went along),
-// per-number state is forgotten, and every value is re-read without being sent.
+// Tracks renumbered: each effect slot's bookkeeping, each value flim last saw, and each name / color /
+// route baseline follow their track (from[]: new number -> old, -1 = new). Re-taking them from FL instead
+// swallowed edits made in the same moment (they never went out).
 static void mix_rebaseline(const int *from, int n) {
     static Unit old[MAX_MIX][MAX_FX_SLOTS];
     static int oldN[MAX_MIX][MAX_FX_SLOTS];
@@ -2411,40 +2876,96 @@ static void mix_rebaseline(const int *from, int n) {
             int f = t < n ? from[t] : -1;
             if (f >= 0) { *u = old[f][s]; g_fxN[t][s] = oldN[f][s]; }
             else { memset(u, 0, sizeof(*u)); g_fxN[t][s] = 0; }
-            if (f != t) { u->hash = 0; u->identAt = 0; u->lastAct = 0; u->burst = 0; }
-            if (t < n) u->inst = plugin_inst(fx_obj(t, s));
+            // a moved track's pending sends (a plugin swapped or edited just before) go with it
+            if (f != t && f >= 0) { u->hash = 0; if (!u->identAt && !u->lastAct) u->baselineAt = GetTickCount() + REBASE_MS; }
+            // a moved track keeps the plugins flim knew in it: one swapped meanwhile is still found by do_struct
+            if (t < n && f < 0) u->inst = plugin_inst(fx_obj(t, s));
         }
+    (void)i;
     plug_agreed_reset(0, 1);
-    for (t = M_MIX; t <= M_ROUTE; t++)                       // names, colors and sends moved with their tracks
-        for (i = 0; i < MAX_MIX; i++) { g_mSeen[t][i] = g_mHash[t][i] = meta_hash(t, i); g_mAt[t][i] = 0; }
+    slots_rebase(NULL, 0, from, n);                          // values, names, colors and sends go with their tracks,
+    meta_remap(M_MIX, from, n);                              // so edits made in the same moment still go out
+    meta_remap(M_ROUTE, from, n);
     mix_known_take();
-    InterlockedIncrement(&g_structGen);                      // the poll thread re-reads every value silently
+    InterlockedIncrement(&g_structGen);
 }
 
-// Main thread (do_struct): tracks inserted or deleted here go out as one mix.struct.
+static int int_in(const int *a, int n, int v) { int i; for (i = 0; i < n; i++) if (a[i] == v) return 1; return 0; }
+
+// Main thread (do_struct): tracks inserted, deleted or moved here go out as one mix.struct. "perm": the
+// order to put the tracks in after replaying del and ins (which keeps the old tracks in their order and
+// puts the new ones at their places): position j gets the track that is then at perm[j - 1].
 static void mix_struct(void) {
-    static int del[MAX_MIX], ins[MAX_MIX], from[MAX_MIX];
-    int n0 = g_nMixKnown, n = mix_count(), nd, ni, i;
+    static int del[MAX_MIX], ins[MAX_MIX], from[MAX_MIX], after[MAX_MIX], perm[MAX_MIX];
+    int n0 = g_nMixKnown, n = mix_count(), nd, ni, i, j, k, moved = 0;
     if (n0 < 0) { mix_known_take(); return; }
     if (n == n0) {
-        for (i = 0; i < n && fx_obj(i, 0) == g_mixKnown[i]; i++) {}
+        for (i = 0; i < n && mix_tid(i) == g_mixKnown[i]; i++) {}
         if (i == n) return;
     }
     n = mix_diff(g_mixKnown, n0, del, &nd, ins, &ni, from);
-    if (!nd && !ni) { mix_known_take(); return; }           // only moved: the moved tracks' state goes as edits
+    for (j = 1, i = 1, k = 0; j < n - 1; j++) {             // what del + ins alone gives: old index or -1 (new)
+        if (k < ni && ins[k] == j) { after[j] = -1; k++; continue; }
+        while (i < n0 - 1 && int_in(del, nd, i)) i++;
+        after[j] = i++;
+    }
+    for (j = 1; j < n - 1; j++) {
+        if (from[j] < 0) perm[j] = j;                        // a new track: where the insert puts it
+        else for (perm[j] = 1; perm[j] < n - 1 && after[perm[j]] != from[j]; perm[j]++) {}
+        moved |= perm[j] != j;
+    }
     {
-        size_t cap = 128 + (size_t)(nd + ni) * 5;
+        size_t cap = 128 + (size_t)(nd + ni) * 5 + (moved ? (size_t)n * 5 : 0);
         char *m = (char *)malloc(cap);
         int o = sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"mix.struct\",\"n0\":%d,\"n\":%d,\"del\":[", n0, n);
         for (i = 0; i < nd; i++) o += sprintf_s(m + o, cap - o, "%s%d", i ? "," : "", del[i]);
         o += sprintf_s(m + o, cap - o, "],\"ins\":[");
         for (i = 0; i < ni; i++) o += sprintf_s(m + o, cap - o, "%s%d", i ? "," : "", ins[i]);
-        sprintf_s(m + o, cap - o, "]}}");
+        o += sprintf_s(m + o, cap - o, "]");
+        if (moved) {
+            o += sprintf_s(m + o, cap - o, ",\"perm\":[");
+            for (j = 1; j < n - 1; j++) o += sprintf_s(m + o, cap - o, "%s%d", j > 1 ? "," : "", perm[j]);
+            o += sprintf_s(m + o, cap - o, "]");
+        }
+        sprintf_s(m + o, cap - o, "}}");
         ws_send(m);
         free(m);
     }
-    logmsg("MIX tracks changed locally: %d deleted, %d inserted, %d -> %d tracks (sent)", nd, ni, n0, n);
+    logmsg("MIX tracks changed locally: %d deleted, %d inserted%s, %d -> %d tracks (sent)", nd, ni, moved ? ", moved" : "", n0, n);
     mix_rebaseline(from, n);
+}
+
+// Remote: the tracks into the sender's order, position j getting the track now at perm[j] (j = 1..n-2),
+// with FL's own "move selected", one step left at a time: it renumbers sends, channel targets,
+// automation and linked playlist tracks and refreshes all of it, as the sender's move did. Each person's
+// selection and focused track stay on their tracks. 0: FL didn't move a track as expected.
+static int mix_reorder(const int *perm, int n) {
+    static void *want[MAX_MIX], *sel[MAX_MIX];
+    int *focus = (int *)(g_flBase + (MIXFOCUS_VA - IMG_BASE));
+    void *focusId;
+    int j, c, t, ns = 0, steps = 0, ok = 1;
+    for (j = 1; j < n - 1; j++) want[j] = mix_tid(perm[j]);
+    for (t = 1; t < n - 1; t++) if (mix_rec(t)[MIX_SELECTED]) sel[ns++] = mix_tid(t);
+    focusId = *focus >= 0 && *focus < n ? mix_tid(*focus) : NULL;
+    for (j = 1; j < n - 1 && ok; j++) {
+        for (c = j; c < n - 1 && mix_tid(c) != want[j]; c++) {}
+        if (c == n - 1) { ok = 0; break; }
+        for (; c > j; c--, steps++) {
+            for (t = 0; t < n; t++) mix_rec(t)[MIX_SELECTED] = (char)(t == c);
+            *focus = c;
+            ((mixmove_t)(g_flBase + (MIXMOVE_VA - IMG_BASE)))(-1, 0, 0);
+            if (mix_tid(c - 1) != want[j]) { ok = 0; break; }
+        }
+    }
+    for (t = 0; t < n; t++) {                                // their selection and focus back, wherever the tracks went
+        void *id = mix_tid(t);
+        int k, on = 0;
+        for (k = 0; k < ns && !on; k++) on = sel[k] == id;
+        mix_rec(t)[MIX_SELECTED] = (char)on;
+        if (id == focusId) *focus = t;
+    }
+    logmsg("MIX tracks moved (remote): %d step%s%s", steps, steps == 1 ? "" : "s", ok ? "" : ", FL DIDN'T MOVE THEM AS SENT");
+    return ok;
 }
 
 // "key":[1,2,3] -> out; returns how many.
@@ -2462,9 +2983,10 @@ static int json_ints(const char *m, const char *key, int *out, int cap) {
 // Remote mix.struct: replay it with FL's own insert / delete, then re-take baselines as for a local
 // one. A member whose track list no longer matches the sender's re-syncs to the leader. Main thread.
 static void do_mixstruct(const QItem *it) {
-    static int del[MAX_MIX], ins[MAX_MIX], from[MAX_MIX], d2[MAX_MIX], i2[MAX_MIX];
+    static int del[MAX_MIX], ins[MAX_MIX], from[MAX_MIX], d2[MAX_MIX], i2[MAX_MIX], perm[MAX_MIX], seen[MAX_MIX];
     static void *before[MAX_MIX];
     int nd = json_ints(it->path, "\"del\":[", del, MAX_MIX), ni = json_ints(it->path, "\"ins\":[", ins, MAX_MIX);
+    int np = json_ints(it->path, "\"perm\":[", perm + 1, MAX_MIX - 2);
     int n0 = -1, want = -1, have = mix_count(), bad = 0, i, k, nd2, ni2;
     int_after(it->path, NULL, "\"n0\":", &n0);
     int_after(it->path, NULL, "\"n\":", &want);
@@ -2475,8 +2997,13 @@ static void do_mixstruct(const QItem *it) {
     }
     for (i = 0; i < nd; i++) bad |= del[i] < 1 || del[i] > have - 2 || (i && del[i] <= del[i - 1]);
     for (i = 0; i < ni; i++) bad |= ins[i] < 1 || ins[i] > want - 2 || (i && ins[i] <= ins[i - 1]);
+    if (np) {                                                // a permutation of 1..want-2
+        memset(seen, 0, sizeof(seen));
+        bad |= np != want - 2;
+        for (i = 1; i <= np && !bad; i++) { bad |= perm[i] < 1 || perm[i] > want - 2 || seen[perm[i]]; if (!bad) seen[perm[i]] = 1; }
+    }
     if (bad || want != have - nd + ni || want > MIX_ROUTE_MAX) { logmsg("MIX struct: malformed op; skipped"); return; }
-    for (i = 0; i < have; i++) before[i] = fx_obj(i, 0);
+    for (i = 0; i < have; i++) before[i] = mix_tid(i);
     __try {
         if (nd) {
             // FL takes a Delphi dynamic array: refcount and length in front of the ints (a huge
@@ -2492,6 +3019,8 @@ static void do_mixstruct(const QItem *it) {
             for (k = i + 1; k < ni && ins[k] == ins[k - 1] + 1; k++) {}
             ((mixins_t)(g_flBase + (MIXINS_VA - IMG_BASE)))((unsigned)ins[i], (unsigned)(k - i), MIXINS_FLAGS);
         }
+        if (np && mix_count() == want && !mix_reorder(perm, want) && !g_isLeader)
+            ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");   // not the sender's order: the leader's project again
     } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("MIX struct faulted"); }
     mix_diff(before, have, d2, &nd2, i2, &ni2, from);
     logmsg("MIX tracks changed (remote): %d deleted, %d inserted, %d -> %d tracks%s", nd, ni, have, mix_count(),
@@ -2619,6 +3148,30 @@ static void scan_meta(DWORD now) {
     for (i = 0; i < np; i++) enqueue_unit(T_METASNAP, pend[i] / META_MAX, pend[i] % META_MAX, 0, 0, NULL);
 }
 
+// Detailed log: what the project looks like here, as hashes of what the scanners last saw (names and
+// colors of mixer tracks, routes, channels, patterns, playlist tracks, markers, time signatures, notes,
+// the current arrangement's clips), every DIGEST_MS. Two people's lines from the same moment should
+// match; the first one that doesn't shows when and in what they went out of step.
+#define DIGEST_MS 30000
+static void state_digest(DWORD now) {
+    static DWORD last = 0;
+    char s[600];
+    int t, i, o;
+    uint64_t h;
+    if (!g_logDetailed || !g_metaReady || now - last < DIGEST_MS) return;
+    last = now;
+    o = sprintf_s(s, sizeof(s), "STATE channels %d, mixer tracks %d |", g_nChKnown, mix_count());
+    for (t = 0; t < M_NTYPES; t++) {
+        h = 1469598103934665603ull;
+        for (i = 0; i < meta_cap(t); i++) h = fnv_add(h, &g_mSeen[t][i], 8);
+        o += sprintf_s(s + o, sizeof(s) - o, " %s %08x", M_TAG[t], (unsigned)(h ^ (h >> 32)));
+    }
+    h = 1469598103934665603ull;
+    for (i = 1; i < MAX_PAT; i++) h = fnv_add(h, &g_patSeen[i], 8);
+    sprintf_s(s + o, sizeof(s) - o, " notes %08x clips %08x", (unsigned)(h ^ (h >> 32)), (unsigned)(g_clipSeen ^ (g_clipSeen >> 32)));
+    logmsg("%s", s);
+}
+
 // Inbound meta.set: the whole message goes to the main thread.
 static void on_meta_set(const char *m) {
     QItem q; memset(&q, 0, sizeof(q));
@@ -2696,6 +3249,7 @@ static void tsig_apply(int nu, int de) {
     if (*pn != nu || *pd != de) logmsg("META time signature %d/%d came out as %d/%d", nu, de, *pn, *pd);
 }
 
+static volatile LONG g_mbAuto;           // (the pattern ops section)
 static void do_meta(const QItem *it) {
     const char *m = it->path, *e = strstr(m, "\"e\":\""), *q;
     int t, i = -1, len = 0, hasL, hasC = 0;
@@ -2740,7 +3294,7 @@ static void do_meta(const QItem *it) {
             static int lvl[MIX_ROUTE_MAX];
             char *r = mix_rec(i), *end;
             void *mixer = **(void ***)(g_flBase + (MIXOBJ_VA - IMG_BASE));
-            int d, nm = mix_count(), changed = 0;
+            int d, nm = mix_count(), changed = 0, pass;
             memset(on, 0, sizeof(on));
             q = strstr(m, "\"r\":[");
             if (!q || !mixer) break;
@@ -2755,11 +3309,20 @@ static void do_meta(const QItem *it) {
                 q = end + 1;
                 if (*q == ',') q++;
             }
-            for (d = 0; d < nm && d < MIX_ROUTE_MAX; d++) {
-                int cur = r[MIX_ROUTE + d * 8 + 4] != 0;
-                if (cur != on[d]) { ((setroute_t)(g_flBase + (SETROUTE_VA - IMG_BASE)))(mixer, i, d, on[d], 1); changed = 1; }
-                if (on[d] && *(int32_t *)(r + MIX_ROUTE + d * 8) != lvl[d]) { *(int32_t *)(r + MIX_ROUTE + d * 8) = lvl[d]; changed = 1; }
-            }
+            // FL refuses a route that would close a loop with what is routed here now: the routes this row drops
+            // go first, then the new ones, and the ones refused once more after that. No undo step here; FL's
+            // "Disable routing?" (a plugin uses the route) is answered yes, as the sender did.
+            InterlockedExchange(&g_mbAuto, 1);
+            for (pass = 0; pass < 3; pass++)
+                for (d = 0; d < nm && d < MIX_ROUTE_MAX; d++) {
+                    int cur = r[MIX_ROUTE + d * 8 + 4] != 0;
+                    if (cur == on[d] || (pass == 0) != !on[d]) continue;
+                    if (((setroute_t)(g_flBase + (SETROUTE_VA - IMG_BASE)))(mixer, i, d, on[d], 0) >= 0) changed = 1;
+                    else if (pass == 2) logmsg("META route %d -> %d: FL refused it here (it would make a loop)", i, d);
+                }
+            InterlockedExchange(&g_mbAuto, 0);
+            for (d = 0; d < nm && d < MIX_ROUTE_MAX; d++)
+                if (on[d] && r[MIX_ROUTE + d * 8 + 4] && *(int32_t *)(r + MIX_ROUTE + d * 8) != lvl[d]) { *(int32_t *)(r + MIX_ROUTE + d * 8) = lvl[d]; changed = 1; }
             if (changed) {
                 ((mixerfn_t)(g_flBase + (ROUTEUPD_VA - IMG_BASE)))(mixer);
                 ((uiupdate_t)(g_flBase + (UIUPDATE_VA - IMG_BASE)))(0x18, 0);
@@ -2768,10 +3331,15 @@ static void do_meta(const QItem *it) {
         case M_CHAN: {
             char *o = (char *)chan_obj(i);
             void **vmt;
+            int changed = 0;
+            Unit *u = unit_ptr(U_CH, i, 0);
             if (!o) break;
             vmt = *(void ***)o;
-            if (name && !ustr_eq(*(wchar_t **)(o + CH_NAME), name)) ((chsetname_t)vmt[CH_SETNAME_VSLOT])(o, meta_name_arg(name));
-            if (hasC && *(uint32_t *)(o + CH_COLOR) != color) ((chsetcolor_t)vmt[CH_SETCOLOR_VSLOT])(o, color);
+            if (name && !ustr_eq(*(wchar_t **)(o + CH_NAME), name)) { ((chsetname_t)vmt[CH_SETNAME_VSLOT])(o, meta_name_arg(name)); changed = 1; }
+            if (hasC && *(uint32_t *)(o + CH_COLOR) != color) { ((chsetcolor_t)vmt[CH_SETCOLOR_VSLOT])(o, color); changed = 1; }
+            // the channel's saved state holds its name and color: not an edit of ours to send back (it went
+            // out under the plugin lock and replaced the state the renaming FL had just loaded)
+            if (changed && u) u->baselineAt = now + REBASE_MS;
             break; }
         case M_PAT: {
             char *r = pat_rec(i);
@@ -3026,12 +3594,19 @@ static void gui_status_again(void) {
     gui_push(GUI_STATUS, line);
 }
 
-// The window's log: our own log lines, for the events people care about (logmsg calls this).
+// The window's log: our own log lines, for the events people care about (logmsg calls this). With the
+// detailed log, nearly all of them: the per-knob, per-op and mouse lines stay in the file (and its export).
 static void gui_log(const char *line) {
     static const char *const KEEP[] = { "PROJECT ", "SAMPLES uploaded", "SAMPLES downloaded", "SAMPLES gave up",
                                         "SAMPLES could not", "SAMPLES upload", "SAMPLES the server", "MIX ", "LOCK ",
-                                        "PLUGIN " };
+                                        "PLUGIN ", "SYNC ", "SHARED " };
+    static const char *const NOISE[] = { "DETECT ", "APPLY ", "OP ", "CURSOR ", "PLUGFOCUS", "BEAT " };
     int i;
+    if (g_logDetailed) {
+        for (i = 0; i < (int)(sizeof(NOISE) / sizeof(NOISE[0])); i++) if (strncmp(line, NOISE[i], strlen(NOISE[i])) == 0) return;
+        gui_push(GUI_LOG, line);
+        return;
+    }
     for (i = 0; i < (int)(sizeof(KEEP) / sizeof(KEEP[0])); i++)
         if (strncmp(line, KEEP[i], strlen(KEEP[i])) == 0) { gui_push(GUI_LOG, line); return; }
 }
@@ -3105,7 +3680,9 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
     case GUI_SETTINGS:
         g_plugLockMs = flimcfg_lock_s() * 1000;
         backup_setting();
-        logmsg("settings: plugin lock %ld s, project backup every %ld min (0 = off)", g_plugLockMs / 1000, g_backupMin);
+        g_logDetailed = flimcfg_log_detailed();
+        logmsg("settings: plugin lock %ld s, project backup every %ld min (0 = off), detailed log %s", g_plugLockMs / 1000, g_backupMin,
+               g_logDetailed ? "on" : "off");
         if (g_isLeader && g_netState == NET_ON) leader_name_project();   // a song name typed in mid-session
         break;
     }
@@ -3255,7 +3832,7 @@ static void set_project_file(const wchar_t *path) {
 
 // Re-take every baseline after a project change (main thread). Nothing is sent.
 static void proj_rebaseline(void) {
-    void **items; int n = chan_list(&items), i, t, s, k;
+    void **items; int n = chan_list(&items), i, t, s;
     known_from_list();
     mix_known_take();
     memset(g_chU, 0, sizeof(g_chU));
@@ -3267,14 +3844,9 @@ static void proj_rebaseline(void) {
     for (t = 0; t < mix_count() && t < MAX_MIX; t++)
         for (s = 0; s < MAX_FX_SLOTS; s++) g_fxU[t][s].inst = plugin_inst(fx_obj(t, s));
     notes_rebaseline();
+    meta_rebaseline();
     rescan();
-    for (k = 0; k < g_nslot; k++) {
-        EnterCriticalSection(&g_slotLock);
-        g_slots[k].last = read_value(g_slots[k].id);
-        g_slots[k].lockedByMe = 0;
-        InterlockedIncrement(&g_slots[k].gen);
-        LeaveCriticalSection(&g_slotLock);
-    }
+    slots_reread();
     InterlockedIncrement(&g_structGen);
 }
 
@@ -3301,6 +3873,8 @@ static void send_project(const unsigned char *d, size_t n, const wchar_t *name) 
 }
 
 // A snapshot carries no solo of ours: each track gets its own mute state back and loses the solo.
+// Nor does a song saved while soloed: its file has the solo and the solo's mutes, and FL opens it with
+// every track's +0x1c set (what the tracks get back on unsolo), so the others would open it soloed.
 static int solostrip_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end) {
     int *t = (int *)ctx;
     (void)at; (void)end;
@@ -3356,6 +3930,7 @@ static void leader_project_loaded(void) {
             } else logmsg("PROJECT could not create %S (error %lu); staying on the original", flim, GetLastError());
         }
         d = read_file_w(cur, &n);
+        if (d && solo_scan()) { int t = 0; flp_walk(d, n, solostrip_cb, &t); }
         if (d) { send_project(d, n, base_name(cur)); free(d); return; }
     }
     d = project_snapshot(&n);
@@ -3963,6 +4538,64 @@ static void ustate_merge(UState *dst, int isPat, const unsigned char *src, unsig
     free(dst->d);
     dst->d = o; dst->n = k; dst->known = 1;
 }
+static void ustate_remap_ch(UState *s, int isPat, const int *toNew) {
+    size_t rs;
+    unsigned i, k;
+    if (!s->known || !s->d) return;
+    rs = rec_size(isPat);
+    for (i = 0, k = 0; i < s->n; i++) {
+        unsigned char *r = s->d + (size_t)i * rs;
+        int old, neu;
+        if (isPat) {
+            old = (int)*(const uint16_t *)(r + NOTE_CH_OFS);
+        } else {
+            uint32_t item = *(const uint32_t *)(r + 0x04);
+            if ((item & 0xFFFFu) != 0x5000u) {
+                if (k != i) memmove(s->d + (size_t)k * rs, r, rs);
+                k++;
+                continue;
+            }
+            old = (int)(item >> 16);
+        }
+        if (old < 0 || old >= MAX_CH) {                 // not a channel (a pattern clip: (0x5000 + pattern) << 16 | 0x5000)
+            if (k != i) memmove(s->d + (size_t)k * rs, r, rs);
+            k++;
+            continue;
+        }
+        neu = toNew[old];
+        if (neu < 0) continue;
+        if (isPat) *(uint16_t *)(r + NOTE_CH_OFS) = (uint16_t)neu;
+        else *(uint32_t *)(r + 0x04) = ((uint32_t)neu << 16) | 0x5000u;
+        if (k != i) memmove(s->d + (size_t)k * rs, r, rs);
+        k++;
+    }
+    s->n = k;
+}
+
+static void notes_remap(const int *from, int n) {
+    int toNew[MAX_CH];
+    int p, i;
+    for (i = 0; i < MAX_CH; i++) toNew[i] = -1;
+    for (i = 0; i < n && i < MAX_CH; i++) if (from[i] >= 0 && from[i] < MAX_CH) toNew[from[i]] = i;
+    EnterCriticalSection(&g_ulockLock);
+    for (p = 1; p < MAX_PAT; p++) {
+        ustate_remap_ch(&g_patLast[p], 1, toNew);
+        ustate_remap_ch(&g_patPend[p], 1, toNew);
+        ustate_remap_ch(&g_patBase[p], 1, toNew);
+    }
+    ustate_remap_ch(&g_clipLast, 0, toNew);
+    ustate_remap_ch(&g_clipPend, 0, toNew);
+    ustate_remap_ch(&g_clipBase, 0, toNew);
+    LeaveCriticalSection(&g_ulockLock);
+}
+
+static void chan_rebase(const int *from, int n) {
+    slots_rebase(from, n, NULL, 0);
+    meta_remap(M_CHAN, from, n);
+    notes_remap(from, n);
+    InterlockedIncrement(&g_structGen);
+}
+
 // "pat:<p>[:<ch>]" / "clips:<a>[:<track>]" -> unit + group (-1 = whole unit). 0 = not such a key.
 static int unit_key_parse(const char *key, int *isPat, int *idx, int *g) {
     *g = -1;
@@ -4764,26 +5397,35 @@ static int mem_find(const unsigned char *d, size_t n, const void *pat, size_t pn
 // Main thread: if this unit's state mentions one of the file names in it->path (a list of
 // NUL-terminated names, ending in an empty one), load its own state back, so FL reads the
 // sample (no longer a placeholder) from disk again. Nothing is sent: everyone else had it.
-static void do_reloadu(const QItem *it) {
+static int names_in(const unsigned char *d, size_t n, const wchar_t *names) {   // any of names in d (UTF-16 or ANSI)
     const wchar_t *nm;
-    size_t n = 0;
-    int hit = 0;
-    unsigned char *d;
+    for (nm = names; *nm; nm += wcslen(nm) + 1) {
+        char an[MAX_PATH * 2];
+        int al = WideCharToMultiByte(CP_ACP, 0, nm, -1, an, sizeof(an), NULL, NULL) - 1;
+        if (mem_find(d, n, nm, wcslen(nm) * 2) || (al > 0 && mem_find(d, n, an, (size_t)al))) return 1;
+    }
+    return 0;
+}
+static void do_reloadu(const QItem *it) {
+    size_t n = 0, kn = 0;
+    unsigned char *d, *k;
+    Unit *u = unit_ptr(it->unit, it->a, it->b);
+    void *obj = unit_obj(it->unit, it->a, it->b);
     if (load_queued(it->unit, it->a, it->b)) return;     // a peer's newer state is about to load anyway
     d = unit_save(it->unit, it->a, it->b, &n);
     if (!d) return;
-    for (nm = (const wchar_t *)it->path; *nm && !hit; nm += wcslen(nm) + 1) {
-        char an[MAX_PATH * 2];
-        int al = WideCharToMultiByte(CP_ACP, 0, nm, -1, an, sizeof(an), NULL, NULL) - 1;
-        hit = mem_find(d, n, nm, wcslen(nm) * 2) || (al > 0 && mem_find(d, n, an, (size_t)al));
+    // the state as it came, not as the plugin made it over the placeholder (or without the missing file:
+    // its own save may not even name it any more)
+    k = u ? phload_take(obj, u->editGen, &kn) : NULL;
+    if (k && !names_in(k, kn, (const wchar_t *)it->path) && !names_in(d, n, (const wchar_t *)it->path)) {
+        phload_note(obj, k, kn, u->editGen);              // not this file's: kept for its own
+        free(k);
+        k = NULL;
     }
-    if (hit) {
+    if (k || names_in(d, n, (const wchar_t *)it->path)) {
         char *path = tmp_path("rl");
         FILE *f = NULL;
-        Unit *u = unit_ptr(it->unit, it->a, it->b);
-        size_t kn = 0;
-        unsigned char *k = u ? phload_take(unit_obj(it->unit, it->a, it->b), u->editGen, &kn) : NULL;
-        if (k) { free(d); d = k; n = kn; }       // the state as it came, not as the plugin made it over the placeholder
+        if (k) { free(d); d = k; n = kn; }
         if (fopen_s(&f, path, "wb") == 0 && f) {
             fwrite(d, 1, n, f); fclose(f);
             enqueue_unit(T_LOAD, it->unit, it->a, it->b, LOAD_FORCE, path);
@@ -5020,6 +5662,7 @@ static void run_task(const QItem *in) {
     run_task_inner(it);
     if (remote) sel_restore();
     if (remoteHeavy) wguard_pass();
+    if (remoteHeavy || it->type == T_ORDER || it->type == T_MIXSTRUCT || it->type == T_FXSYNC) g_linkQuiet = GetTickCount();
 }
 
 static void run_task_inner(const QItem *it) {
@@ -5084,6 +5727,14 @@ static int fl_presets_loading(void) {
 static int replaces_plugins(int type) {
     return type == T_LOAD || type == T_ADDCH || type == T_DELCH || type == T_FXCLEAR || type == T_MIXSTRUCT || type == T_PROJLOAD;
 }
+// Tasks that call into plugins (save their state, or replace them): not while a plugin's own menu, drag or
+// dialog is on the stack (main_busy).
+static int calls_plugins(int type) {
+    return replaces_plugins(type) || type == T_SNAP || type == T_PLUGFOCUS || type == T_RELOADU;
+}
+// The task FL's main thread is in (pollThread reports one that doesn't come back: main_stuck).
+static volatile LONG g_runType = -1, g_runUnit, g_runA, g_runB;
+static volatile DWORD g_runAt;
 static int module_is_plugin(HMODULE m) {
     static HMODULE seen[64];
     static char verdict[64];
@@ -5097,10 +5748,18 @@ static int module_is_plugin(HMODULE m) {
     if (n < 64) { seen[n] = m; verdict[n++] = (char)r; }
     return r;
 }
+// A mouse button held while FL is in front: the user is dragging or in a menu in FL. Held in another program
+// it says nothing about FL (it used to hold flim's queue for as long as someone dragged anything anywhere).
+static int fl_mouse_down(void) {
+    DWORD pid = 0;
+    HWND fg = GetForegroundWindow();
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+    return pid == GetCurrentProcessId() && ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) || (GetAsyncKeyState(VK_RBUTTON) & 0x8000));
+}
 static int main_busy(char *why, int cap) {
     void *f[62];
     USHORT n, i;
-    if (GetAsyncKeyState(VK_LBUTTON) & 0x8000 || GetAsyncKeyState(VK_RBUTTON) & 0x8000) { strcpy_s(why, cap, "a mouse button is down"); return 1; }
+    if (fl_mouse_down()) { strcpy_s(why, cap, "a mouse button is down"); return 1; }
     n = RtlCaptureStackBackTrace(1, 62, f, NULL);
     for (i = 0; i < n; i++) {
         HMODULE m = NULL;
@@ -5125,7 +5784,7 @@ static void drain_queue_mainthread(void) {
         it = g_q[g_qh];
         LeaveCriticalSection(&g_qLock);
         if (g_taskWnd && (fl_presets_loading() || fl_loading())) strcpy_s(why, sizeof(why), "FL is loading something");
-        else if (!g_taskWnd || g_projBusy || !replaces_plugins(it.type) || !main_busy(why, sizeof(why))) why[0] = 0;
+        else if (!g_taskWnd || g_projBusy || !calls_plugins(it.type) || !main_busy(why, sizeof(why))) why[0] = 0;
         if (why[0]) {
             if (!waitSince) { waitSince = GetTickCount(); logmsg("WAIT flim's queued changes held back: %s", why); }
             SetTimer(g_taskWnd, BUSY_TIMER, BUSY_RETRY_MS, NULL);
@@ -5133,7 +5792,8 @@ static void drain_queue_mainthread(void) {
         }
         if (waitSince) { logmsg("WAIT over after %lu ms", GetTickCount() - waitSince); waitSince = 0; }
         EnterCriticalSection(&g_qLock);
-        g_qh = (g_qh + 1) % QCAP;                       // only this thread takes from the queue: still `it`
+        it = g_q[g_qh];                                 // as it is now: enqueue may have put a newer value or state in it
+        g_qh = (g_qh + 1) % QCAP;
         LeaveCriticalSection(&g_qLock);
         if (it.peer) InterlockedDecrement(&g_peerQueued);
 
@@ -5145,9 +5805,12 @@ static void drain_queue_mainthread(void) {
             continue;
         }
 
+        g_runType = it.type; g_runUnit = it.type == T_PARAM ? (LONG)it.id : it.unit; g_runA = it.a; g_runB = it.b;
+        g_runAt = GetTickCount() | 1;
         if (it.type != T_PARAM) {
             DWORD t0 = GetTickCount();
             run_task(&it);
+            g_runAt = 0;
             DWORD dt = GetTickCount() - t0;
             if (dt > 50) logmsg("SLOW main-thread task type=%d unit=%d %d/%d took %lu ms", it.type, it.unit, it.a, it.b, dt);
             // one heavy FL call per tick; come back for the rest
@@ -5155,6 +5818,7 @@ static void drain_queue_mainthread(void) {
             break;
         }
         Slot *s = slot_by_id(it.id);
+        if (s && it.mode == 2 && s->applied != it.v) continue;
         if (s) {
             // Record the value before writing so the poller sees no change, and bump
             // gen so any poll that raced with this write is discarded.
@@ -5186,9 +5850,60 @@ static void drain_queue_mainthread(void) {
             InterlockedIncrement(&s->gen);
             LeaveCriticalSection(&g_slotLock);
         }
+        g_runAt = 0;
         logmsg("APPLY id=0x%08x v=%u ret=%u", it.id, it.v, r);
     }
+    g_runAt = 0;
     InterlockedExchange(&g_inHook, 0);
+}
+
+// Poll thread: FL's main thread hasn't come back from one of our tasks for STUCK_MS. Which task, and where
+// the thread is (each frame as module+offset, from its unwind data), so a log alone names the plugin or
+// lock. The thread is stopped only while its registers and return addresses are read (no allocation,
+// no loader lock meanwhile); the names are looked up after it runs again.
+#define STUCK_MS 5000
+static DWORD g_mainTid;
+static void main_stuck(DWORD forMs) {
+    DWORD64 pc[24];
+    int n = 0, i;
+    char line[1600];
+    size_t o;
+    HANDLE th = g_mainTid ? OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, g_mainTid) : NULL;
+    logmsg("STUCK FL's main thread has been in a flim task for %lu s: type %ld, unit %ld %ld/%ld (FL isn't responding)",
+           forMs / 1000, g_runType, g_runUnit, g_runA, g_runB);
+    if (!th) return;
+    if (SuspendThread(th) != (DWORD)-1) {
+        CONTEXT c;
+        memset(&c, 0, sizeof(c));
+        c.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(th, &c)) {
+            __try {
+                for (n = 0; n < 24 && c.Rip; n++) {
+                    DWORD64 base = 0;
+                    PRUNTIME_FUNCTION f;
+                    pc[n] = c.Rip;
+                    f = RtlLookupFunctionEntry(c.Rip, &base, NULL);
+                    if (!f) { c.Rip = *(DWORD64 *)c.Rsp; c.Rsp += 8; }   // a leaf: its return address is on top
+                    else {
+                        PVOID hd;
+                        DWORD64 ef;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, c.Rip, f, &c, &hd, &ef, NULL);
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        ResumeThread(th);
+    }
+    CloseHandle(th);
+    o = (size_t)sprintf_s(line, sizeof(line), "STUCK main thread:");
+    for (i = 0; i < n && o < sizeof(line) - 120; i++) {
+        HMODULE m = NULL;
+        wchar_t p[MAX_PATH] = L"?";
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)pc[i], &m) && m)
+            GetModuleFileNameW(m, p, MAX_PATH);
+        o += (size_t)sprintf_s(line + o, sizeof(line) - o, " %S+%llx", base_name(p), (unsigned long long)(pc[i] - (DWORD64)m));
+    }
+    logmsg("%s", line);
 }
 
 static LRESULT CALLBACK task_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -5282,6 +5997,27 @@ static void delchan_detour_install(void) {
     g_delchanOrig = (delchan_t)detour_tramp((unsigned char *)(g_flBase + (DELCHAN_VA - IMG_BASE)), PRO, 14, (void *)delchan_detour);
     if (g_delchanOrig) g_delChannel = g_delchanOrig;      // a peer's delete (do_delch) isn't one of ours
     else logmsg("CHAN: FL's channel delete looks different: a delete and an add right after it may sync as a move");
+}
+
+// FL loads a preset into a channel or effect slot (its browser, a plugin's preset menu, a drop): that
+// unit's state goes out once it settles, as after a preset-sized burst of knobs. A preset that moves no
+// knob (another soundfont, sample or wavetable) waited for the round-robin check, a minute in a big
+// project. A channel FL is making (not in the known list yet) goes out as a new channel anyway.
+static presetfile_t g_loadPresetOrig;
+static int loadpreset_detour(const wchar_t *file, int mask, void *obj, int flags) {
+    int r = g_loadPresetOrig(file, mask, obj, flags), i, t, s, n = mix_count();
+    Unit *u = NULL;
+    for (i = 0; i < g_nChKnown && !u; i++) if (g_chKnown[i] == obj) u = &g_chU[i];
+    for (t = 0; t < n && t < MAX_MIX && !u; t++)
+        for (s = 0; s < MAX_FX_SLOTS && !u; s++) if (fx_obj(t, s) == obj) u = &g_fxU[t][s];
+    if (u && mask) { u->lastAct = GetTickCount(); u->burst = 1; }
+    return r;
+}
+static void loadpreset_detour_install(void) {
+    static const unsigned char PRO[16] = { 0x55, 0x48, 0x83, 0xEC, 0x60, 0x48, 0x8B, 0xEC, 0x48, 0xC7, 0x45, 0x30, 0, 0, 0, 0 };   // push rbp; sub rsp,60h; mov rbp,rsp; mov [rbp+30h],0
+    g_loadPresetOrig = (presetfile_t)detour_tramp((unsigned char *)(g_flBase + (LOADPRESET_VA - IMG_BASE)), PRO, 16, (void *)loadpreset_detour);
+    if (g_loadPresetOrig) g_loadPreset = g_loadPresetOrig;   // flim's own loads (someone else's states) aren't edits
+    else logmsg("PLUG: FL's preset loader looks different: a preset loaded here that moves no knob syncs later");
 }
 static LRESULT CALLBACK savepop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_TIMER) { if (!host_saving()) DestroyWindow(h); return 0; }
@@ -5416,6 +6152,7 @@ static int install_mainthread_hook(void) {
     if (!h) { logmsg("main window not found"); return -1; }
     g_mainWnd = h;
     DWORD tid = GetWindowThreadProcessId(h, NULL);
+    g_mainTid = tid;
     g_hook = SetWindowsHookExW(WH_GETMESSAGE, getMsgHook, g_hinst, tid);
     g_hookCwp = SetWindowsHookExW(WH_CALLWNDPROC, callWndHook, g_hinst, tid);
     char cls[128] = { 0 }; GetClassNameA(h, cls, sizeof(cls));
@@ -5442,7 +6179,7 @@ static uint32_t container_of(uint32_t id) {
 #define BULK_MIN_CHANGES    24
 #define BULK_MIN_CONTAINERS 4
 
-typedef struct { Slot *s; uint32_t prev, v; int self; } Change;
+typedef struct { Slot *s; uint32_t prev, v, id; LONG gen; int self; } Change;
 static Change g_changes[MAX_SLOTS];
 
 // A param change is an edit only if someone here is using FL: values that move by themselves
@@ -5525,6 +6262,11 @@ static void schedule_units(DWORD now) {
 // On unsolo the tracks go back to the mute states everyone shares (FL may unmute them all instead,
 // or leave the rest muted when a mute click ended the solo).
 #define SOLO_HOLD_MS 1000
+// While audio runs, FL mutes a track with a short fade: the track still reads enabled until the fade
+// ends, and an unmute meanwhile changes nothing, so the fade finishes muted (FL's sub_12C1810). A
+// mute that ends up against flim's last apply this soon after it is put back, not taken for an edit.
+// Later, any change is someone's click: a mute click goes back to the value flim applied all the time.
+#define MUTE_FADE_MS 500
 static unsigned char g_mutePend[MAX_MIX];  // a track's new mute reading + 1, until the next pass confirms it
 static DWORD g_soloChangedAt;              // when solo last went on or off here
 static void solo_poll(DWORD now) {
@@ -5554,9 +6296,11 @@ static int mute_settled(Slot *s, uint32_t v, DWORD now) {
 static DWORD WINAPI pollThread(LPVOID p) {
     (void)p;
     DWORD lastScan = GetTickCount(), lastBeat = GetTickCount();
-    LONG seenGen = g_structGen;
+    uint64_t lastMixH = 0;
     for (;;) {
-        DWORD now = GetTickCount();
+        DWORD now = GetTickCount(), at = g_runAt;
+        static DWORD stuckSaid;
+        if (g_inHook && at && (LONG)(now - at) > STUCK_MS && at != stuckSaid) { stuckSaid = at; main_stuck(now - at); }
         if (now - lastBeat > 30000) {
             int depth = (g_qt - g_qh + QCAP) % QCAP;
             logmsg("BEAT queue=%d inHook=%ld hookCalls=%ld chanChanged=%d known=%d", depth, g_inHook,
@@ -5588,42 +6332,52 @@ static DWORD WINAPI pollThread(LPVOID p) {
         // Reading a plugin's params while FL's loader replaces it calls into a half-built (or freed)
         // plugin: Slicer 2 then deadlocks its next load, others crash. Not while FL loads anything.
         if (fl_presets_loading() || fl_loading()) { Sleep(POLL_MS); continue; }
-        if (chan_list_changed() || mix_count_changed()) {
-            // A channel or mixer track was added/removed and the main thread hasn't processed it
-            // yet: REC ids of later channels / tracks have shifted, so diffs would be garbage.
+        if (chan_list_changed() || mix_layout_changed()) {
+            // A channel or mixer track was added, removed or moved and the main thread hasn't processed
+            // it yet: REC ids of later channels / tracks have shifted, so diffs would be garbage.
             // The structure check runs now, not at its next turn (a delete and an add between two
             // checks are harder to tell apart, and the others should hear of it before anything else).
-            int k;
             if (!InterlockedExchange(&g_structQueued, 1)) enqueue_unit(T_STRUCT, 0, 0, 0, 0, NULL);
-            for (k = 0; k < g_nslot; k++) g_slots[k].last = read_value(g_slots[k].id);
             schedule_units(now);
             Sleep(POLL_MS);
             continue;
         }
-        if (gen0 != seenGen) {
-            // channel indices shifted (delete): re-read everything silently
-            int k;
-            for (k = 0; k < g_nslot; k++) g_slots[k].last = read_value(g_slots[k].id);
-            seenGen = gen0;
-        }
-        if (now - lastScan > RESCAN_MS || InterlockedExchange(&g_rescanNow, 0)) { rescan(); retry_pending(); lastScan = now; }
+        // (not while FL's main thread is in one of our tasks: it may be saving or loading the very plugin the
+        // rescan or the param reads below would call into; a plugin locked that way once deadlocked FL)
+        if (!g_inHook && (now - lastScan > RESCAN_MS || InterlockedExchange(&g_rescanNow, 0))) { rescan(); retry_pending(); lastScan = now; }
         reload_poll();
         plugfocus_poll(now);
         scan_notes(now);
         scan_clips(now);
         scan_meta(now);
+        state_digest(now);
         focus_poll(now);
         cursor_poll(now);
         solo_poll(now);
         uint64_t mixH = mix_ids_hash();
+        int mixSteady = mixH == lastMixH;              // no track moved since the last pass
+        lastMixH = mixH;
+        links_scan(now, mixSteady);
         n = g_nslot;
         for (i = 0; i < n; i++) {
             Slot *s = &g_slots[i];
             LONG g0 = s->gen;
             uint32_t v;
+            int pu, pa, pb;
             if (fl_presets_loading()) break;           // a load began meanwhile: the rest next tick
+            if (g_inHook && plug_param_unit(s->id, &pu, &pa, &pb)) continue;   // a plugin's: after our task (above)
             v = read_value(s->id);
             if (s->gen != g0) continue;                 // raced with an apply; re-read next tick
+            if (IS_MUTE_ID(s->id) && mixSteady && v != REC_NONE && v != s->last && v != s->applied && v != s->echo &&
+                s->echoAt && now - s->echoAt < MUTE_FADE_MS) {
+                // FL's fade swallowed our last apply: once more (if that fails too, what FL shows is our echo)
+                EnterCriticalSection(&g_slotLock);
+                s->echo = v;
+                LeaveCriticalSection(&g_slotLock);
+                enqueue_apply(s->id, s->applied, 2);
+                logmsg("MUTE track %u ended up %s after flim's apply: applying it again", s->id & 0xFFFFF, v ? "on" : "muted");
+                continue;
+            }
             if (IS_MUTE_ID(s->id) && !mute_settled(s, v, now)) continue;
             EnterCriticalSection(&g_slotLock);
             uint32_t prev = s->last;
@@ -5631,14 +6385,21 @@ static DWORD WINAPI pollThread(LPVOID p) {
             LeaveCriticalSection(&g_slotLock);
             if (v != prev && v != REC_NONE && prev != REC_NONE) {
                 int unit, a, b;
-                Unit *u = unit_of_id(s->id, &unit, &a, &b) ? unit_ptr(unit, a, b) : NULL;
+                Unit *u;
+                if (auto_target(s->id)) {               // a clip / controller drives it: each FL plays its own
+                    static DWORD said = 0;
+                    if (now - said > 10000) { said = now; logmsg("PARAM 0x%08x is automated: each FL plays its own, not synced", s->id); }
+                    continue;
+                }
+                u = unit_of_id(s->id, &unit, &a, &b) ? unit_ptr(unit, a, b) : NULL;
                 if (u && now < u->suppressUntil) continue;   // caused by a remote state load
                 // its plugin is being replaced here (the structure scan may not have seen it yet): the old
                 // plugin's params "changing" aren't edits, the new one's whole state goes out (SNAP_FORCE)
                 if (u && (u->identAt || plugin_inst(unit_obj(unit, a, b)) != u->inst)) continue;
-                if ((v == s->echo || v == s->applied) && now - s->echoAt < ECHO_MS) continue;   // our apply (rounded, or late)
+                if ((v == s->echo || v == s->applied) && now - s->echoAt < (DWORD)(IS_MUTE_ID(s->id) ? MUTE_FADE_MS : ECHO_MS)) continue;   // our apply (rounded, or late)
                 if (active < 0) active = input_recent(now);
                 g_changes[nc].s = s; g_changes[nc].prev = prev; g_changes[nc].v = v;
+                g_changes[nc].id = s->id; g_changes[nc].gen = g0;
                 g_changes[nc].self = !active || now - s->selfAt < SELF_MS;
                 if (g_changes[nc].self) s->selfAt = now;
                 nc++;
@@ -5648,10 +6409,11 @@ static DWORD WINAPI pollThread(LPVOID p) {
                 s->lockedByMe = 0;
             }
         }
-        if (g_structGen != gen0 || mix_count_changed() || mix_ids_hash() != mixH) {
+        if (g_structGen != gen0 || chan_list_changed() || mix_count_changed() || mix_ids_hash() != mixH) {
             // indices moved mid-tick: forget this tick's changes (moved mixer tracks show up whole next tick)
             EnterCriticalSection(&g_slotLock);
-            for (i = 0; i < nc; i++) if (g_changes[i].s->last == g_changes[i].v) g_changes[i].s->last = g_changes[i].prev;
+            for (i = 0; i < nc; i++) if (g_changes[i].s->id == g_changes[i].id && g_changes[i].s->gen == g_changes[i].gen &&
+                                        g_changes[i].s->last == g_changes[i].v) g_changes[i].s->last = g_changes[i].prev;
             LeaveCriticalSection(&g_slotLock);
             Sleep(POLL_MS);
             continue;
@@ -5779,6 +6541,8 @@ static void pend_put(uint32_t id, uint32_t v) {
 // Apply an inbound value (queued for the main thread). onlyIfDiff skips values
 // we already have (join state). Returns 1 if an apply was queued.
 static int route_inbound(uint32_t id, uint32_t v, int onlyIfDiff) {
+    if (id == MAIN_VOL_ID) return 0;                  // an older flim still sends its main volume
+    if (auto_target(id)) return 0;                    // (an older flim sends automated values as it plays)
     if (!add_slot(id)) { pend_put(id, v); return 0; }
     Slot *s = slot_by_id(id);
     if (onlyIfDiff && s && s->last == v) return 0;
@@ -5829,17 +6593,18 @@ static int b64val(char c) {
     return -1;
 }
 
-// Decode base64 [s, s+n) into a new temp .fst; returns its path (malloc'd) or NULL.
-static char *b64_to_tmpfile(const char *s, size_t n) {
-    unsigned char *out = (unsigned char *)malloc(n / 4 * 3 + 3);
-    size_t o = 0, i;
-    int acc = 0, bits = 0;
-    for (i = 0; i < n; i++) {
-        int v = b64val(s[i]);
-        if (v < 0) continue;
-        acc = (acc << 6) | v; bits += 6;
-        if (bits >= 8) { bits -= 8; out[o++] = (unsigned char)((acc >> bits) & 0xff); }
+// Decode base64 [s, s+n) into a new temp .fst, with the links in base64 lk[0..ln) back at the end of its
+// FLdt chunk (unit_json_fields); returns its path (malloc'd) or NULL.
+static char *b64_to_tmpfile(const char *s, size_t n, const char *lk, size_t ln) {
+    size_t o, tn = 0, dt;
+    unsigned char *out = b64dec(s, n, &o), *t = ln ? b64dec(lk, ln, &tn) : NULL;
+    if (tn && o >= 8 && (dt = 8 + (size_t)*(uint32_t *)(out + 4)) + 8 <= o && memcmp(out + dt, "FLdt", 4) == 0) {
+        out = (unsigned char *)realloc(out, o + tn);
+        memcpy(out + o, t, tn);
+        *(uint32_t *)(out + dt + 4) += (uint32_t)tn;
+        o += tn;
     }
+    free(t);
     samples_rewrite(&out, &o);
     char *path = tmp_path("in");
     FILE *f = NULL;
@@ -5855,11 +6620,12 @@ static int int_after(const char *p, const char *end, const char *key, int *out) 
     return 1;
 }
 
-// Parse one unit object starting at p ("unit":..., ids..., "data":"..."). Returns
+// Parse one unit object starting at p ("unit":..., ids..., "data":"..."[,"lk":"..."]). Returns
 // pointer past it, or NULL. Fields are always written in this order by unit_json_fields.
-static const char *parse_unit(const char *p, int *unit, int *a, int *b, char **path) {
+// *lk: the sender put the unit's links in (LOAD_LINKS); an older flim doesn't.
+static const char *parse_unit(const char *p, int *unit, int *a, int *b, char **path, int *lk) {
     const char *u = strstr(p, "\"unit\":\"");
-    const char *d = u ? strstr(u, "\"data\":\"") : NULL;
+    const char *d = u ? strstr(u, "\"data\":\"") : NULL, *l = NULL, *le = NULL;
     if (!u || !d) return NULL;
     *unit = strncmp(u + 8, "fx", 2) == 0 ? U_FX : U_CH;
     *a = *b = 0;
@@ -5868,13 +6634,15 @@ static const char *parse_unit(const char *p, int *unit, int *a, int *b, char **p
     d += 8;
     const char *e = strchr(d, '"');
     if (!e) return NULL;
-    *path = b64_to_tmpfile(d, (size_t)(e - d));
-    return e + 1;
+    if (strncmp(e + 1, ",\"lk\":\"", 7) == 0 && (le = strchr(e + 8, '"')) != NULL) l = e + 8;
+    *lk = l != NULL;
+    *path = b64_to_tmpfile(d, (size_t)(e - d), l, l ? (size_t)(le - l) : 0);
+    return le ? le + 1 : e + 1;
 }
 
 // Member: converge channels and plugin states to the leader's.
 static void apply_plug_full(const char *m) {
-    int nch = 0, unit, a, b, items = 0, k;
+    int nch = 0, unit, a, b, items = 0, k, lk;
     char *path;
     void **list;
     int local = chan_list(&list);
@@ -5883,11 +6651,11 @@ static void apply_plug_full(const char *m) {
     if (local > nch) local = nch;
     const char *p = strstr(m, "\"items\":[");
     unsigned char *keep = (unsigned char *)calloc(MAX_MIX * MAX_FX_SLOTS, 1);
-    while (p && (p = parse_unit(p, &unit, &a, &b, &path)) != NULL) {
+    while (p && (p = parse_unit(p, &unit, &a, &b, &path, &lk)) != NULL) {
         if (!path) continue;
         if (unit == U_FX && a >= 0 && a < MAX_MIX && b >= 0 && b < MAX_FX_SLOTS) keep[a * MAX_FX_SLOTS + b] = 1;
         if (unit == U_CH && a >= local) { enqueue_peer(T_ADDCH, U_CH, a, 0, -1, path); local++; }
-        else enqueue_peer(T_LOAD, unit, a, b, 1, path);
+        else enqueue_peer(T_LOAD, unit, a, b, 1 | (lk ? LOAD_LINKS : 0), path);
         items++;
     }
     {
@@ -5917,9 +6685,43 @@ static void leader_signal(const char *m) {
     }
 }
 
+// Everyone in a session needs the same flim: ops change between builds, and one can misread or skip what
+// another sends. Who joins says its version and build time ("ask":1), the others answer with theirs. (The
+// version is the push date, so two builds of one day share it.)
+// ponytail: flims older than this one say nothing, so they aren't noticed.
+#define FLIM_BUILD __DATE__ " " __TIME__
+#define HELLO_FMT "{\"t\":\"op\",\"op\":{\"kind\":\"hello\",\"ver\":\"" FLIM_VERSION "\",\"build\":\"" FLIM_BUILD "\",\"ask\":%d}}"
+static void json_str(const char *m, const char *key, char *out, int cap) {     // "key":"value" -> out ("" if none)
+    const char *p = strstr(m, key);
+    int i = 0;
+    if (p) for (p += strlen(key); p[i] && p[i] != '"' && i < cap - 1; i++) out[i] = p[i];
+    out[i] = 0;
+}
+static void on_hello(const char *m) {
+    static char said[16][64];
+    static int nsaid;
+    char ver[32], build[32], from[64], who[64], text[480];
+    int i;
+    json_str(m, "\"ver\":\"", ver, sizeof(ver));
+    json_str(m, "\"build\":\"", build, sizeof(build));
+    json_str(m, "\"from\":\"", from, sizeof(from));
+    if (strstr(m, "\"ask\":1")) { char r[160]; sprintf_s(r, sizeof(r), HELLO_FMT, 0); ws_send(r); }
+    if (strcmp(ver, FLIM_VERSION) == 0 && strcmp(build, FLIM_BUILD) == 0) return;
+    for (i = 0; i < nsaid && strcmp(said[i], from) != 0; i++) {}
+    if (i < nsaid) return;
+    if (nsaid < 16) strcpy_s(said[nsaid++], sizeof(said[0]), from);
+    peer_name(from, who, sizeof(who));
+    logmsg("NET %s runs flim %s (built %s), this is %s (built %s): some changes may not sync", who, ver, build, FLIM_VERSION, FLIM_BUILD);
+    sprintf_s(text, sizeof(text), "%s is on flim %s (built %s) and you're on %s (built %s).\n\nEveryone in a session needs "
+              "the same flim, or some changes won't reach everyone. Update to the newest one.", who, ver, build, FLIM_VERSION, FLIM_BUILD);
+    gui_push(GUI_ALERT, text);
+}
+
 static void handle_msg_body(const char *m);
+static void sh_inbox(const char *m);
+static void sh_joined(void);
 // Whatever one network message queues is someone else's op (task_rebind, do_struct).
-static void handle_msg(const char *m) { t_peerMsg++; handle_msg_body(m); t_peerMsg--; }
+static void handle_msg(const char *m) { log_op("in", m); t_peerMsg++; handle_msg_body(m); t_peerMsg--; }
 static void handle_msg_body(const char *m) {    uint32_t id, v;
     int unit, a, b;
     char *path;
@@ -5928,6 +6730,11 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         return;
     }
     if (strstr(m, "\"t\":\"op\"") && (strstr(m, "\"kind\":\"alive\"") || strstr(m, "\"kind\":\"saving\""))) { leader_signal(m); return; }
+    if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"hello\"")) { on_hello(m); return; }
+    if (strstr(m, "\"t\":\"op\"") && (strstr(m, "\"kind\":\"shared.files\"") || strstr(m, "\"kind\":\"shared.need\""))) {
+        sh_inbox(m);                                     // not held during a project load: nothing of the song in it
+        return;
+    }
     if (hold_if_loading(m)) return;
     if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"state.req\"")) {
         // join / member re-sync: send the project (mid-load, the load's own broadcast covers it)
@@ -5935,11 +6742,12 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"plug.full\"")) {
         if (!g_isLeader) apply_plug_full(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"plug.state\"")) {
-        if (parse_unit(m, &unit, &a, &b, &path) && path) enqueue_peer(T_LOAD, unit, a, b, 0, path);
+        int lk;
+        if (parse_unit(m, &unit, &a, &b, &path, &lk) && path) enqueue_peer(T_LOAD, unit, a, b, lk ? LOAD_LINKS : 0, path);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"chan.add\"")) {
-        int n0 = -1;                                         // -1: an older flim (appends only)
+        int n0 = -1, lk;                                     // -1: an older flim (appends only)
         int_after(m, NULL, "\"n0\":", &n0);
-        if (parse_unit(m, &unit, &a, &b, &path) && path) enqueue_peer(T_ADDCH, U_CH, a, 0, n0, path);
+        if (parse_unit(m, &unit, &a, &b, &path, &lk) && path) enqueue_peer(T_ADDCH, U_CH, a, 0, n0, path);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"mix.struct\"")) {
         QItem q; memset(&q, 0, sizeof(q));
         q.type = T_MIXSTRUCT; q.path = _strdup(m);
@@ -5997,6 +6805,8 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         net_show_connected(m);
         if (!g_isLeader) ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");
         else enqueue_unit(T_NAMEPROJ, 0, 0, 0, 0, NULL);  // an untitled project gets the song name, if one is set
+        sh_joined();                                        // the shared folder's files go out
+        { char h[128]; sprintf_s(h, sizeof(h), HELLO_FMT, 1); ws_send(h); }
     } else if (strstr(m, "\"t\":\"op\"")) {
         if (strstr(m, "\"kind\":\"param.set\"") && jget_u32(m, "id", &id) && jget_u32(m, "v", &v)) {
             route_inbound(id, v, 0);
@@ -6090,6 +6900,7 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
 // Compressed / encrypted states (Kontakt...) show no paths and are left as they are.
 #define SAMPLE_ASK_BYTES (50ull * 1024 * 1024)
 #define SAMPLE_MAX_BYTES (2000ull * 1024 * 1024)
+static int in_shared(const wchar_t *p);                       // the shared folder (its own section)
 #define SAMPLE_PATH_MAX  1024
 #define BLOB_CHUNK       (256 * 1024)
 
@@ -6357,7 +7168,7 @@ static int find_by_hash(const char *hex, wchar_t *out, int cap) {
     for (i = 0; i < g_nhash && !found; i++) {
         uint64_t sz;
         FILETIME mt;
-        if (strcmp(g_hashes[i].hex, hex) != 0) continue;
+        if (strcmp(g_hashes[i].hex, hex) != 0 || in_shared(g_hashes[i].path)) continue;   // (it may change under us)
         if (!file_info(g_hashes[i].path, &sz, &mt) || sz != g_hashes[i].size || CompareFileTime(&g_hashes[i].mt, &mt) != 0) continue;
         wcsncpy_s(out, cap, g_hashes[i].path, _TRUNCATE);
         found = 1;
@@ -6661,15 +7472,19 @@ static void pathlist_free(PathList *L) {
     free(L->paths);
     memset(L, 0, sizeof(*L));
 }
-// A saved state that uses a sample which is still a placeholder here.
+// A saved state that uses a sample which is still a placeholder here, or a shared folder file that
+// isn't here yet.
 static int state_has_placeholder(const unsigned char *d, size_t n) {
     PathList L;
     char h[65];
     uint64_t s;
     int i, r = 0;
+    wchar_t full[SAMPLE_PATH_MAX];
     memset(&L, 0, sizeof(L));
     flp_walk(d, n, collect_cb, &L);
-    for (i = 0; i < L.n && !r; i++) r = placeholder_of(L.paths[i], h, &s);
+    for (i = 0; i < L.n && !r; i++)
+        r = placeholder_of(L.paths[i], h, &s) ||
+            (expand_path(L.paths[i], full, SAMPLE_PATH_MAX) && in_shared(full) && !file_exists_w(full));
     pathlist_free(&L);
     return r;
 }
@@ -6891,6 +7706,15 @@ static void samples_rewrite(unsigned char **d, size_t *n) {
     free(*d);
     *d = c.o;
     *n = c.n;
+}
+
+// The shared folder (flimcfg_shared_dir; the "shared folder" section): p (expanded) is in it.
+static wchar_t g_shRoot[MAX_PATH];
+static int in_shared(const wchar_t *p) {
+    size_t n = wcslen(g_shRoot), i;
+    for (i = 0; i < n; i++)
+        if (towlower(p[i] == L'/' ? L'\\' : p[i]) != towlower(g_shRoot[i])) return 0;
+    return n && (p[n] == L'\\' || p[n] == L'/');
 }
 
 // ---- projects opened from a zip ----
@@ -7132,16 +7956,19 @@ fail:
 // ---- sender ----
 typedef struct { const wchar_t *p; wchar_t *full; char hex[65]; uint64_t size, ms; int upload, skip, ph; } SEnt;
 
-// Queue a file for the upload thread (once per content).
-static void upload_queue(const wchar_t *full, const char *hex, uint64_t size) {
+// Queue a file for the upload thread (once per content). front: ahead of what's waiting (a sample a
+// change uses goes before the shared folder's bulk).
+static char g_upNow[65];                                         // the content upThread is sending (g_sampleLock)
+static void upload_queue(const wchar_t *full, const char *hex, uint64_t size, int front) {
     XJob *j, **t;
     EnterCriticalSection(&g_sampleLock);
-    for (t = &g_upQ; *t; t = &(*t)->nx) if (strcmp((*t)->hex, hex) == 0) { LeaveCriticalSection(&g_sampleLock); return; }
+    for (t = &g_upQ; *t; t = &(*t)->nx) if (strcmp((*t)->hex, hex) == 0) break;
+    if (*t || strcmp(g_upNow, hex) == 0) { LeaveCriticalSection(&g_sampleLock); return; }
     j = (XJob *)calloc(1, sizeof(XJob));
     strcpy_s(j->hex, 65, hex);
     j->size = size;
     wcsncpy_s(j->path, MAX_PATH * 2, full, _TRUNCATE);
-    *t = j;
+    if (front) { j->nx = g_upQ; g_upQ = j; } else *t = j;
     g_upTotal += size;
     LeaveCriticalSection(&g_sampleLock);
     SetEvent(g_upEvt);
@@ -7157,13 +7984,16 @@ static DWORD WINAPI upThread(LPVOID p) {
             DWORD st;
             EnterCriticalSection(&g_sampleLock);
             j = g_upQ;
-            if (j) g_upQ = j->nx;
+            if (j) { g_upQ = j->nx; strcpy_s(g_upNow, sizeof(g_upNow), j->hex); }
             else g_upDone = g_upTotal = 0;
             LeaveCriticalSection(&g_sampleLock);
             if (!j) { xfer_end(); break; }
             xfer_show(1);
             sprintf_s(what, sizeof(what), "/blob/%s", j->hex);
             st = blob_http(L"PUT", what, j->path, j->size, NULL, 0, NULL, NULL, NULL, 0);
+            EnterCriticalSection(&g_sampleLock);
+            g_upNow[0] = 0;
+            LeaveCriticalSection(&g_sampleLock);
             if (st == 200 || st == 201) logmsg("SAMPLES uploaded %S (%llu bytes)", j->path, (unsigned long long)j->size);
             else logmsg("SAMPLES upload of %S failed (HTTP %lu): the others keep a placeholder", j->path, st);
             free(j);
@@ -7273,7 +8103,7 @@ static char *samples_attach(const char *msg, const unsigned char *blob, size_t n
             upBytes = 0; nup = 0;
         }
     }
-    for (i = 0; i < ne; i++) if (E[i].upload) upload_queue(E[i].full, E[i].hex, E[i].size);
+    for (i = 0; i < ne; i++) if (E[i].upload) upload_queue(E[i].full, E[i].hex, E[i].size, 1);
     {   // splice "samples":[...] in front of the op's fields
         const char *op = strstr(msg, "\"op\":{");
         size_t cap = strlen(msg) + 64, len;
@@ -7317,6 +8147,7 @@ static void out_push(char *msg, unsigned char *blob, size_t n) {   // caller hol
 static void ws_send(const char *msg) {
     static const char ALIVE[] = "{\"t\":\"op\",\"op\":{\"kind\":\"alive\"", CUR[] = "{\"t\":\"op\",\"op\":{\"kind\":\"cur\"";
     if (strncmp(msg, ALIVE, sizeof(ALIVE) - 1) == 0 || strncmp(msg, CUR, sizeof(CUR) - 1) == 0) { ws_send_now(msg); return; }
+    log_op("out", msg);
     EnterCriticalSection(&g_outLock);
     if (g_outBusy || g_outHead || strlen(msg) > BIG_MSG) { out_push(_strdup(msg), NULL, 0); SetEvent(g_outEvt); }
     else ws_send_now(msg);
@@ -7327,6 +8158,7 @@ static void ws_send(const char *msg) {
 static void ws_send_samples(char *msg, const unsigned char *blob, size_t n) {
     unsigned char *copy;
     if (!g_ws) { free(msg); return; }
+    log_op("out", msg);
     copy = (unsigned char *)malloc(n ? n : 1);
     if (n) memcpy(copy, blob, n);
     EnterCriticalSection(&g_outLock);
@@ -7610,6 +8442,10 @@ static void samples_resolve(const char *m) {
         const wchar_t *have = NULL;
         char hx[65];
         uint64_t sz;
+        // in our shared folder: left as written, the folder brings the file (if it isn't here yet, the
+        // plugin gets it reloaded when it is: state_has_placeholder). NULL also drops an earlier rewrite.
+        // (Listed anyway: someone whose Windows isn't on C: has another shared path, sent as a sample.)
+        if (expand_path(R[i].p, full, SAMPLE_PATH_MAX) && in_shared(full)) { map_set(R[i].p, NULL); continue; }
         if (!g_noLocal && expand_path(R[i].p, full, SAMPLE_PATH_MAX) && sample_hash(full, hx, &sz) && strcmp(hx, R[i].hex) == 0)
             have = full;                                // the same file is right where the peer has it
         else if (!g_noLocal && find_by_hash(R[i].hex, found, SAMPLE_PATH_MAX)) have = found;
@@ -7863,6 +8699,7 @@ static void samples_connected(const NetUrl *u, const char *pw) {
     LeaveCriticalSection(&g_sampleLock);
 }
 // Disconnected: drop what was waiting to go out or to be applied.
+static void sh_disconnected(void);
 static void samples_disconnected(void) {
     EnterCriticalSection(&g_sampleLock);
     InterlockedExchange(&g_blobOn, 0);
@@ -7879,6 +8716,747 @@ static void samples_disconnected(void) {
     while (g_inHead) { InItem *n = g_inHead->next; free(g_inHead->msg); free(g_inHead); g_inHead = n; }
     g_inTail = NULL;
     LeaveCriticalSection(&g_inLock);
+    sh_disconnected();
+}
+
+// ---------------- shared folder ----------------
+// One folder with the same path on every PC (flimcfg_shared_dir: normally C:\Users\Public\Documents\flim\
+// Shared) whose files are the same for everyone in the session. A plugin that loads a sample from there
+// finds it on every PC: the path in its state is right everywhere, so flim never rewrites it (in_shared:
+// samples_resolve leaves those paths alone, the file comes through here). That works for any plugin,
+// whatever it does with its state (Serum 2 and Kontakt compress theirs, so flim can't see their samples).
+// Versions decide which content a path has, not file times (a copied file keeps its old time, and clocks
+// differ): a change made here gets max(its version, the highest anyone sent) + 1 and goes out; a higher
+// version from someone replaces ours; the same version with other content (two changes at once) goes to
+// the higher hash. A version only this PC had is kept in <root>\..\Shared backups\<time>\ before it is
+// replaced. A file deleted here stays deleted: only a newer version brings it back (deletes don't sync).
+// The table survives restarts: %APPDATA%\flim\shared-<root hash>.tsv.
+//   {"t":"op","op":{"kind":"shared.files","full":0|1|2[,"root":"<b64 UTF-16>"],"f":[{"r":"<b64 UTF-16 path
+//    in the folder>","h":"<sha256>","s":<bytes>,"v":<version>},...]}}
+// full 1: everything we have, when we join; everyone answers with full 2 (not answered). Changes go out
+// as full 0 after a scan (every SH_SCAN_MS), their files uploaded first. A download that finds no blob
+// (evicted, or a full list's file never uploaded) asks its sender at most every SH_NEED_MS:
+//   {"t":"op","op":{"kind":"shared.need","h":"<sha256>","to":"<sender id>"}}
+// shThread owns the table: it scans, decides and puts files in place. shDlThread only downloads verified
+// .part files (one at a time), so a big download doesn't hold up the scans.
+#define SH_SCAN_MS     2000
+#define SH_MAX_FILES   10000
+#define SH_REL_MAX     200
+#define SH_NEED_MS     30000
+#define SH_FREE_MIN    (2ull << 30)        // a download leaves this much free on the folder's drive
+#define SH_BACKUP_DAYS 30                  // older backups go to the Recycle Bin
+#define SH_RELOAD_MS   10000               // finished files reload the plugins that use them in batches
+typedef struct {
+    wchar_t *rel;
+    uint64_t size, t, v, seen;             // the file when hashed (size, time); its version; the highest version anyone sent
+    uint64_t ps, pt;                       // what the last scan saw: a change counts once two scans agree
+    char hex[65];                          // its content ("": none here)
+    unsigned char del, local, dirty, found; // deleted here; content made here (no one else has it); to send; seen this scan
+} ShFile;
+typedef struct ShJob {
+    wchar_t rel[SH_REL_MAX + 1];
+    char hex[65], from[64], who[64];
+    uint64_t size, v, tsize, tt;           // tsize, tt: the file here when queued (tsize ~0: none), to spot a change since
+    int got, warned;                       // got: its .part is complete and verified
+    DWORD first, next, asked;
+    struct ShJob *nx;
+} ShJob;
+typedef struct ShMsg { char *m; struct ShMsg *nx; } ShMsg;
+static ShFile *g_shf; static int g_nshf, g_capshf, g_shHint;     // shThread
+static ShJob  *g_shJobs;                                         // shThread
+static ShMsg  *g_shIn, *g_shInTail;                              // g_shLock
+static CRITICAL_SECTION g_shLock;
+static HANDLE g_shEvt, g_shDlEvt;
+static volatile LONG g_shFull, g_shGen, g_shOn;   // what to send everything as next (1 join, 2 answer); bumped on disconnect; in a room
+static wchar_t g_shTable[MAX_PATH], g_shBackups[MAX_PATH];
+static int g_shSave;                                             // the table changed: write it (shThread)
+static struct { int busy, done; LONG gen; ShJob j; DWORD status; } g_shDl;   // the download worker's job (g_shLock)
+
+static uint64_t ft_ms(FILETIME f) { return (((uint64_t)f.dwHighDateTime << 32) | f.dwLowDateTime) / 10000; }
+
+// Names flim's own and other programs' unfinished files have, and Windows' folder files: never shared.
+static int sh_skip_name(const wchar_t *nm) {
+    static const wchar_t *const END[] = { L".part", L".crdownload", L".tmp", L".partial", L".download" };
+    size_t n = wcslen(nm), i, k;
+    if (!_wcsnicmp(nm, L"~flim-", 6) || !wcsncmp(nm, L"~$", 2) || !_wcsicmp(nm, L"desktop.ini") || !_wcsicmp(nm, L"thumbs.db")) return 1;
+    for (i = 0; i < sizeof(END) / sizeof(END[0]); i++) { k = wcslen(END[i]); if (n > k && !_wcsicmp(nm + n - k, END[i])) return 1; }
+    return 0;
+}
+// A path in the folder as someone names it: names below the folder only (no drive, no "..", no stream,
+// no device name), of a file a sample may be (content_file: no programs or plugin binaries; and no
+// scripts or shell files either).
+static int sh_rel_ok(const wchar_t *r) {
+    static const wchar_t *const DEV[] = { L"CON", L"PRN", L"AUX", L"NUL", L"CONIN$", L"CONOUT$" };
+    static const wchar_t *const NO[] = { L".hta", L".reg", L".inf", L".js", L".jse", L".vbe", L".wsf", L".wsh", L".psm1",
+        L".msp", L".msix", L".appx", L".jar", L".chm", L".pif", L".application", L".gadget", L".library-ms",
+        L".search-ms", L".searchconnector-ms", L".settingcontent-ms", L".url", L".website", L".scf" };
+    size_t n = wcslen(r), i, s = 0, j, k, x;
+    wchar_t w[SH_REL_MAX + 2] = L"\\", up[8];
+    if (!n || n > SH_REL_MAX) return 0;
+    wcscat_s(w, SH_REL_MAX + 2, r);
+    if (!content_file(w, n + 1)) return 0;               // (it takes a path: "\x.wav")
+    for (i = 0; i < sizeof(NO) / sizeof(NO[0]); i++) { k = wcslen(NO[i]); if (n > k && !_wcsicmp(r + n - k, NO[i])) return 0; }
+    for (i = 0; i <= n; i++) {
+        if (r[i] && r[i] != L'\\') {
+            if (r[i] < 32 || wcschr(L"/:*?\"<>|", r[i])) return 0;
+            continue;
+        }
+        k = i - s;
+        if (!k || r[i - 1] == L'.' || r[i - 1] == L' ') return 0;          // empty, ".", "..", "name." / "name "
+        if (i == n && sh_skip_name(r + s)) return 0;
+        for (j = 0; j < k && r[s + j] != L'.'; j++) {}
+        while (j && r[s + j - 1] == L' ') j--;
+        if (j <= 7) {                                                       // a device name, with any extension
+            for (x = 0; x < j; x++) up[x] = towupper(r[s + x]);
+            up[j] = 0;
+            for (x = 0; x < sizeof(DEV) / sizeof(DEV[0]); x++) if (!wcscmp(up, DEV[x])) return 0;
+            if (j == 4 && (!wcsncmp(up, L"COM", 3) || !wcsncmp(up, L"LPT", 3)) && up[3] >= L'0' && up[3] <= L'9') return 0;
+        }
+        s = i + 1;
+    }
+    return 1;
+}
+// root\rel (after a check that it is still inside the root and short enough for Windows); 0 = no.
+static int sh_target(const wchar_t *rel, wchar_t *out, int cap) {
+    wchar_t full[MAX_PATH * 2];
+    size_t n = wcslen(g_shRoot);
+    if (!n || _snwprintf_s(out, cap, _TRUNCATE, L"%s\\%s", g_shRoot, rel) < 0) return 0;
+    if (!GetFullPathNameW(out, MAX_PATH * 2, full, NULL) || wcslen(full) >= MAX_PATH - 24) return 0;
+    return _wcsnicmp(full, g_shRoot, n) == 0 && full[n] == L'\\' && _wcsicmp(full, out) == 0;
+}
+// No folder between the root and p is a link (a junction there would lead outside the root).
+static int sh_no_links(const wchar_t *p) {
+    wchar_t d[MAX_PATH];
+    size_t i;
+    wcsncpy_s(d, MAX_PATH, p, _TRUNCATE);
+    for (i = wcslen(g_shRoot) + 1; d[i]; i++) {
+        DWORD a;
+        if (d[i] != L'\\') continue;
+        d[i] = 0;
+        a = GetFileAttributesW(d);
+        d[i] = L'\\';
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT)) return 0;
+    }
+    return 1;
+}
+static void sh_part(const wchar_t *full, const char *hex, wchar_t *out, int cap) {   // its download, next to it
+    const wchar_t *b = base_name(full);
+    _snwprintf_s(out, cap, _TRUNCATE, L"%.*s~flim-%.16S.part", (int)(b - full), full, hex);
+}
+static int sh_find(const wchar_t *rel) {      // (scans and lists go in the same order: try after the last hit first)
+    int i, k;
+    for (k = 0; k < g_nshf; k++) {
+        i = (g_shHint + k) % g_nshf;
+        if (_wcsicmp(g_shf[i].rel, rel) == 0) { g_shHint = i + 1; return i; }
+    }
+    return -1;
+}
+static ShFile *sh_entry(const wchar_t *rel) {
+    int i = sh_find(rel);
+    if (i >= 0) return &g_shf[i];
+    if (g_nshf == g_capshf) { g_capshf = g_capshf ? g_capshf * 2 : 64; g_shf = (ShFile *)realloc(g_shf, sizeof(ShFile) * g_capshf); }
+    memset(&g_shf[g_nshf], 0, sizeof(ShFile));
+    g_shf[g_nshf].rel = _wcsdup(rel);
+    return &g_shf[g_nshf++];
+}
+// Once per file and reason: why something in the folder doesn't reach the others.
+static void sh_warn(const wchar_t *rel, const char *why) {
+    static wchar_t *said[64];
+    static int n;
+    int i;
+    for (i = 0; i < n; i++) if (!_wcsicmp(said[i], rel)) return;
+    if (n < 64) said[n++] = _wcsdup(rel);
+    logmsg("SHARED %S isn't shared: %s", rel, why);
+}
+
+// ---- the table on disk: v, seen, del, local, size, time, hash, path (UTF-8), one file per line ----
+static void sh_load(void) {
+    FILE *f = NULL;
+    char line[1200];
+    if (_wfopen_s(&f, g_shTable, L"rb") != 0 || !f) return;
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line, *e;
+        uint64_t x[6];
+        int k;
+        wchar_t rel[SH_REL_MAX + 1];
+        ShFile *s;
+        for (k = 0; k < 6; k++) { x[k] = _strtoui64(p, &e, 10); if (*e != '\t') break; p = e + 1; }
+        if (k < 6 || strlen(p) < 66 || p[64] != '\t' || (p[0] != '-' && !is_hex64(p))) continue;
+        e = p + 65;
+        e[strcspn(e, "\r\n")] = 0;
+        if (!MultiByteToWideChar(CP_UTF8, 0, e, -1, rel, SH_REL_MAX + 1) || !sh_rel_ok(rel)) continue;
+        s = sh_entry(rel);
+        s->v = x[0]; s->seen = x[1]; s->del = (unsigned char)x[2]; s->local = (unsigned char)x[3];
+        s->size = s->ps = x[4]; s->t = s->pt = x[5];
+        if (p[0] != '-') { memcpy(s->hex, p, 64); s->hex[64] = 0; }
+    }
+    fclose(f);
+}
+static void sh_store(void) {
+    static char none[65];
+    wchar_t tmp[MAX_PATH + 8];
+    FILE *f = NULL;
+    int i;
+    if (!none[0]) memset(none, '-', 64);                    // (no content here: a version known, nothing yet)
+    swprintf_s(tmp, MAX_PATH + 8, L"%s.new", g_shTable);
+    if (_wfopen_s(&f, tmp, L"wb") != 0 || !f) return;
+    for (i = 0; i < g_nshf; i++) {
+        ShFile *s = &g_shf[i];
+        char rel[SH_REL_MAX * 3 + 1];
+        if (!s->hex[0] && !s->seen) continue;
+        WideCharToMultiByte(CP_UTF8, 0, s->rel, -1, rel, sizeof(rel), NULL, NULL);
+        fprintf(f, "%llu\t%llu\t%d\t%d\t%llu\t%llu\t%s\t%s\n", (unsigned long long)s->v, (unsigned long long)s->seen, s->del, s->local,
+                (unsigned long long)s->size, (unsigned long long)s->t, s->hex[0] ? s->hex : none, rel);
+    }
+    fclose(f);
+    MoveFileExW(tmp, g_shTable, MOVEFILE_REPLACE_EXISTING);
+    g_shSave = 0;
+}
+
+// ---- scanning ----
+static int sh_quiet(const wchar_t *full) {       // nobody is writing it (a writer's handle refuses read-only sharing)
+    HANDLE h = CreateFileW(full, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    CloseHandle(h);
+    return 1;
+}
+static void sh_scan_dir(const wchar_t *dir, const wchar_t *rel0, int *count, int first) {
+    WIN32_FIND_DATAW fd;
+    wchar_t pat[MAX_PATH], rel[SH_REL_MAX + 2], full[MAX_PATH];
+    HANDLE h;
+    if (_snwprintf_s(pat, MAX_PATH, _TRUNCATE, L"%s\\*", dir) < 0) return;
+    h = FindFirstFileExW(pat, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        const wchar_t *nm = fd.cFileName;
+        uint64_t size, t;
+        char hx[65];
+        ShFile *f;
+        if (!wcscmp(nm, L".") || !wcscmp(nm, L"..") || (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) continue;
+        if (_snwprintf_s(rel, SH_REL_MAX + 2, _TRUNCATE, rel0[0] ? L"%s\\%s" : L"%s%s", rel0, nm) < 0 ||
+            _snwprintf_s(full, MAX_PATH, _TRUNCATE, L"%s\\%s", dir, nm) < 0) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { sh_warn(rel, "it is a link (put the files themselves in the folder)"); continue; }
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (wcslen(rel) < SH_REL_MAX) sh_scan_dir(full, rel, count, first);
+            continue;
+        }
+        if (sh_skip_name(nm)) {
+            if (first && !_wcsnicmp(nm, L"~flim-", 6)) DeleteFileW(full);   // a download a crash left behind
+            continue;
+        }
+        if (wcslen(rel) > SH_REL_MAX || !sh_target(rel, pat, MAX_PATH)) { sh_warn(rel, "its path is too long"); continue; }
+        if (!sh_rel_ok(rel)) continue;                      // programs and the like: the rule the others' files follow too
+        size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        if (size > SAMPLE_MAX_BYTES) { sh_warn(rel, "it is over 2000 MB"); continue; }
+        if (++*count > SH_MAX_FILES) break;
+        t = ft_ms(fd.ftLastWriteTime);
+        f = sh_entry(rel);
+        f->found = 1;
+        if (!f->del && f->hex[0] && f->size == size && f->t == t) continue;
+        if (f->ps != size || f->pt != t) { f->ps = size; f->pt = t; continue; }   // changing (or just appeared): next scan
+        if (!sh_quiet(full) || !hash_file(full, hx)) continue;                  // still being written
+        if (f->del || strcmp(hx, f->hex) != 0) {            // new content here: the next version
+            strcpy_s(f->hex, sizeof(f->hex), hx);
+            f->v = (f->v > f->seen ? f->v : f->seen) + 1;
+            f->local = 1; f->dirty = 1; f->del = 0;
+        }
+        f->size = size; f->t = t;
+        g_shSave = 1;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+static void sh_scan(int first) {
+    int i, n = 0;
+    SHCreateDirectoryExW(NULL, g_shRoot, NULL);
+    for (i = 0; i < g_nshf; i++) g_shf[i].found = 0;
+    sh_scan_dir(g_shRoot, L"", &n, first);
+    if (n > SH_MAX_FILES) {
+        static int said;
+        if (!said) { said = 1; logmsg("SHARED the shared folder has more than %d files: only %d of them are shared", SH_MAX_FILES, SH_MAX_FILES); }
+    }
+    for (i = 0; i < g_nshf; i++)                            // deleted here: it stays deleted (a newer version brings it back)
+        if (!g_shf[i].found && g_shf[i].hex[0] && !g_shf[i].del) { g_shf[i].del = 1; g_shf[i].dirty = 0; g_shSave = 1; }
+}
+
+// ---- sending ----
+// full 0: what changed here (after the server got those files); 1, 2: every file we have, announced only
+// (a peer whose download finds no blob asks for it: shared.need).
+static void sh_send(int full) {
+    int i, n = 0, o = 0;
+    size_t cap;
+    char *m;
+    wchar_t path[MAX_PATH];
+    for (i = 0; i < g_nshf; i++) if (g_shf[i].hex[0] && !g_shf[i].del && (full || g_shf[i].dirty)) n++;
+    if (!n && !full) return;
+    if (!full) {
+        char *body = (char *)malloc((size_t)n * 65 + 1), *resp = (char *)malloc((size_t)n * 65 + 16), *line, *ctx = NULL;
+        DWORD st;
+        for (i = 0; i < g_nshf; i++)
+            if (g_shf[i].hex[0] && !g_shf[i].del && g_shf[i].dirty) o += sprintf_s(body + o, (size_t)n * 65 + 1 - o, "%s\n", g_shf[i].hex);
+        resp[0] = 0;
+        st = blob_http(L"POST", "/blobs/missing", NULL, 0, body, (DWORD)o, NULL, NULL, resp, n * 65 + 16);
+        if (st == 200)
+            for (line = strtok_s(resp, "\r\n", &ctx); line; line = strtok_s(NULL, "\r\n", &ctx))
+                for (i = 0; i < g_nshf; i++)
+                    if (strcmp(g_shf[i].hex, line) == 0 && sh_target(g_shf[i].rel, path, MAX_PATH)) { upload_queue(path, g_shf[i].hex, g_shf[i].size, 0); break; }
+        free(body); free(resp);
+        if (st != 200) return;                              // the server can't be asked: still to send, at the next scan
+    }
+    cap = 300 + (wcslen(g_shRoot) * 2 + 3) / 3 * 4;
+    for (i = 0; i < g_nshf; i++) cap += 160 + (wcslen(g_shf[i].rel) * 2 + 3) / 3 * 4;
+    m = (char *)malloc(cap);
+    o = sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"shared.files\",\"full\":%d", full);
+    if (full) {
+        o += sprintf_s(m + o, cap - o, ",\"root\":\"");
+        b64enc((const unsigned char *)g_shRoot, (int)wcslen(g_shRoot) * 2, m + o);
+        o += (int)strlen(m + o);
+        m[o++] = '"';
+    }
+    o += sprintf_s(m + o, cap - o, ",\"f\":[");
+    for (i = 0, n = 0; i < g_nshf; i++) {
+        ShFile *f = &g_shf[i];
+        if (!f->hex[0] || f->del || (!full && !f->dirty)) continue;
+        o += sprintf_s(m + o, cap - o, "%s{\"r\":\"", n++ ? "," : "");
+        b64enc((const unsigned char *)f->rel, (int)wcslen(f->rel) * 2, m + o);
+        o += (int)strlen(m + o);
+        o += sprintf_s(m + o, cap - o, "\",\"h\":\"%s\",\"s\":%llu,\"v\":%llu}", f->hex, (unsigned long long)f->size, (unsigned long long)f->v);
+        f->dirty = 0;
+    }
+    sprintf_s(m + o, cap - o, "]}}");
+    ws_send(m);
+    free(m);
+    if (full) logmsg("SHFILE listed all %d files for the others", n);
+    else logmsg("SHARED sent %d file%s to the others", n, n == 1 ? "" : "s");
+}
+
+// ---- receiving ----
+static void sh_job_add(const wchar_t *rel, const wchar_t *full, const char *hex, uint64_t size, uint64_t v, const char *id, const char *who) {
+    ShJob *j, **pp;
+    uint64_t sz;
+    FILETIME ft;
+    for (pp = &g_shJobs; *pp && _wcsicmp((*pp)->rel, rel) != 0; pp = &(*pp)->nx) {}
+    if (*pp) {                                              // one for this file already: the newer one stays
+        wchar_t part[MAX_PATH];
+        j = *pp;
+        if (j->v > v || (j->v == v && strcmp(j->hex, hex) >= 0)) return;
+        sh_part(full, j->hex, part, MAX_PATH);
+        DeleteFileW(part);
+        *pp = j->nx;
+    } else {
+        j = (ShJob *)calloc(1, sizeof(ShJob));
+        j->first = GetTickCount();
+        if (file_info(full, &sz, &ft)) { j->tsize = sz; j->tt = ft_ms(ft); } else j->tsize = ~0ull;
+    }
+    wcscpy_s(j->rel, SH_REL_MAX + 1, rel);
+    strcpy_s(j->hex, 65, hex);
+    strncpy_s(j->from, sizeof(j->from), id, _TRUNCATE);
+    strncpy_s(j->who, sizeof(j->who), who, _TRUNCATE);
+    j->size = size; j->v = v; j->got = 0; j->next = 0;
+    for (pp = &g_shJobs; *pp && (*pp)->size <= size; pp = &(*pp)->nx) {}   // small files first
+    j->nx = *pp;
+    *pp = j;
+}
+static void sh_manifest(const char *m) {
+    const char *q = strstr(m, "\"f\":["), *fr = strstr(m, "\"from\":\""), *ro = strstr(m, "\"root\":\"");
+    char id[64] = "", who[64] = "someone";
+    int i, full = 0, cnt = 0;
+    int_after(m, NULL, "\"full\":", &full);
+    if (fr) {
+        for (i = 0; fr[8 + i] && fr[8 + i] != '"' && i < 63; i++) id[i] = fr[8 + i];
+        id[i] = 0;
+        peer_name(id, who, sizeof(who));
+    }
+    if (ro) {
+        static int said;
+        const char *e = strchr(ro + 8, '"');
+        size_t bn;
+        unsigned char *b = e ? b64dec(ro + 8, (size_t)(e - ro - 8), &bn) : NULL;
+        wchar_t *w = b ? (wchar_t *)calloc(bn / 2 + 1, 2) : NULL;
+        if (w) {
+            memcpy(w, b, bn / 2 * 2);
+            if (_wcsicmp(w, g_shRoot) != 0 && !said) {
+                said = 1;
+                logmsg("SHARED %s's shared folder is %S, yours is %S: files sync, but plugins won't find each other's", who, w, g_shRoot);
+            }
+        }
+        free(w); free(b);
+    }
+    if (full == 1) InterlockedCompareExchange(&g_shFull, 2, 0);   // a newcomer: they get our list (unless ours goes out anyway)
+    if (!q) return;
+    for (q += 5; *q == '{' && cnt < SH_MAX_FILES; cnt++) {
+        const char *e = strchr(q, '}'), *rr = strstr(q, "\"r\":\""), *hh = strstr(q, "\"h\":\""), *ss = strstr(q, "\"s\":"), *vv = strstr(q, "\"v\":");
+        if (!e) break;
+        if (rr && rr < e && hh && hh < e && ss && ss < e && vv && vv < e && is_hex64(hh + 5)) {
+            const char *re = strchr(rr + 5, '"');
+            size_t bn = 0;
+            unsigned char *b = re && re < e ? b64dec(rr + 5, (size_t)(re - rr - 5), &bn) : NULL;
+            wchar_t rel[SH_REL_MAX + 1], full_[MAX_PATH];
+            char hex[65];
+            uint64_t size = _strtoui64(ss + 4, NULL, 10), v = _strtoui64(vv + 4, NULL, 10);
+            ShFile *f;
+            memcpy(hex, hh + 5, 64); hex[64] = 0;
+            rel[0] = 0;
+            if (b && bn / 2 <= SH_REL_MAX) { memcpy(rel, b, bn / 2 * 2); rel[bn / 2] = 0; }
+            free(b);
+            if (!rel[0] || wcslen(rel) != bn / 2 || !sh_rel_ok(rel) || size > SAMPLE_MAX_BYTES || !v || !sh_target(rel, full_, MAX_PATH)) {
+                logmsg("SHFILE %s's file \"%S\" isn't a name flim takes into the shared folder: skipped", who, rel);
+            } else {
+                f = sh_entry(rel);
+                if (v > f->seen) { f->seen = v; g_shSave = 1; }
+                if (f->hex[0] && !f->del && !strcmp(f->hex, hex)) {             // the same here
+                    if (v > f->v) f->v = v;
+                    f->local = 0;
+                    g_shSave = 1;
+                } else if (f->del) {
+                    if (v > f->v) sh_job_add(rel, full_, hex, size, v, id, who);  // changed after we deleted ours
+                } else if (!f->hex[0]) {
+                    if (!file_exists_w(full_)) sh_job_add(rel, full_, hex, size, v, id, who);
+                    // (a file here the scan hasn't taken yet: it becomes a newer version and goes out)
+                } else if (v > f->v || (v == f->v && strcmp(hex, f->hex) > 0)) sh_job_add(rel, full_, hex, size, v, id, who);
+                else f->dirty = 1;                                                // ours is newer: they get it next
+            }
+        }
+        q = e + 1;
+        if (*q == ',') q++;
+    }
+}
+static void sh_need(const char *m) {             // someone's download of our file found no blob: upload it
+    const char *h = strstr(m, "\"h\":\""), *to = strstr(m, "\"to\":\"");
+    char pat[96];
+    int i;
+    wchar_t full[MAX_PATH];
+    char hx[65];
+    sprintf_s(pat, sizeof(pat), "\"to\":\"%s\"", g_myId);
+    if (!h || !to || !strstr(m, pat) || !is_hex64(h + 5)) return;
+    for (i = 0; i < g_nshf; i++)
+        if (!g_shf[i].del && !strncmp(g_shf[i].hex, h + 5, 64) && sh_target(g_shf[i].rel, full, MAX_PATH) &&
+            hash_file(full, hx) && !strcmp(hx, g_shf[i].hex)) {
+            char resp[80] = "";
+            if (blob_http(L"POST", "/blobs/missing", NULL, 0, hx, 64, NULL, NULL, resp, sizeof(resp)) == 200 && !strstr(resp, hx)) return;   // there by now
+            upload_queue(full, g_shf[i].hex, g_shf[i].size, 0);
+            logmsg("SHFILE uploading %S again: someone's download found nothing", g_shf[i].rel);
+            return;
+        }
+}
+
+// A version only we have, before the others' replaces it: <root>\..\Shared backups\<time>\<rel> (a hard link
+// to it, same drive: no copy). 0: no backup (then it isn't replaced).
+static int sh_backup(const wchar_t *full, const wchar_t *rel, wchar_t *out, int cap) {
+    wchar_t dir[MAX_PATH * 2], *slash;
+    SYSTEMTIME st;
+    const wchar_t *ext = wcsrchr(rel, L'.');
+    char hx[65];
+    GetLocalTime(&st);
+    swprintf_s(out, cap, L"%s\\%04d-%02d-%02d %02d.%02d.%02d\\%s", g_shBackups, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, rel);
+    if (wcslen(out) >= MAX_PATH - 1 && hash_file(full, hx))
+        swprintf_s(out, cap, L"%s\\%04d-%02d-%02d %02d.%02d.%02d\\%.16S%s", g_shBackups, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, hx, ext ? ext : L"");
+    if (wcslen(out) >= MAX_PATH - 1) return 0;
+    wcscpy_s(dir, MAX_PATH * 2, out);
+    slash = wcsrchr(dir, L'\\');
+    *slash = 0;
+    SHCreateDirectoryExW(NULL, dir, NULL);
+    return CreateHardLinkW(out, full, NULL) || CopyFileW(full, out, FALSE);
+}
+// Older backups go to the Recycle Bin (folders are named by their time, so the name says how old).
+static void sh_backups_prune(void) {
+    WIN32_FIND_DATAW fd;
+    wchar_t pat[MAX_PATH], cut[32];
+    SYSTEMTIME st;
+    FILETIME ft;
+    ULARGE_INTEGER u;
+    HANDLE h;
+    GetSystemTimeAsFileTime(&ft);
+    u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+    u.QuadPart -= (ULONGLONG)SH_BACKUP_DAYS * 24 * 3600 * 10000000;
+    ft.dwLowDateTime = u.LowPart; ft.dwHighDateTime = u.HighPart;
+    FileTimeToSystemTime(&ft, &st);
+    swprintf_s(cut, 32, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+    swprintf_s(pat, MAX_PATH, L"%s\\*", g_shBackups);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || fd.cFileName[0] == L'.' || wcslen(fd.cFileName) != 19 || wcsncmp(fd.cFileName, cut, 10) >= 0) continue;
+        {
+            wchar_t from[MAX_PATH + 2] = L"";
+            SHFILEOPSTRUCTW op;
+            swprintf_s(from, MAX_PATH + 1, L"%s\\%s", g_shBackups, fd.cFileName);
+            from[wcslen(from) + 1] = 0;                     // a double-NUL-terminated list
+            memset(&op, 0, sizeof(op));
+            op.wFunc = FO_DELETE; op.pFrom = from;
+            op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+            SHFileOperationW(&op);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+
+// The download worker: one GET at a time into the job's .part, sha256-checked while it streams.
+static DWORD WINAPI shDlThread(LPVOID p) {
+    (void)p;
+    for (;;) {
+        ShJob j;
+        wchar_t full[MAX_PATH], part[MAX_PATH];
+        char what[80], got[65] = "";
+        DWORD st = 0;
+        WaitForSingleObject(g_shDlEvt, INFINITE);
+        EnterCriticalSection(&g_shLock);
+        if (!g_shDl.busy || g_shDl.done) { LeaveCriticalSection(&g_shLock); continue; }
+        j = g_shDl.j;
+        LeaveCriticalSection(&g_shLock);
+        if (sh_target(j.rel, full, MAX_PATH)) {
+            sh_part(full, j.hex, part, MAX_PATH);
+            sprintf_s(what, sizeof(what), "/blob/%s", j.hex);
+            st = blob_http(L"GET", what, NULL, 0, NULL, 0, part, got, NULL, 0);
+            if (st == 200 && strcmp(got, j.hex) != 0) st = 0;
+            if (st != 200) DeleteFileW(part);
+        }
+        EnterCriticalSection(&g_shLock);
+        g_shDl.status = st;
+        g_shDl.done = 1;
+        LeaveCriticalSection(&g_shLock);
+        SetEvent(g_shEvt);
+    }
+}
+
+typedef struct { int n; uint64_t bytes; char who[64]; wchar_t *names; size_t len, cap; DWORD at; } ShBatch;
+static void sh_batch_add(ShBatch *b, const ShJob *j, const wchar_t *full) {
+    const wchar_t *nm = base_name(full);
+    size_t k = wcslen(nm) + 1;
+    if (!b->n) b->at = GetTickCount();
+    b->n++; b->bytes += j->size;
+    strcpy_s(b->who, sizeof(b->who), j->who);
+    if (b->len + k + 1 > b->cap) { b->cap = (b->len + k + 1) * 2; b->names = (wchar_t *)realloc(b->names, b->cap * sizeof(wchar_t)); }
+    memcpy(b->names + b->len, nm, k * sizeof(wchar_t));
+    b->len += k;
+}
+// Finished files: one window line, and the plugins that use them load them again (one pass for a batch).
+static void sh_batch_flush(ShBatch *b) {
+    const wchar_t *nm;
+    if (!b->n) return;
+    EnterCriticalSection(&g_sampleLock);
+    for (nm = b->names; nm < b->names + b->len; nm += wcslen(nm) + 1) {
+        if (g_nreload == g_capreload) { g_capreload = g_capreload ? g_capreload * 2 : 16; g_reload = (wchar_t **)realloc(g_reload, sizeof(wchar_t *) * g_capreload); }
+        g_reload[g_nreload++] = _wcsdup(nm);
+    }
+    LeaveCriticalSection(&g_sampleLock);
+    logmsg("SHARED got %d file%s (%.1f MB) from %s", b->n, b->n == 1 ? "" : "s", b->bytes / 1048576.0, b->who);
+    b->n = 0; b->bytes = 0; b->len = 0;
+}
+// A downloaded file into place. 1: done (or no longer wanted), 0: try again later.
+static int sh_finish(ShJob *j, ShBatch *b) {
+    wchar_t full[MAX_PATH], part[MAX_PATH], bak[MAX_PATH * 2] = L"";
+    uint64_t sz;
+    FILETIME ft;
+    ShFile *f;
+    int here;
+    if (!sh_target(j->rel, full, MAX_PATH)) return 1;
+    sh_part(full, j->hex, part, MAX_PATH);
+    f = sh_entry(j->rel);
+    here = file_info(full, &sz, &ft);
+    if (here ? j->tsize != sz || j->tt != ft_ms(ft) : j->tsize != ~0ull) {
+        DeleteFileW(part);                                  // changed here meanwhile: that one counts (the scan sends it)
+        logmsg("SHFILE %S changed here while %s's came: kept yours", j->rel, j->who);
+        return 1;
+    }
+    if (here && f->local && f->hex[0] && strcmp(f->hex, j->hex) != 0) {
+        if (!sh_backup(full, j->rel, bak, MAX_PATH * 2)) {
+            if (!j->warned) { j->warned = 1; logmsg("SHARED %s has a newer %S, but yours couldn't be backed up: not replaced yet", j->who, j->rel); }
+            j->next = GetTickCount() + SH_NEED_MS;
+            return 0;
+        }
+    }
+    if (!MoveFileExW(part, full, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        if (!j->warned) { j->warned = 1; logmsg("SHARED %S is in use here: it is replaced as soon as it's free", j->rel); }
+        if (bak[0]) DeleteFileW(bak);                       // backed up again next time
+        return 0;
+    }
+    if (!file_info(full, &sz, &ft)) { sz = j->size; GetSystemTimeAsFileTime(&ft); }
+    strcpy_s(f->hex, sizeof(f->hex), j->hex);
+    f->v = j->v; f->size = f->ps = sz; f->t = f->pt = ft_ms(ft);
+    f->local = 0; f->dirty = 0; f->del = 0;
+    g_shSave = 1;
+    if (bak[0]) logmsg("SHARED %s's newer %S replaced yours (yours is in %S)", j->who, j->rel, bak);
+    logmsg("SHFILE got %S from %s (%llu bytes, version %llu)", j->rel, j->who, (unsigned long long)j->size, (unsigned long long)j->v);
+    sh_batch_add(b, j, full);
+    return 1;
+}
+static void sh_status(void) {                    // "getting N files" in the session status, unless samples show theirs
+    static DWORD at;
+    static int shown;
+    DWORD now = GetTickCount();
+    int n = 0;
+    uint64_t bytes = 0;
+    ShJob *j;
+    for (j = g_shJobs; j; j = j->nx) { n++; bytes += j->size; }
+    if (g_upTotal || g_dnTotal) return;
+    if (!n) { if (shown && g_peersJson[0]) net_show_connected(g_peersJson); shown = 0; return; }
+    if (now - at < 1000) return;
+    at = now; shown = 1;
+    net_status(NET_ON, "Shared folder: getting %d file%s (%.1f MB)", n, n == 1 ? "" : "s", bytes / 1048576.0);
+}
+// The download jobs: hand the next one to the worker (or copy it from a file here with that content), take
+// what it finished, put finished files in place.
+static void sh_jobs(LONG gen, ShBatch *b) {
+    ShJob **pp, *j;
+    DWORD now = GetTickCount();
+    int busy, done;
+    DWORD st;
+    EnterCriticalSection(&g_shLock);
+    busy = g_shDl.busy; done = g_shDl.done; st = g_shDl.status;
+    if (busy && done) {
+        for (j = g_shJobs; j && !(g_shDl.gen == gen && !_wcsicmp(j->rel, g_shDl.j.rel) && !strcmp(j->hex, g_shDl.j.hex)); j = j->nx) {}
+        if (j) {
+            if (st == 200) j->got = 1;
+            else {
+                j->next = now + DL_RETRY_MS;
+                // not on the server (any more, or a full list's file): ask its sender (after its own upload had time)
+                if (st == 404 && now - j->first >= 5000 && now - j->asked >= SH_NEED_MS) {
+                    char m[220];
+                    j->asked = now;
+                    sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"shared.need\",\"h\":\"%s\",\"to\":\"%s\"}}", j->hex, j->from);
+                    ws_send(m);
+                }
+            }
+        }
+        g_shDl.busy = g_shDl.done = 0;
+        busy = 0;
+    }
+    LeaveCriticalSection(&g_shLock);
+    for (pp = &g_shJobs; (j = *pp) != NULL && gen == g_shGen; ) {
+        wchar_t full[MAX_PATH], part[MAX_PATH];
+        if (j->got) {
+            if ((LONG)(now - j->next) >= 0 && sh_finish(j, b)) { *pp = j->nx; free(j); continue; }
+            if (!j->next || (LONG)(now - j->next) >= 0) j->next = now + DL_RETRY_MS;
+            pp = &j->nx;
+            continue;
+        }
+        if (now - j->first > DL_GIVEUP_MS) {
+            logmsg("SHARED gave up on %S from %s: it never reached the server", j->rel, j->who);
+            *pp = j->nx; free(j); continue;
+        }
+        if (busy || (LONG)(now - j->next) < 0 || !sh_target(j->rel, full, MAX_PATH)) { pp = &j->nx; continue; }
+        {
+            ULARGE_INTEGER fr;
+            int i;
+            if (GetDiskFreeSpaceExW(g_shRoot, &fr, NULL, NULL) && fr.QuadPart < j->size + SH_FREE_MIN) {
+                logmsg("SHARED no room for %S (%.1f MB) on the shared folder's drive: skipped", j->rel, j->size / 1048576.0);
+                *pp = j->nx; free(j); continue;
+            }
+            if (!sh_no_links(full)) { logmsg("SHARED %S: a folder on its way is a link, not written", j->rel); *pp = j->nx; free(j); continue; }
+            wcscpy_s(part, MAX_PATH, full);
+            *(wchar_t *)base_name(part) = 0;
+            SHCreateDirectoryExW(NULL, part, NULL);
+            sh_part(full, j->hex, part, MAX_PATH);
+            for (i = 0; i < g_nshf; i++) {                  // the same content here already (moved or renamed): copy it
+                wchar_t src[MAX_PATH];
+                char hx[65];
+                if (g_shf[i].del || strcmp(g_shf[i].hex, j->hex) || !sh_target(g_shf[i].rel, src, MAX_PATH)) continue;
+                if (CopyFileW(src, part, FALSE) && hash_file(part, hx) && !strcmp(hx, j->hex)) { j->got = 1; break; }
+                DeleteFileW(part);
+            }
+            if (j->got) continue;                           // finished on the next pass
+            EnterCriticalSection(&g_shLock);
+            g_shDl.j = *j; g_shDl.gen = gen; g_shDl.busy = 1; g_shDl.done = 0;
+            LeaveCriticalSection(&g_shLock);
+            SetEvent(g_shDlEvt);
+            busy = 1;
+        }
+        pp = &j->nx;
+    }
+}
+
+// handle_msg (any thread): a shared.files / shared.need for shThread. sh_joined: our list goes out.
+static void sh_inbox(const char *m) {
+    ShMsg *x = (ShMsg *)calloc(1, sizeof(ShMsg));
+    x->m = _strdup(m);
+    EnterCriticalSection(&g_shLock);
+    if (g_shInTail) g_shInTail->nx = x; else g_shIn = x;
+    g_shInTail = x;
+    LeaveCriticalSection(&g_shLock);
+    SetEvent(g_shEvt);
+}
+static void sh_joined(void) { InterlockedExchange(&g_shOn, 1); InterlockedExchange(&g_shFull, 1); SetEvent(g_shEvt); }
+static void sh_disconnected(void) {                          // its downloads stop too, and so do the scans
+    InterlockedExchange(&g_shOn, 0);
+    InterlockedIncrement(&g_shGen);
+    EnterCriticalSection(&g_shLock);
+    while (g_shIn) { ShMsg *n = g_shIn->nx; free(g_shIn->m); free(g_shIn); g_shIn = n; }
+    g_shInTail = NULL;
+    LeaveCriticalSection(&g_shLock);
+}
+
+static DWORD WINAPI shThread(LPVOID p) {
+    DWORD lastScan = 0, lastSave = 0;
+    LONG gen = g_shGen;
+    int first = 1, hinted = 0;
+    ShBatch b;
+    (void)p;
+    memset(&b, 0, sizeof(b));
+    {   // the folder, and where its table and backups go
+        wchar_t d[MAX_PATH], low[MAX_PATH], *slash;
+        DWORD a;
+        size_t i;
+        flimcfg_shared_dir(d, MAX_PATH);
+        a = GetFileAttributesW(d);
+        if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            logmsg("SHARED %S is a link: the shared folder is off (make it a real folder)", d);
+            return 0;
+        }
+        wcscpy_s(g_shBackups, MAX_PATH, d);
+        slash = wcsrchr(g_shBackups, L'\\');
+        if (slash) wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - g_shBackups), L"Shared backups");
+        for (i = 0; d[i]; i++) low[i] = towlower(d[i]);
+        low[i] = 0;
+        if (!SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, g_shTable))) return 0;
+        swprintf_s(g_shTable + wcslen(g_shTable), MAX_PATH - wcslen(g_shTable), L"\\flim\\shared-%08llx.tsv",
+                   (unsigned long long)(fnv64((const unsigned char *)low, i * 2) & 0xffffffffull));
+        wcscpy_s(g_shRoot, MAX_PATH, d);                    // in_shared from here on
+        sh_load();
+        sh_backups_prune();
+    }
+    for (;;) {
+        DWORD now;
+        WaitForSingleObject(g_shEvt, 500);
+        now = GetTickCount();
+        if (gen != g_shGen) {                               // disconnected: what was on its way is dropped
+            gen = g_shGen;
+            while (g_shJobs) {
+                wchar_t full[MAX_PATH], part[MAX_PATH];
+                ShJob *n = g_shJobs->nx;
+                if (sh_target(g_shJobs->rel, full, MAX_PATH)) { sh_part(full, g_shJobs->hex, part, MAX_PATH); DeleteFileW(part); }
+                free(g_shJobs);
+                g_shJobs = n;
+            }
+            sh_batch_flush(&b);
+        }
+        if (g_shSave && now - lastSave >= 5000) { sh_store(); lastSave = now; }
+        if (!g_blobOn || !g_shOn) continue;
+        for (;;) {
+            ShMsg *x;
+            EnterCriticalSection(&g_shLock);
+            x = g_shIn;
+            if (x) { g_shIn = x->nx; if (!g_shIn) g_shInTail = NULL; }
+            LeaveCriticalSection(&g_shLock);
+            if (!x) break;
+            if (strstr(x->m, "\"kind\":\"shared.need\"")) sh_need(x->m); else sh_manifest(x->m);
+            free(x->m); free(x);
+        }
+        if (g_shFull || now - lastScan >= SH_SCAN_MS) {
+            LONG full;
+            sh_scan(first);
+            first = 0;
+            lastScan = GetTickCount();
+            full = InterlockedExchange(&g_shFull, 0);
+            sh_send((int)full);
+            if (!hinted && g_nshf == 0) {
+                hinted = 1;
+                logmsg("SHARED files in %S reach everyone at the same path: load samples for Serum 2, Kontakt and other plugins from there", g_shRoot);
+            }
+        }
+        sh_jobs(gen, &b);
+        if (b.n && (!g_shJobs || now - b.at >= SH_RELOAD_MS)) sh_batch_flush(&b);
+        sh_status();
+    }
 }
 
 // ---------------- connection (one net thread per connect) ----------------
@@ -8339,6 +9917,7 @@ static DWORD WINAPI engineMain(LPVOID p) {
         patops_install();
         save_detour_install();
         delchan_detour_install();
+        loadpreset_detour_install();
         InterlockedExchange(&g_uiWanted, 1);
         PostMessageW(g_mainWnd, WM_NULL, 0, 0);
     }
@@ -8360,7 +9939,8 @@ static DWORD WINAPI engineMain(LPVOID p) {
         sprintf_s(g_myId, sizeof(g_myId), "fl-%lu-%u", GetCurrentProcessId(), (unsigned)rand());
         g_plugLockMs = flimcfg_lock_s() * 1000;
         backup_setting();
-        logmsg("I am %s (%s); not connected until flim's window connects", g_myName, g_myId);
+        g_logDetailed = flimcfg_log_detailed();
+        logmsg("I am %s (%s); not connected until flim's window connects%s", g_myName, g_myId, g_logDetailed ? " (detailed log)" : "");
 
         // flim.exe's Join / Host (and tests): connect right away. UTF-8, like the Connect dialog.
         {
@@ -8432,6 +10012,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         InitializeCriticalSection(&g_sampleLock);
         InitializeCriticalSection(&g_outLock);
         InitializeCriticalSection(&g_inLock);
+        InitializeCriticalSection(&g_autoLock);
         g_outEvt = CreateEventW(NULL, FALSE, FALSE, NULL);
         g_inEvt = CreateEventW(NULL, FALSE, FALSE, NULL);
         g_upEvt = CreateEventW(NULL, FALSE, FALSE, NULL);
@@ -8453,6 +10034,11 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         CreateThread(NULL, 0, inThread, NULL, 0, NULL);
         CreateThread(NULL, 0, upThread, NULL, 0, NULL);
         CreateThread(NULL, 0, dnThread, NULL, 0, NULL);
+        InitializeCriticalSection(&g_shLock);
+        g_shEvt = CreateEventW(NULL, FALSE, FALSE, NULL);
+        g_shDlEvt = CreateEventW(NULL, FALSE, FALSE, NULL);
+        CreateThread(NULL, 0, shThread, NULL, 0, NULL);
+        CreateThread(NULL, 0, shDlThread, NULL, 0, NULL);
         CreateThread(NULL, 0, engineMain, NULL, 0, NULL);
     }
     return TRUE;

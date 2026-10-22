@@ -97,8 +97,9 @@ Offsets that changed from FL 25.2.3.5171 are marked with the old value in bracke
 | `PATNAME_VA` / `PATCOLOR_VA` | `0x12d0fc0` / `0x12d14b0` | `SetPatternName/Color(pattern, v)` | |
 | `PATLENSET_VA` | `0x12d2350` | `PatternLengthChanged(pattern)`: call after writing `+0x44` | `patterns.setPatternLength` |
 | `PATREFRESH_VA` | `0xea7ae0` | after a rename, on (playlist form `+0xd34` [`0xd00`]) | |
-| `NOTEARR_VA` / `NOTEDEL_VA` | `0x12d16e0` / `0x10603b0` | `NoteArray(pattern, create)`, `DeleteNote(arr, i, 0)`; note record 24 bytes, channel `+6` | |
-| `NOTELOCK_VA` | `0x15e2008` | CRITICAL_SECTION* held while editing notes (the audio thread reads them) | |
+| `NOTEARR_VA` / `NOTEDEL_VA` | `0x12d16e0` / `0x10603b0` | `NoteArray(pattern, update)`: makes the array if the pattern has none, and then, with `update` while FL plays, calls `sub_11E7470(song pos + 1, 0, 0)`, which takes `SONGLOCK` and then `NOTELOCK` (section 6); `DeleteNote(arr, i, 0)`; note record 24 bytes, channel `+6` | |
+| `NOTELOCK_VA` | `0x15e2008` | CRITICAL_SECTION* held while editing notes (the audio thread reads them); -> the `CRITICAL_SECTION` at `0x16b6b20` | |
+| playing | `0x193fb0c` (slot `0x15e09f8`) | int: 1 while FL plays (a space key posted to the main form starts / stops it) | `NoteArray` |
 | `GRIDREFRESH_VA` | `0x12d6900` | `RefreshGrid(channel->grid)` | |
 | pattern ops | project vmt (`*(*FLPROJ+0x10)`) | clone `+0xe8`, delete `+0xf8`, insert `+0x118`, split `+0x120` | `EEPat*MenuClick` |
 
@@ -145,7 +146,16 @@ Offsets that changed from FL 25.2.3.5171 are marked with the old value in bracke
 | `MIXOBJ_VA`, `SETROUTE_VA`, `ROUTEUPD_VA` | `0x15e22d8`, `0x12a33c0`, `0x12a28f0` | mixer object; `SetRoute(mixer, src, dst, on, 1)`; `RoutingChanged(mixer)` | `setRouteTo` |
 | `MIXINS_VA` | `0x12a46f0` | `InsertMixerTracks(pos, count, flags)` | undo name "insert mixer track(s)" |
 | `MIXDEL_VA` | `0x12a5280` | `DeleteMixerTracks(int dynarray, last, flags)` | "Delete tracks" dialog's caller |
-| (not used) | `0x12a4030`, `0x12a4490`, `0x127cee0` | permute / move selected / set count | section 4 |
+| `MIXMOVE_VA` / `MIXFOCUS_VA` | `0x12a4490` / `0x193fa10` | `MoveSelectedMixerTracks(dir, undo, scroll)` / int: the focused track | section 4 |
+| (not used) | `0x12a4030`, `0x127cee0`, `0x1233b30` | permute / set count / move an effect to another slot of its track | section 4 |
+
+### Automation links (section 5 has the details)
+| Define | VA / offset | What | How found |
+|---|---|---|---|
+| `LINKS_VA` | `0x15e0a00` | -> { MIDI link list, internal link list } | the project writer's link loop `0xF43513` |
+| `LINKDEL_VA` | `0xf832b0` | `DeleteLinksFrom(lo, hi)`: internal links whose source is in `[lo, hi]` (takes `SONGLOCK`) | channel type change `sub_FF7770` |
+| `FORMTEXT_VA` | `0xbaffd0` | `FormulaText(formula, UnicodeString *out, 0)`: the text the project writer saves as event 230 | `0xF435EB` |
+| (not used) | `0xf82530`, `0xf825b0`, `0x1191a50` | new link record (flags) / sort a list by source / "Create automation clip" | section 5 |
 
 ## 3. FLP / .fst event stream
 
@@ -230,8 +240,14 @@ Track 0 is Master, 1..n-2 are inserts, n-1 is "Current".
 
 ### Records move, so slot objects name tracks
 Insert, delete and move all go through `sub_12A4030`, which copies whole records, so each track
-keeps its 10 slot object pointers wherever it goes. flim uses **slot 0's object as the track's
-identity**. Live, inserting 2 tracks at 3 in an 18-track mixer gave: the old Current record (17)
+keeps its 10 slot object pointers wherever it goes. flim uses **the lowest of them as the track's
+identity** (`mix_tid`). Not slot 0's alone: an effect's Move up / down (`sub_1233B30(new slot, undo)`
+on the slot in `*0x15E2C38`, from `MoveUpMenuClick` `0x1233DE0` / `MoveDownMenuClick` `0x1235190` and
+the mouse wheel) swaps two slot objects inside the track under `SONGLOCK` and remaps automation
+(`sub_1233A70`). With slot 0's object as the identity, moving the first effect looked like the track
+deleted and a new one inserted: the others deleted the track with its plugins and inserted an empty
+one. Now the move shows up as two slots whose plugin changed, whose states go out (and the links that
+FL remapped, with their clips). Live, inserting 2 tracks at 3 in an 18-track mixer gave: the old Current record (17)
 became the first new track (3), a fresh record became the second (4), old 3..16 became 5..18, and a
 fresh record became Current (19). Deleting those two put the first deleted record into the unused
 part, made the second the new Current, and moved everything back. So, comparing only tracks 1..n-2
@@ -239,18 +255,35 @@ part, made the second the new Current, and moved everything back. So, comparing 
 identities.
 
 ### How flim syncs it (engine "mixer track structure" section)
-- `do_struct` (main thread, every 500 ms) diffs the identities against the last known list
-  (`mix_diff`). New or missing identities go out as `{"kind":"mix.struct","n0","n","del":[old
-  numbers],"ins":[new numbers]}`. Only moved means it isn't structural: the moved tracks' state goes
-  out as ordinary edits (heavier, their plugins reload on the other side).
+- `do_struct` (main thread, every 500 ms, and at once when the poll thread sees the layout change)
+  diffs the identities against the last known list (`mix_diff`) and sends `{"kind":"mix.struct","n0",
+  "n","del":[old numbers],"ins":[new numbers][,"perm":[...]]}`. `perm` is there when tracks moved:
+  replaying del and ins keeps the old tracks in their order and puts the new ones at their places, and
+  position j then gets the track at `perm[j-1]` (j = 1..n-2).
 - Receivers check `n0`, then call `sub_12A5280(del, ..., 2)` and `sub_12A46F0(run, len, 4)` per
   contiguous run, lowest first. That's the menus' resulting state without undo steps or scrolling;
-  linked channels the sender deleted arrive as `chan.del`.
+  linked channels the sender deleted arrive as `chan.del`. Then `mix_reorder` replays `perm` with
+  FL's own move, `sub_12A4490(-1, 0, 0)` (`MIXMOVE`), one step left at a time: only that track
+  selected (`+0x19`) and focused (`MIXFOCUS`, int `0x193FA10`, whose pointer slot is `0x15E26A0`),
+  which moves it and everything that refers to it exactly as the sender's move did. The selection and
+  the focused track are put back by identity afterwards.
+- Moves used to travel as per-track edits: names, sends, params and plugin states by number. The
+  receiver applied each track's send row against its half-moved matrix, and FL's `SetRoute`
+  (`0x12A33C0`) refuses a route that would close a loop (`0x127C640` walks the routes; it returns -1 and
+  writes nothing). flim ignored that and re-baselined, so a new insert feeding its left neighbour and
+  moved past it ended up routed nowhere on the others. A bus with ~20 senders swapped in one pass also
+  went over `META_BULK` (24) and nothing was sent at all ("the routing of all the inserts got messed
+  up"). `live_test.py mix_routes` covers both.
 - Both sides then carry each slot's bookkeeping to the new numbers, re-take the mixer name/color/send
-  baselines and re-read every value without sending (`mix_rebaseline`).
-- The poll thread sends nothing while the count differs from the last known one. It also undoes a
-  tick's pending changes if the identities changed during that tick, so a delete caught halfway (FL
-  permutes before it shrinks the count) never leaks shifted values.
+  baselines (and forget when they last sent them: the leader's conflict rule is by number) and
+  re-read every value without sending (`mix_rebaseline`).
+- The poll thread sends nothing while the count or the order differs from the last known one
+  (`mix_layout_changed`): values read mid-move would go out by number and be moved a second time by the
+  others' replay. It also undoes a tick's pending changes if the identities changed during that tick,
+  so a delete caught halfway (FL permutes before it shrinks the count) never leaks shifted values.
+- A received send row (`do_meta`, M_ROUTE) drops routes first, then adds, and retries refused ones once;
+  `SetRoute`'s 5th argument is 0 (1 adds an undo step), and FL's "Disable routing? Some plugins use this
+  track route" box is answered Yes (`g_mbAuto`), as the sender already chose.
 
 ### Solo
 FL solos by muting the other tracks, so flim used to send those mutes: a solo soloed for everyone.
@@ -281,7 +314,29 @@ How flim keeps it local (engine `solo_*`, `mute_*`):
 - A project snapshot (join, re-sync, backup) has none of the leader's solo: `project_snapshot` puts
   each track's `+0x1c` into bit 8 of event 236 and clears `0x1000`. Checked by restarting B while A
   had a track soloed: B came in with the shared mutes and no solo.
-- Tests: `live_test.py solo`, harness `t_solo`.
+- Nor does a song file the leader opens: one saved while soloed has the solo and the solo's mutes,
+  and opening it sets every track's `+0x1c` to 1 (nothing of the mutes from before the solo is in the
+  file), so `leader_project_loaded` strips the file it sends the same way: the others get every track
+  enabled, what the leader gets on unsolo. It used to send the file as saved, and everyone opened it
+  soloed (a tester's "soloing for one person does it for everyone").
+- Tests: `live_test.py solo solo_song`, harness `t_solo`.
+
+### Mute fade
+- While audio runs, `SetTrackEnabled(t, 0)` doesn't clear `+0x18`: `sub_12C1810(record, 0)` starts a
+  fade-out (`+0x151` = 2, samples left at `+0x154`) and the audio thread clears `+0x18` when it ends.
+  An unmute meanwhile compares with `+0x18` (still 1), sees no change and does nothing, so the fade
+  finishes muted. The test FLs mute at once (no fade), so this is from the code, not seen live.
+- So a peer's mute and unmute applied back to back (queued behind other work, or arriving together)
+  left the track muted here, and the poll took that for a local edit: sent to everyone (undoing the
+  unmute) when someone here was at the keyboard, otherwise this FL alone stayed muted.
+- Separately, a mute click back to the value flim had just applied counted as flim's own echo for
+  `ECHO_MS` (2 s, meant for plugins rounding a value) and was never sent: on/off values go back to
+  the applied one all the time.
+- flim now: a peer's newer mute replaces one still queued for that track (`enqueue`); a mute that ends
+  up against flim's last apply within `MUTE_FADE_MS` (500 ms) gets the applied value once more (task
+  mode 2, dropped if another value was applied since); after those 500 ms any mute change is a click.
+- Tests: `live_test.py mute_fast` (B's main thread held in `Sleep` while A mutes and unmutes; B's
+  `+0x18` cleared right after an unmute lands, as a fade would; B's own clicks right after).
 
 ## 5. Plugins: window state, loading, missing plugins
 
@@ -377,8 +432,48 @@ else from the longest prefix that is an existing file. It must name a file (`\na
 program or system file (`.exe`, `.dll`, `.vst3`, ..., anything under `Windows\`): those are installed,
 not sent. The receiver (`raw_rewrite`) replaces each path it has a download for as an exact string in
 all three encodings: with a same-length alias of the local file, or, in a short string, with the
-local path and a new length byte. Tests: harness `t_samples`, `live_test.py sf2` (B downloads a
-soundfont A's SF2 Player loads).
+local path and a new length byte (only outside TLV data, which covers FL's VST wrapper records,
+whose lengths would otherwise be wrong). Tests: harness `t_samples`, `live_test.py sf2` (B downloads
+a soundfont A's SF2 Player loads).
+
+**Plugins that compress their state** hide their paths: Serum 2 keeps its samples in zstd-compressed
+CBOR (`"XferJson\0"` blocks inside FL's VST wrapper record 53, key `samplePath`), Kontakt has its own
+format. A Serum 2 reader that rewrote those blocks was built and removed again (2026-10-21): code for one
+plugin's private format breaks when the plugin changes it. The shared folder (below) covers every such
+plugin without reading its state. Raw scanning may still pick up a scrap of a path from compressed
+bytes; it names no file, so it is never hashed or sent.
+
+**Shared folder** (engine section "shared folder"; `flimcfg_shared_dir`). One folder with the same path
+on every PC, `CSIDL_COMMON_DOCUMENTS\flim\Shared` = `C:\Users\Public\Documents\flim\Shared` (the same
+physical path in every Windows language; OneDrive doesn't move Public folders; Wine maps it too; any
+local user can write there). A plugin's saved path into it is right everywhere, so nothing is rewritten:
+`samples_resolve` maps such a path to itself (`map_set(p, NULL)`) and the folder brings the file.
+Senders still list those files as samples: someone whose Windows isn't on C: has another shared path,
+which then travels like any sample. `FLIM_SHARED_DIR` moves the folder (tests: two FLs on one PC).
+- Sync by version, not by file time (a copy keeps its old time, clocks differ). Per file: its content
+  hash, its version, the highest version anyone sent, deleted here, made here. A change here gets
+  max(version, highest seen) + 1; a higher version replaces ours; the same version with other content
+  (two changes at once) goes to the higher hash. A version that only this PC had is first hard-linked
+  (else copied) to `<root>\..\Shared backups\<time>\<path>`; no backup, no replace. A file deleted here
+  is a tombstone: only a newer version brings it back (deletes don't sync). The table is
+  `%APPDATA%\flim\shared-<hash of the root>.tsv`, so restarts know versions and deletions.
+- Ops: `shared.files` with `full` 0 (what changed, after `/blobs/missing` + uploads), 1 (everything,
+  on our welcome; announced only) or 2 (everyone's answer to a 1). A download that finds no blob asks
+  its sender after 5 s: `shared.need` (`h`, `to`), at most every 30 s; the sender checks the store
+  first. Dispatched before `hold_if_loading` (nothing of the song in them). Paths are base64 UTF-16.
+- `shThread` owns the table: scans every 2 s (a changed file is hashed only once two scans agree on its
+  size and time and a read-only open succeeds: nobody is writing it), decides, puts files in place.
+  `shDlThread` only downloads verified `~flim-<hash>.part` files next to the target. A file with the
+  same content elsewhere in the folder is copied instead of downloaded. Finished files go on
+  `g_reload` in batches (`SH_RELOAD_MS`), so plugins naming them reload once per batch.
+- Limits: 10000 files, paths up to 200 characters, files up to `SAMPLE_MAX_BYTES`; links (junctions)
+  in the folder are skipped (and written through never: `sh_no_links`), the root must not be one;
+  downloads keep 2 GB free. A peer's path must pass `sh_rel_ok`: no drive, `..`, stream, device name,
+  trailing dot or space; not a program, script or shell file (`content_file` + a few more); not
+  `desktop.ini`, `~$*` or an unfinished download (`.part`, `.crdownload`, `.tmp`).
+- Tests: harness `t_samples` (path rules), `live_test.py shared` (both ways, newer version wins with a
+  backup, an old-dated copy still wins, unfinished files and programs stay put, a delete survives B
+  reconnecting, a channel keeps a shared path).
 
 **Sample plugins and placeholders (Slicer 2).** Loaded with flim's silent 8 kHz placeholder, Fruity
 Slicer 2 fits its slices to that; its own save afterwards has lost them. So after the download flim
@@ -428,6 +523,69 @@ wrong channels (a tester's session lost a channel's plugin that way). How it wor
 - Tests: `live_test.py chan_insert` (an insert, a burst of three, a delete and an insert together, a
   Clone) and `chan_race` (both insert at the same moment). The old engine failed all but the first.
 
+### Edits made in the same moment as a structure change
+Everything flim compares is keyed by number: a value by REC id, a name / color / route by track or channel
+number, notes by their channel field, clips by the channel they play. A structure change renumbers it
+all, so flim used to re-take every baseline from FL afterwards (and re-read every value while one was
+pending). Any edit made in that moment was taken for known and never went out: a burst of everyday edits
+from one person left the other FL with different names, mutes, routes, volumes, effects, notes and clips
+(`live_test.py stress`: 2 of 18 checks matched). Now the main thread carries the baselines through the
+change with `from[]` (new number -> old, -1 = new), so only real edits differ afterwards and go out after
+the structure op:
+- `chan_rebase` (`do_addch`, `do_delch`, `do_order`, `chan_struct_local`, which builds one map through
+  its deletes, reorder and inserts) and `mix_rebaseline` (`mix_struct`, `do_mixstruct`):
+  - `slots_rebase` renames each watched value to its entity's new REC id, keeping its last value
+    (channel `ch << 16`, mixer `t << 22` and send destinations, mute `0xF0000000 | t`);
+  - `meta_remap` moves names, colors and routes with their entity (the route hash is by destination
+    track identity, so renumbering isn't a route edit);
+  - `notes_remap` rewrites the channel of every stored note (`+6`) and channel clip (`+4` =
+    `ch << 16 | 0x5000`; a pattern clip is `(0x5000 + pattern) << 16 | 0x5000`) in the last / pending /
+    base states.
+- Pending sends move with their unit: a plugin swapped (`identAt`) or edited (`lastAct`) just before its
+  track or channel moved still goes out, and a state check queued before a move is tried again.
+- The poll thread doesn't re-read values while a structure change is pending or after it; what bumps
+  `g_structGen` without a map (a project load, an order FL didn't follow) re-reads itself (`slots_reread`).
+- Not covered: pattern ops still re-take note, clip and pattern baselines, and two people changing
+  structure in the same instant can still send an edit by an old number (`stress`, phase "both", fails
+  about one check in three runs). After the whole suite, pattern 7's clips on playlist track 9 once ended
+  864 vs 288 ticks long (B's FL resized them back after each apply); not reproduced with the pattern tests
+  plus `stress` alone.
+- `main_busy` holds plugin-touching tasks while a mouse button is down only when FL is the foreground
+  app: the global button state held flim's queue for as long as someone dragged anything in any program.
+
+### Automation clips and controller links
+An automation clip is an ordinary channel (type 5, points in event 234). What it drives is a **link**,
+kept apart from every channel: `*LINKS` (`0x15E0A00` -> `0x16BACB8`) = { MIDI list (event 226: each
+person's hardware), internal list (event 227) }, TLists (items `+8`, count `+0x10`, capacity `+0x14`)
+of 28-byte records from `sub_F82530(flags)`: `+0` formula object (event 230, text via `FORMTEXT`
+`sub_BAFFD0(formula, &str, 0)`), `+8` source (the clip channel's REC base `index << 16`, or a mixer
+slot's for a controller there; plugin controller outputs add `0x8000 + k`), `+0xC` runtime, `+0x10`
+target REC id, `+0x14` flags (8 internal, 4 MIDI, 2 smoothing), `+0x18` smoothing (469).
+- Saved only with whole projects (`SavePresetFile` mask 0 writes 226/227/230 at `0xF435C5`; a channel
+  or slot state never has them). The loader appends a 226/227 it finds in any state, mask 32/48 too,
+  with no check for duplicates, but sorts the lists only after a project (`sub_F825B0`, a stable sort
+  by `+8`; FL's own adders sort right after appending). Playback (`sub_D0B7B0(source, value)` from
+  `0xD0C8E0`) finds a source's links by binary search (`sub_F82660`), so an unsorted list silently
+  drives nothing for some clips while the UI still shows them linked.
+- FL makes them in `sub_1191A50(target, 1, 0, 1, undo)` ("Create automation clip": `AddChannel(-2)`
+  from `AutoTrack.fst`, then the link, under `SONGLOCK`); Clone and Make unique copy a clip's links
+  (`sub_13030A0`); `sub_F697D0` adds a target, `RemTargetLinkBtnClick` `0xF66920` removes one,
+  `LINKDEL` `sub_F832B0(lo, hi)` deletes those whose source is in `[lo, hi]` (under `SONGLOCK`).
+  Channel and mixer structure changes renumber both ends (`sub_12CB6C0`), freeing a plugin deletes the
+  links into its params (`sub_12BA900` -> `sub_12CA340`), a channel changing type deletes its own.
+- **How flim syncs them** (engine section "automation links"): `unit_save` appends the unit's own
+  links to its state as 227 (+230), so they travel with the clip (chan.add, plug.state, plug.full)
+  but in a field of their own (`"lk"`): an older flim, loading them into its list with every state,
+  would pile up copies. A load of a state with links first drops the unit's (`LINKDEL`), rebases
+  their source to the unit it loads into, and sorts the list after (`links_sort`, under `SONGLOCK`).
+  The poll thread hashes the list per source every 250 ms (`links_scan`): a change made here counts
+  as an edit of that clip; one made by FL during a load or structure op (`LINK_QUIET_MS`) doesn't. When
+  a slot's or channel's plugin changes, the clips with links into it go again after it
+  (`links_resend_into`): the clip may have arrived first and lost its link to FL's plugin swap there.
+- A param that is a link's target is never sent or applied (`auto_target`): each FL plays its own
+  automation. Before, one person playing the song sent the automated knob to everyone.
+- Tests: `live_test.py auto_clip auto_add auto_remove slot_move`.
+
 ## 6. Threads and locks
 
 - Call FL only from its main thread. flim runs that work from a **message-only window's WndProc**
@@ -442,13 +600,35 @@ wrong channels (a tester's session lost a channel's plugin that way). How it wor
   wait `vmt+24` -> `sub_1276CE0`) while holding it. A tester's hang (Task Manager dump): the main thread in
   `LoadPresetFile` (`sub_F46490` -> channel reset `sub_FFE2D0`/`sub_FE90D0`) waiting for it, the render
   thread holding it and waiting for its jobs, the jobs stuck inside plugins (Fruity Phaser via
-  Distructor's `module_x64.dll`, SDRR2). The load had been started by flim. `NOTELOCK` (`0x15e2008`)
-  guards notes. flim takes them only around its own edits of those.
+  Distructor's `module_x64.dll`, SDRR2). The load had been started by flim. `NOTELOCK` (`0x15e2008`
+  -> `0x16b6b20`) guards notes. flim takes them only around its own edits of those.
+- **Lock order: `SONGLOCK`, then `NOTELOCK`.** The audio thread takes them in that order
+  (`sub_D0C220` takes the note lock first thing, inside the render's song lock), and so does FL's
+  `sub_11E7470`, which `NoteArray(p, 1)` calls when it makes a pattern's note array while FL plays.
+  flim's `notes_apply` used to call `NoteArray(p, 1)` holding the note lock: the first notes of a
+  pattern someone else wrote, arriving while this FL played, deadlocked it (hang report 2026-10-21
+  175345: main thread in `notes_apply` -> `NoteArray` -> `sub_11E7470` waiting for the song lock,
+  render thread holding it and waiting for the note lock). Now the array is made before the note
+  lock is taken. `live_test.py notes_playing` writes notes into 20 new patterns while B plays: the old
+  engine froze B at the sixth.
 - Never replace or delete a plugin while that plugin's code is on the main thread's stack (its menu,
   knob drag or dialog runs a message loop that can dispatch flim's task window): the call returns into
   freed code, FL's "Execution of address ..." crash. flim's queue holds such tasks back (`main_busy`:
   stack walk with `RtlCaptureStackBackTrace`, anything not FL / Windows / flim; also while a mouse
   button is down).
+- A task still queued can be replaced in place (a newer state for the same unit, a peer's newer mute),
+  so the main thread copies a task out of the queue as it takes it, under the queue lock. It used to
+  copy it before its busy checks: a state replaced meanwhile was freed under it and the newer one lost.
+- Two testers' "crashes" (2026-10-21) were hangs: FL's main thread stayed inside one of flim's tasks
+  (`BEAT ... inHook=1 hookCalls=0`, the queue growing), and Windows closed FL when they chose "Close
+  the program" (exit code `0xCFFFFFFF`). The likely calls are a state save (`SavePresetFile` ->
+  getChunk) or load during playback. Since then: tasks that save or replace plugins wait while a
+  plugin's menu/drag/dialog is on the stack or a mouse button is down (`calls_plugins` + `main_busy`);
+  the poll thread doesn't read plugin params or rescan while the main thread is in a task (`g_inHook`);
+  a task running over 5 s is logged with FL's main-thread stack (`main_stuck`: suspend, unwind with
+  `RtlVirtualUnwind`, resume, then name the modules: `STUCK main thread: ntdll.dll+... Serum2.vst3+...`).
+  flim.exe makes the hang dump after 8 s (was 20) and puts it into the report when FL is closed while
+  hung ("FL not responding <time>.zip").
 - Reading a dump without a debugger: the `minidump` Python package (`pip install minidump`) gives
   threads, contexts, modules and memory; scan the stack from `Rsp` for values inside modules (the
   scratchpad scripts did that). A `CRITICAL_SECTION`'s `OwningThread` names the thread that holds it.
@@ -465,22 +645,26 @@ wrong channels (a tester's session lost a channel's plugin that way). How it wor
 - `live_test.py` makes a change in one FL through FL's own functions and checks the other. It covers
   params, mixer names/mute/routes/colors, notes, patterns and pattern ops, markers, time signatures,
   channels (add, rename, reorder, delete, with a sample), clips, VST state, an SF2 Player soundfont,
-  mixer insert, delete, append and move, solo staying local, a plugin someone else is editing, and
-  channels inserted mid-list, quickly and by both at once (57 checks). Run it after every port.
+  mixer insert, delete, append and move, routes across moves, solo staying local, quick mutes, a plugin
+  someone else is editing, channels inserted mid-list, quickly and by both at once, the main volume
+  staying local, the shared folder, notes into new patterns while the other FL plays, automation
+  clips and their links, an effect moved inside its track, and a soloed song (116 checks, 18 of them the quick-change stress test; the last
+  test opens a song). Run it after every port.
 - The engine writes `%TEMP%\flim_crash_<pid>.dmp` on the first jump into unloaded code (on by default,
   `FLIM_CRASHDUMP=0` turns it off); flim.exe puts it into the crash report, and saves a hang report
-  (a small dump of FL) after 20 s without an answer (`hang_watch`; `IsHungAppWindow` doesn't notice a
+  (a small dump of FL) after 8 s without an answer (`hang_watch`; `IsHungAppWindow` doesn't notice a
   stuck FL, a 3 s `SendMessageTimeout` does). `cdbX64 -z <dmp> -c ".ecxr; dps @rsp L90; q"` shows who called.
 - flim only syncs changes made while someone uses FL (input in the last 1.5 s). The probe makes no
   input, so `live_test.py` runs a background thread that posts F24 key-ups to both FLs.
 
 ## 8. Signatures
 
-The engine finds every address in section 2 that has a define (70 of them) at start, so an FL update
+The engine finds every address in section 2 that has a define (75 of them) at start, so an FL update
 that only moves code needs no re-port.
 
 **Tried on another build:** FL 26.1.5.5613 (installed next to 26.1.7 in `FL Studio 2026 OLD`).
-- All 70 signatures were found exactly once. 68 of the 70 addresses differ from 26.1.7; only two
+- All 70 signatures were found exactly once (75 since MIXMOVE, MIXFOCUS, LINKS, LINKDEL and FORMTEXT:
+  all found there too). 68 of the 70 addresses differ from 26.1.7; only two
   Delphi RTL helpers stayed put. The old fixed table would have called into the wrong code
   everywhere.
 - The sanity checks passed and the detours installed.
@@ -494,23 +678,23 @@ that only moves code needs no re-port.
   The wildcards are the bytes that move when FL is rebuilt: rip-relative displacements, branch
   targets (rel8 and rel32), and every byte a base relocation touches (64-bit absolute addresses:
   their values differ when the DLL is loaded at another address).
-- `off < 0`: a function's first bytes; the match is the address. 47 rows.
+- `off < 0`: a function's first bytes; the match is the address. 50 rows.
 - `off >= 0`: an instruction that addresses a global rip-relative (`mov rax, [rip+X]`, `lea`):
-  address = match + `nx` + the rel32 at match + `off`. 23 rows: the globals, plus the marker RTTI
+  address = match + `nx` + the rel32 at match + `off`. 25 rows: the globals, plus the marker RTTI
   slot.
 - `va` is the address in FL `FLIM_FL_BUILD` (`common/flim_config.h`), image base `0x400000`.
 
 **At start** (`fl_addrs_resolve`, engine section "FL addresses"), before anything else touches FL:
-- Each pattern is looked up in `.text`: `memchr` on its first concrete byte, then a compare. All 70
+- Each pattern is looked up in `.text`: `memchr` on its first concrete byte, then a compare. All 75
   take about 0.3 s.
 - The FL build is the file version of the loaded `FLEngine_x64.dll`.
 - Outcomes, all logged to `%TEMP%\flim_engine.log`:
   - **All found once:** the engine uses the scanned addresses. Log: "FL addresses: FL 26.1.7.5654,
-    all 70 signatures found once in 282 ms, using them (equal to this build's table)".
+    all 75 signatures found once in 343 ms, using them (equal to this build's table)".
   - **Found, but different from the table on FLIM_FL_BUILD itself:** each difference is logged and
     the table is used.
   - **Any not found, found twice, or decoding outside the image:** the failing names are logged
-    ("1 of 70 signatures failed: REC (not found)"). On FLIM_FL_BUILD the table's VAs are used.
+    ("1 of 75 signatures failed: REC (not found)"). On FLIM_FL_BUILD the table's VAs are used.
     On any other build, sync is off.
 - **Sync off** (`sync_off_idle`) means FL is left alone: no hooks, no polling, no detours. Only the
   engine's task window runs, on the engine thread, so flim.exe still gets the reason. Its status
@@ -554,7 +738,7 @@ logged.
    the new build.
 3. Run `python flsigs.py` (about 20 s). It rewrites every pattern from the VAs, checks each one the
    way the engine will (one match, decodes to its VA), and writes nothing if any fails.
-4. Build. The engine log should say "all 70 signatures found once ... (equal to this build's
+4. Build. The engine log should say "all 75 signatures found once ... (equal to this build's
    table)". Run the harness (`t_groups` maps the installed DLL and resolves every signature) and
    `live_test.py`.
 

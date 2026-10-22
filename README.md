@@ -44,10 +44,10 @@ samples) is kept in sync over the internet. It works a bit like [Drawpile](https
 | Channel volume / pan / on-off / mixer routing, filter, pitch, portamento, gate, swing, time offset, delay and arp settings | Samples inside plugins that store them compressed or encrypted (Kontakt, ...) |
 | Every plugin parameter (generators and effects, FL's own and third-party VSTs) | Showing other people's selection inside an editor |
 | Full plugin state (presets, wavetables, samples loaded inside a VST, ...), checked as soon as you stop working in the plugin's window | Placeholders for MP3 / FLAC / OGG samples (those wait for their download, see [Samples](#samples)) |
-| Tempo, swing, main pitch and main volume | |
+| Tempo, swing and main pitch (the main volume is each person's own) | |
 | Mixer volume / pan / stereo separation / mute / built-in EQ; each effect slot's on/off and mix level | |
 | Mixer track names, colors and routing (sends on/off and send levels) | |
-| Inserting, deleting and trimming mixer tracks; moving one (as ordinary edits, so its effects reload on the other side) | |
+| Inserting, deleting, trimming and moving mixer tracks (routing and automation follow the track); moving an effect up or down in a track (its effects reload on the other side) | |
 | Adding (anywhere in the list, cloning too), deleting and reordering channels; channel names and colors | |
 | Adding, replacing and removing mixer effects | |
 | Notes in every pattern; pattern names, colors and length (so new patterns too) | |
@@ -55,7 +55,7 @@ samples) is kept in sync over the internet. It works a bit like [Drawpile](https
 | Playlist clips; playlist track names and colors | |
 | Playlist markers (including time signature markers); the project's time signature | |
 | Time signatures of single patterns (pattern menu) and piano roll markers | |
-| Automation clips | |
+| Automation clips, with their links to what they automate (made, cloned, added or removed in the session too), and the links of internal controllers (Peak, Formula...) | |
 | Sample files used by channels, audio clips and plugins like FPC, and other files plugins load, such as SF2 Player's soundfont (see [Samples](#samples)) | |
 | Opening or loading a project (the leader's project is sent to everyone) | |
 | Which window everyone is working in, and where their mouse is in the piano roll and playlist (see [Who's where](#whos-where)) | |
@@ -80,12 +80,14 @@ project for everyone instead of letting edits land on the wrong channels.
 
 **What isn't an edit:** values that move by themselves (automation playing back, a Patcher preset's
 own modulation, controllers linked inside FL) happen the same way on every PC, so flim only syncs a
-change when someone is using FL (a click or key press in the last 1.5 s). Changes made with a MIDI
-controller alone aren't synced for now.
+change when someone is using FL (a click or key press in the last 1.5 s). A knob an automation clip
+or controller drives is never synced: each FL plays its own automation, so one person playing the
+song doesn't move everyone's knob. Changes made with a MIDI controller alone aren't synced for now.
 
 **Solo is yours:** soloing a mixer track only changes what you hear. The others keep their mutes, and
 when you unsolo, your tracks get back the mutes everyone shares, including any someone changed while
-you were soloing.
+you were soloing. A song saved while soloed opens soloed only for whoever opens it; the others get it
+with every track on, which is what the solo leaves when it ends. The main volume knob is yours too.
 
 **Staying out of your way:** someone else's plugin changes load without opening the plugin's window,
 and they wait while you're in the middle of something (holding a mouse button, a menu or dialog of a
@@ -129,7 +131,10 @@ at the same pattern or arrangement. The arrows can't be clicked and never get in
      host: closing it ends the session. See [Hosting](#hosting) for people outside your network.
 4. flim's window stays open next to FL. Its **Session** panel shows the status, green once connected
    (`Connected to 203.0.113.7:8080 · member · 2 people · Alex: Mixer`), and a log of what happened:
-   people joining, the project arriving and being zipped, samples uploading and downloading.
+   people joining, the project arriving and being zipped, samples uploading and downloading. You can
+   select and copy from the log. **Detailed log** adds every change sent and received, and every 30 s a
+   summary of the song (two people's summaries differ where their songs do). **Export log...** saves
+   what a bug report needs as one zip.
 5. Make music together. While FL runs, the **Join** button is **Disconnect** / **Connect**. You can close
    flim's window (FL keeps going) and open it again later: it finds your FL. *Open FL without
    connecting* starts FL offline.
@@ -219,7 +224,28 @@ both when the leader's project is sent and when someone loads a new sample durin
   folder when that fits, else under the shorter `Documents\flim\samples\`. If no such path fits and the
   plugin stores the path's length (SF2 Player), it points at the downloaded file itself. When the real file arrives, the plugin is loaded
   again with the state it was sent (not the one it made of the silent placeholder, so Slicer's slices
-  stay right). Plugins that compress or encrypt their state (Kontakt, ...) aren't covered.
+  stay right). Plugins that compress or encrypt their state (Serum 2, Kontakt, ...) don't show their
+  files to flim: load those plugins' samples from the shared folder (below).
+
+### The shared folder
+**Shared folder** in flim's window opens `C:\Users\Public\Documents\flim\Shared`: the same path on every
+PC. Whatever is in it, everyone in the session gets, at that same path. So a sample any plugin loads
+from there (Serum 2, Kontakt, a sampler, a wavetable, an impulse response) is found on everyone's PC,
+because the plugin's own saved path is right everywhere; flim doesn't need to understand the plugin.
+- Put files in (copy, drag, unzip, subfolders are fine), then load them in the plugin from there. Tip:
+  add the folder to FL's browser (Options > File settings > Browser extra search folders).
+- Changes reach the others within a few seconds: a new file, or a new version of one (yours replaces
+  theirs, whatever the file's date says). If two people change the same file at once, one version wins
+  for everyone, and a version that only you had is kept in `C:\Users\Public\Documents\flim\Shared
+  backups\` (30 days, then the Recycle Bin).
+- Deleting a file only deletes your copy, and it stays deleted for you (a newer version from someone
+  brings it back). Renaming one sends the new name; the old one stays with the others.
+- Files that are still being copied or downloaded wait until they're finished. Programs, scripts,
+  shortcuts and plugin files are never shared; files over 2000 MB and links (junctions) in the folder
+  aren't either (flim's window says so). flim downloads only while there's at least 2 GB free.
+- A plugin loaded before its file arrived: plugins that store plain paths (FL's samplers, SF2 Player,
+  many VSTs) are loaded again by themselves; Serum 2, Kontakt and others need the preset reloaded or the
+  sample picked again.
 
 ### Backups and crash reports
 - **Backups:** *Back up the project every [10] min* (on by default) saves a zip of the project and every
@@ -227,8 +253,10 @@ both when the leader's project is sent and when someone loads a new sample durin
 - **Crash reports:** if FL crashes, flim's window logs it and saves
   `Documents\flim\Crash reports\FL crash <date time>.zip`: FL's crash log and startup log from that run,
   flim's log for that FL, and a memory dump when FL jumped into a plugin that was already unloaded.
-- **Hang reports:** if FL doesn't respond for 20 s, flim saves `FL hang <date time>.zip` there: a small
+- **Hang reports:** if FL doesn't respond for 8 s, flim saves `FL hang <date time>.zip` there: a small
   dump with what every thread was doing, which is what's needed to find a freeze. FL may still recover.
+  If FL is then closed while not responding, `FL not responding <date time>.zip` has the dump too, and
+  flim's log names the step FL was stuck in and where (the `STUCK` lines).
 - **Crash reports** in flim's window opens the folder. Send the zip to whoever helps you with flim.
 
 ### Server addresses
@@ -249,10 +277,12 @@ projects folder are set there too and apply right away.
 | What | Where |
 |---|---|
 | Settings (FL folder, name, last address, host port, passwords if "Remember" is ticked or you host) | `%APPDATA%\flim\flim.ini`. Passwords are encrypted for your Windows user (DPAPI). |
-| Log (attach it to bug reports) | `%TEMP%\flim_engine.log` |
+| Log | `%TEMP%\flim_engine.log` |
+| Exported logs (**Export log...**: the log for this FL, flim's window and host logs, versions and settings, no passwords) | `Documents\flim\Logs\` |
 | Songs: session copies, received samples, zips, backups | `Documents\flim\Projects\<song>\` (or the projects folder you picked) |
 | Same-length links for plugins that store sample paths, when the song folder's path is too long (safe to delete when no session is running) | `Documents\flim\samples\` |
 | Crash and hang reports | `Documents\flim\Crash reports\` |
+| The shared folder, its backups, and what flim knows about its files (versions, deletions) | `C:\Users\Public\Documents\flim\Shared\`, `...\flim\Shared backups\`, `%APPDATA%\flim\shared-*.tsv` |
 | The built-in host's sample store (a cache, safe to delete when not hosting) | `%LOCALAPPDATA%\flim\host-samples\` |
 
 ---
@@ -339,13 +369,19 @@ server/                 flim-server (Node.js + TypeScript, WebSocket + HTTP)
 - **"Can't connect: not a flim server (HTTP …)"**: something answered at that address, but it isn't
   flim-server.
 - **"Wrong password"**: ask whoever runs the server. The password is the server's `FLIM_PASSWORD`.
+- **"Alex is on flim X (built …) and you're on Y (built …)"**: everyone in a session needs the same flim
+  (the same download); another build may miss or misread some changes. Everyone updates to the newest.
+  (Builds from before this check don't say which they are, so it only shows between newer ones.)
 - **"The plugin X is missing"**: someone uses a plugin (VST) that isn't installed on your PC (or isn't
   in FL's plugin database: rescan in FL's plugin manager). Click OK. That channel or effect slot keeps
   a placeholder that holds the plugin and its settings, so nothing is lost: it plays for everyone who
   has the plugin and comes back if you install it. It's silent for you. FL warns once per plugin;
   after that, changes to it still arrive (the placeholder keeps the latest settings) and are only
   noted in flim's log.
-- **Something didn't sync or FL crashed**: please open an issue and attach `%TEMP%\flim_engine.log`.
+- **Something didn't sync**: tick **Detailed log** in flim's window (everyone in the session) and carry
+  on. When it happens again, note the time, click **Export log...** and attach the zip to an issue,
+  one from each person if you can.
+- **FL crashed**: attach the crash report zip (see [Backups and crash reports](#backups-and-crash-reports)).
 
 ---
 

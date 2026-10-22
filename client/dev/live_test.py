@@ -94,6 +94,11 @@ def t_params():
         rec_set(a, i, (cur + 2345) % 12800 if nm != 'tempo' else 123456)
         check('param ' + nm, lambda i=i: rec_get(a, i), lambda i=i: rec_get(b, i))
 
+def t_main_volume():                                            # each person's own listening level
+    before = rec_get(b, 0x40000000)
+    rec_set(a, 0x40000000, (rec_get(a, 0x40000000) + 2345) % 12800); time.sleep(2)
+    check('main volume stays local', lambda: rec_get(b, 0x40000000), lambda: before)
+
 def t_mixer_name():
     a.call(MIXNAME, 2, a.mkstr('FlimMix'), 1)
     check('mixer name', lambda: mix_name(a, 2), lambda: mix_name(b, 2))
@@ -281,9 +286,17 @@ def t_sf2():
         check('SF2 soundfont %s arrives' % 'AB'[k], lambda: (len(chans(a)), True),
               lambda: (len(chans(b)), sf2_in(b, -1, 'b')[1] == want), wait=20)
 
+def routes(p, t):                                               # where track t sends (+0x394: {int level, byte on} per track)
+    n = mix_count(p); r = p.r(mix_rec(p, t) + 0x394, n * 8)
+    return [d for d in range(n) if r[d * 8 + 4]]
+def all_routes(p): return [routes(p, t) for t in range(mix_count(p))]
+def route_only(p, src, dst):                                    # src sends to dst only (SetRoute, no undo; RoutingChanged)
+    m = p.q(p.g(0x15e22d8))
+    for d in routes(p, src): p.call(0x12a33c0, m, src, d, 0, 0)
+    p.call(0x12a33c0, m, src, dst, 1, 0); p.call(0x12a28f0, m)
 def mix_state(p):
     n = mix_count(p)
-    return n, [mix_name(p, t) for t in range(n)], [rec_get(p, mix_id(t, 0x1fc0)) for t in range(1, n - 1)], [has_plug(p, t) for t in range(1, n - 1)]
+    return n, [mix_name(p, t) for t in range(n)], [rec_get(p, mix_id(t, 0x1fc0)) for t in range(1, n - 1)], [has_plug(p, t) for t in range(1, n - 1)], all_routes(p)
 
 def t_mix_insert():
     a.call(MIXNAME, 3, a.mkstr('Three'), 1); a.call(MIXNAME, 4, a.mkstr('Four'), 1)
@@ -306,7 +319,29 @@ def t_mix_append():
 
 def t_mix_move():
     mix_move(a, 3, 1)
-    check('mixer: A moves track 3 right (edits)', lambda: mix_state(a), lambda: mix_state(b), wait=15)
+    check('mixer: A moves track 3 right', lambda: mix_state(a), lambda: mix_state(b), wait=15)
+
+# Moves travel as one reorder the others replay with FL's own move. Sent as each track's sends one by one,
+# FL refused routes that closed a loop with the half-moved matrix, and 24+ changed rows weren't sent at all.
+def t_mix_routes():
+    mix_insert(a, 4)
+    check('routes: insert', lambda: mix_count(a), lambda: mix_count(b), wait=8)
+    route_only(a, 4, 3)
+    check('routes: new track feeds 3', lambda: routes(a, 4), lambda: routes(b, 4), wait=6)
+    mix_move(a, 4, -1)                                          # ...and moves left past it
+    check('routes: moved left past the track it feeds', lambda: mix_state(a), lambda: mix_state(b), wait=10)
+    while mix_count(a) < 28: mix_insert(a, mix_count(a) - 1, 28 - mix_count(a))
+    check('routes: 28 tracks', lambda: mix_count(a), lambda: mix_count(b), wait=10)
+    a.call(MIXNAME, 24, a.mkstr('Bus'), 1)
+    for t in range(1, 23):                                      # 22 senders into the bus (a few per pass)
+        route_only(a, t, 24)
+        if t % 5 == 0: time.sleep(1)
+    check('routes: 22 tracks into the bus', lambda: mix_state(a), lambda: mix_state(b), wait=10)
+    mix_insert(a, 25); time.sleep(0.3); mix_move(a, 25, -1)     # a new track swapped with the bus
+    check('routes: bus swapped with a new track', lambda: mix_state(a), lambda: mix_state(b), wait=12)
+    check('routes: the senders still feed the bus', lambda: {tuple(routes(a, t)) for t in range(1, 23)}, lambda: {(25,)}, wait=2)
+    for k in range(3): mix_move(a, 25, -1); time.sleep(0.15); mix_move(a, 24, -1); time.sleep(0.15)   # back and forth, fast
+    check('routes: fast moves', lambda: mix_state(a), lambda: mix_state(b), wait=12)
 
 # Solo is each person's own: FL solos by muting the other tracks, which must not reach the others.
 MUTE, SOLO = 0x127b9b0, 0x127c2a0                               # setTrackEnabled(t, on); solo(t, 1 on / 0 off, 2: mixer default)
@@ -314,8 +349,8 @@ def mixb(p, t, off): return p.r(mix_rec(p, t) + off, 1)[0]     # +0x18 enabled, 
 def mutes(p): return [mixb(p, t, 0x18) for t in range(mix_count(p))]
 
 def t_solo():
-    a.call(MUTE, 6, 0)
-    check('mute 6 (shared)', lambda: mixb(a, 6, 0x18), lambda: mixb(b, 6, 0x18))
+    a.call(MUTE, 6, 0)                                          # (FL fades it in while its audio runs)
+    check('mute 6 (shared)', lambda: (mixb(a, 6, 0x18), mixb(b, 6, 0x18)), lambda: (0, 0), wait=4)
     before = mutes(b)
     a.call(SOLO, 3, 1, 2); time.sleep(2.5)
     check('solo: A has 3 soloed', lambda: (mixb(a, 3, 0x1a), mixb(a, 4, 0x18)), lambda: (1, 0))
@@ -329,6 +364,28 @@ def t_solo():
     time.sleep(2.5)
     check('mute ends solo: B unchanged', lambda: mutes(b), lambda: before)
     check('mute ends solo: A back to shared', lambda: mutes(a), lambda: mutes(b), wait=4)
+
+# Quick mute + unmute. While audio runs FL fades a mute out, and an unmute during the fade is lost: the
+# two queued behind other work apply as one, and a track that ends up against flim's apply gets it again.
+def t_mute_fast():
+    import ctypes
+    t, sleep = 4, ctypes.cast(ctypes.windll.kernel32.Sleep, ctypes.c_void_p).value
+    pos = os.path.getsize(LOG)
+    busy = threading.Thread(target=lambda: b.call(va(b, sleep), 2500)); busy.start()   # B's main thread busy
+    time.sleep(0.3); a.call(MUTE, t, 0); time.sleep(0.5); a.call(MUTE, t, 1); busy.join()
+    check('mute + unmute while B is busy', lambda: (mixb(a, t, 0x18), mixb(b, t, 0x18)), lambda: (1, 1), wait=4)
+    check('...B applies only the last', lambda: sum('APPLY id=0x%08x' % (0xF0000000 | t) in l for l in log_since(pos, B)), lambda: 1)
+    a.call(MUTE, t, 0)
+    check('mute (shared)', lambda: mixb(b, t, 0x18), lambda: 0, wait=4)
+    pos = os.path.getsize(LOG); a.call(MUTE, t, 1); t0 = time.time()
+    while mixb(b, t, 0x18) != 1 and time.time() - t0 < 4: pass
+    b.w(mix_rec(b, t) + 0x18, b'\x00')                          # as if FL's fade had swallowed the unmute
+    check('swallowed unmute applied again', lambda: (mixb(a, t, 0x18), mixb(b, t, 0x18)), lambda: (1, 1), wait=3)
+    check('...and logged', lambda: any('MUTE track %d ended up muted' % t in l for l in log_since(pos, B)), lambda: True)
+    time.sleep(1); b.call(MUTE, t, 0)                           # later, B's own mute is an edit as usual
+    check('B mutes it afterwards', lambda: mixb(a, t, 0x18), lambda: 0, wait=4)
+    b.call(MUTE, t, 1)
+    check('B unmutes it', lambda: mixb(a, t, 0x18), lambda: 1, wait=4)
 
 # Fruity Delay 3 locked its user out: the other FL sent its state back after applying their edits.
 FD3_FST = os.path.join(fl_dir(), r'Data\Patches\Plugin database\Effects\Delay reverb\Fruity Delay 3.fst')
@@ -373,9 +430,241 @@ def t_chan_insert():
     check('clone into 1: names', lambda: chan_names(a), lambda: chan_names(b), wait=10)
     check('clone into 1: its volume', lambda: rec_get(a, 1 << 16), lambda: rec_get(b, 1 << 16), wait=10)
 
+def chan_state_bytes(p, i, tag):
+    path = os.path.join(TMP, 'flim_live_chstate_%s.fst' % tag)
+    p.call(V(p, 'SAVEPRESET'), p.mkstr(path), 32, chans(p)[i], 1)
+    return open(path, 'rb').read()
+
+# The shared folder: the same files everywhere, newest wins (the replaced one is backed up), programs and
+# flim's partial downloads stay put, and a sample loaded from it keeps its path on the other side. The two
+# FLs on this PC each have their own (restart_test.ps1: FLIM_SHARED_DIR).
+SH_A, SH_B = (os.path.join(TMP, 'flim_shared_' + x) for x in 'AB')
+def rd(p): return open(p, 'rb').read() if os.path.exists(p) else None
+def engine_cmd(pid, kind, text=None):                           # what flim.exe's window sends the engine (GUI_*)
+    import ctypes, ctypes.wintypes as W
+    u32 = ctypes.windll.user32
+    u32.FindWindowExW.restype = W.HWND
+    u32.FindWindowExW.argtypes = [W.HWND, W.HWND, W.LPCWSTR, W.LPCWSTR]
+    u32.SendMessageW.argtypes = [W.HWND, W.UINT, W.WPARAM, W.LPARAM]
+    class CDS(ctypes.Structure): _fields_ = [('dwData', ctypes.c_size_t), ('cbData', W.DWORD), ('lpData', ctypes.c_void_p)]
+    h = None
+    while True:
+        h = u32.FindWindowExW(W.HWND(-3), h, 'FlimTasks', None)   # HWND_MESSAGE
+        if not h: return False
+        p = W.DWORD(); u32.GetWindowThreadProcessId(h, ctypes.byref(p))
+        if p.value == pid: break
+    buf = ctypes.create_string_buffer(text.encode('utf-8') + b'\0') if text is not None else None
+    cds = CDS(kind, len(buf) if buf else 0, ctypes.cast(buf, ctypes.c_void_p).value if buf else None)
+    u32.SendMessageW(h, 0x4A, 0, ctypes.addressof(cds))
+    return True
+def t_shared():
+    import glob, shutil
+    tag = '%d' % (time.time() % 100000)
+    fa = os.path.join(SH_A, 'Drums ' + tag, 'kick %s.wav' % tag)
+    rel = os.path.relpath(fa, SH_A)
+    fb = os.path.join(SH_B, rel)
+    os.makedirs(os.path.dirname(fa), exist_ok=True)
+    make_wav(fa, 200 + int(tag) % 100)
+    for junk in ('tool %s.exe' % tag, '~flim-%s.part' % tag, 'pack %s.zip.crdownload' % tag): open(os.path.join(SH_A, junk), 'wb').write(b'MZ junk')
+    check('shared: A\'s new file reaches B', lambda: rd(fa), lambda: rd(fb), wait=20)
+    old = rd(fa)
+    time.sleep(1.5)
+    make_wav(fb, 500 + int(tag) % 100)                          # B edits it later: B's is the next version
+    check('shared: B\'s newer version reaches A', lambda: rd(fa), lambda: rd(fb), wait=20)
+    bak = glob.glob(os.path.join(os.path.dirname(SH_A), 'Shared backups', '*', rel))
+    check('shared: A\'s old one is in Shared backups', lambda: any(rd(x) == old for x in bak), lambda: True)
+    check('shared: programs and unfinished files stay put', lambda: [os.path.exists(os.path.join(SH_B, j)) for j in ('tool %s.exe' % tag, '~flim-%s.part' % tag, 'pack %s.zip.crdownload' % tag)], lambda: [False] * 3)
+    fb2 = os.path.join(SH_B, 'pad %s.wav' % tag)
+    make_wav(fb2, 330)
+    check('shared: B\'s new file reaches A', lambda: rd(os.path.join(SH_A, 'pad %s.wav' % tag)), lambda: rd(fb2), wait=20)
+    src = os.path.join(TMP, 'flim_live_old_pad.wav')            # copied over it: a 2019 file (a copy keeps its date)
+    make_wav(src, 777); os.utime(src, (1560000000, 1560000000))
+    time.sleep(1)
+    shutil.copy2(src, os.path.join(SH_A, 'pad %s.wav' % tag))
+    check('shared: an old-dated copy over it still wins', lambda: rd(fb2), lambda: rd(src), wait=20)
+    os.remove(fa)                                               # deleted at A: B still has it and lists it again
+    time.sleep(5)
+    engine_cmd(B, 4); time.sleep(2); engine_cmd(B, 3, 'localhost:8080\n\nB')   # B reconnects (Disconnect, Connect)
+    time.sleep(25)
+    check('shared: a delete sticks when B lists its files again', lambda: (os.path.exists(fa), os.path.exists(fb)), lambda: (False, True))
+    # a channel playing a file at B's shared path (between real PCs it's the same path for everyone; here only
+    # B takes it for its shared folder): B leaves it as it is instead of pointing it at a downloaded copy
+    pad = os.path.join(SH_B, 'pad %s.wav' % tag)
+    src, dst = (os.path.join(TMP, n) for n in ('flim_live_ch0.fst', 'flim_live_shsmp.fst'))
+    a.call(0xf54570, a.mkstr(src), 32, chans(a)[0], 1)
+    fst_with_sample(src, dst, pad)
+    a.call(0x1004230, -1, 0, 1)
+    a.call(0xf54760, a.mkstr(dst), 32, chans(a)[-1], 0)
+    check('shared: channel with a shared sample added', lambda: len(chans(a)), lambda: len(chans(b)), wait=10)
+    check('shared: B\'s channel keeps the shared path', lambda: pad.encode('utf-16le') in chan_state_bytes(b, -1, 'b'), lambda: True, wait=10)
+
 def t_chan_race():
     for p, nm in ((a, 'RaceA'), (b, 'RaceB')): add_named(p, 1, nm)            # both at once: one side re-syncs
     check('both insert at once: same list after', lambda: chan_names(a), lambda: chan_names(b), wait=30)
+
+# B plays while A's notes land in patterns B has no note array for yet. FL makes one then under its song
+# lock, which its audio thread holds while it waits for the note lock: flim holding the note lock around
+# that deadlocked FL (hang report 2026-10-21 175345).
+PLAYING = 0x193fb0c                                             # int: FL is playing
+def space(pid):                                                 # FL's play / stop key
+    import ctypes
+    for w in fl.windows((pid,)):
+        if w[2] == 'TFruityLoopsMainForm':
+            ctypes.windll.user32.PostMessageW(w[1], 0x100, 0x20, 0x00390001); ctypes.windll.user32.PostMessageW(w[1], 0x101, 0x20, 0xC0390001)
+def responds(pid, ms=3000):                                     # FL's main thread answers a message
+    import ctypes, ctypes.wintypes as W
+    r = ctypes.c_size_t()
+    for w in fl.windows((pid,)):
+        if w[2] == 'TFruityLoopsMainForm':
+            return bool(ctypes.windll.user32.SendMessageTimeoutW(w[1], 0, 0, 0, 2, ms, ctypes.byref(r)))   # WM_NULL, SMTO_ABORTIFHUNG
+    return False
+def unsel(recs): return [r[:0x13] + bytes([r[0x13] & 0x7f]) + r[0x14:] for r in recs]   # selection is each person's own
+def t_notes_playing():
+    src = next(iter(notes(a, 1)), None)
+    if src is None: print('   (no notes in pattern 1: skipped)'); return
+    fresh = [p for p in range(100, 999) if not a.q(pat_rec(a, p) + 0x28) and not b.q(pat_rec(b, p) + 0x28)][:20]
+    if not b.d(b.a(PLAYING)): space(B)
+    time.sleep(1)
+    rec = a.alloc(24); a.w(rec, src)
+    for p in fresh:
+        arr = a.call(0x12d16e0, p, 0)                           # NoteArray(p, 0): A isn't playing
+        a.call(va(a, a.q(a.q(arr) + 8)), arr, rec)              # vmt[1]: add the note
+        time.sleep(0.15)
+    check('notes into new patterns, B playing: B responds', lambda: responds(B), lambda: True, wait=15)
+    check('notes into new patterns, B playing', lambda: [unsel(notes(a, p)) for p in fresh], lambda: [unsel(notes(b, p)) for p in fresh], wait=15)
+    if responds(B, 1000) and b.d(b.a(PLAYING)): space(B)
+
+# Automation clips: FL keeps their links in one list (*LINKS -> [MIDI, internal]) of 28-byte records,
+# +8 source (the clip's channel << 16), +0x10 target. They travel with the clip's state.
+LINKS = 0x15e0a00
+def links(p):                                                   # (source, target, flags, smoothing), in FL's order
+    L = p.q(p.g(LINKS) + 8); n = p.d(L + 16); it = p.q(L + 8)
+    return [struct.unpack('<IIIIi', p.r(p.q(it + 8 * i) + 8, 20)) for i in range(n)]
+def t_auto_clip():
+    target = mix_id(5, 0x1fc0)                                  # mixer track 5's volume
+    n = len(chans(a))
+    a.call(0x1191a50, target, 1, 0, 1, 1)                       # FL's "Create automation clip"
+    check('automation clip: channel added', lambda: len(chans(b)), lambda: n + 1, wait=10)
+    check('automation clip: its link reached B', lambda: links(a), lambda: links(b), wait=10)
+    before = rec_get(b, target)
+    rec_set(a, target, (rec_get(a, target) + 2345) % 12800); time.sleep(2.5)
+    check('automated value stays each FL\'s own', lambda: rec_get(b, target), lambda: before)
+def t_auto_add():                                               # another link out of a clip in the middle: B's loader
+    srcs = sorted(set(l[0] for l in links(a)))                  # appends it (unsorted), flim sorts
+    src = srcs[len(srcs) // 2]
+    r = a.call(0xf82530, 8)                                     # FL's new link record (8: internal)
+    a.w(r + 8, struct.pack('<IIIIi', src, 0, mix_id(6, 0x1fc0), 8, 469))
+    L = a.q(a.g(LINKS) + 8); n = a.d(L + 16)
+    if a.d(L + 20) <= n: print('   (link list full: skipped)'); return
+    a.w(a.q(L + 8) + 8 * n, struct.pack('<Q', r)); a.w(L + 16, struct.pack('<i', n + 1))
+    a.call(0xf825b0, L)                                         # FL's sort, as its own "add target link" does
+    check('automation link added: reached B', lambda: links(a), lambda: links(b), wait=10)
+def t_auto_remove():
+    src = sorted(set(l[0] for l in links(a)))[1]
+    a.call(0xf832b0, src, src | 0xffff)                         # FL's delete of a source's links
+    check('automation links removed: gone on B too', lambda: links(a), lambda: links(b), wait=10)
+
+# FL's "Move down" on a track's first effect swaps two slot objects inside the track (sub_1233B30); flim
+# took slot 0's object for the track and replayed it as a track deleted and inserted.
+CURSLOT = 0x15e2c38                                             # global -> the effect slot whose menu is open
+def slot_plugin(p, t, s, tag):                                  # the plugin's name in an effect slot ('' = empty)
+    import flp
+    if not has_plug(p, t, s): return ''
+    path = os.path.join(TMP, 'flim_live_slot_%s.fst' % tag)
+    if os.path.exists(path): os.remove(path)
+    p.call(V(p, 'SAVEPRESET'), p.mkstr(path), 48, fx_slot(p, t, s), 1)
+    for e, v in flp.events(open(path, 'rb').read()):
+        if e in (201, 203): return v.decode('utf-16le', 'replace').rstrip('\0')
+    return '?'
+def t_slot_move():
+    t = 4
+    if not (has_plug(a, t, 0) and has_plug(a, t, 1)): print('   (track %d needs effects in slots 0 and 1: skipped)' % t); return
+    pos = os.path.getsize(LOG)
+    a.w(a.g(CURSLOT), struct.pack('<Q', fx_slot(a, t, 0)))
+    a.call(0x1233b30, 1, 0)                                     # move it to slot 1, no undo step
+    check('effect moved down in A', lambda: [slot_plugin(a, t, s, 'a') for s in range(3)], lambda: [slot_plugin(b, t, s, 'b') for s in (1, 0, 2)], wait=0)
+    check('effect move: B\'s slots', lambda: [slot_plugin(a, t, s, 'a') for s in range(3)], lambda: [slot_plugin(b, t, s, 'b') for s in range(3)], wait=15)
+    check('effect move: not a track delete', lambda: [l for l in log_since(pos, A) if 'MIX tracks changed' in l], lambda: [])
+    check('effect move: links follow', lambda: links(a), lambda: links(b), wait=10)
+
+# Quick changes: bursts of everyday edits as fast as a person clicks, first from A alone, then from both at
+# once; afterwards everything the two FLs share must be the same. FLIM_STRESS_SEED / _OPS vary it.
+def shared_state(p):
+    n = mix_count(p)
+    return {'channels': chan_names(p), 'mixer names': [mix_name(p, t) for t in range(n)], 'mutes': mutes(p),
+            'routes': all_routes(p), 'mixer volumes': [rec_get(p, mix_id(t, 0x1fc0)) for t in range(1, n - 1)],
+            'effects': [[slot_plugin(p, t, s, 'st') for s in range(3)] for t in range(1, n - 1)],
+            'links': links(p), 'notes': [unsel(notes(p, pt)) for pt in range(1, 12)], 'clips': sorted(r[:16] for r in clips(p)[1])}
+def t_stress():
+    import random
+    rnd = random.Random(int(os.environ.get('FLIM_STRESS_SEED', '7')))
+    src = next(iter(notes(a, 1)), bytes(24))
+    def inner(p): return rnd.randrange(1, mix_count(p) - 1)
+    def rename_ch(p, k): c = rnd.choice(chans(p)); p.call(va(p, p.q(p.q(c) + 0x70)), c, p.mkstr('S%d' % k))
+    def add_ch(p, k): add_named(p, rnd.randrange(len(chans(p)) + 1), 'Add%d' % k)
+    def del_ch(p, k): p.call(0x1004a60, rnd.randrange(len(chans(p))), 0, 3)
+    def mute(p, k): p.call(MUTE, inner(p), rnd.randrange(2))
+    def mixname(p, k): p.call(MIXNAME, inner(p), p.mkstr('M%d' % k), 1)
+    def vol(p, k): rec_set(p, mix_id(inner(p), 0x1fc0), rnd.randrange(12800))
+    def route(p, k): s = inner(p); route_only(p, s, rnd.choice([0] + [d for d in range(1, mix_count(p) - 1) if d != s]))
+    def mixins(p, k): mix_insert(p, inner(p))
+    def mixmove(p, k): mix_move(p, rnd.randrange(2, mix_count(p) - 2), rnd.choice((-1, 1)))
+    def fxmove(p, k):
+        full = [t for t in range(1, mix_count(p) - 1) if has_plug(p, t, 0)]
+        if not full: return
+        t = rnd.choice(full); p.w(p.g(CURSLOT), struct.pack('<Q', fx_slot(p, t, 0))); p.call(0x1233b30, 1, 0)
+    def note(p, k):
+        r = bytearray(src); struct.pack_into('<I', r, 0, rnd.randrange(64) * 24); struct.pack_into('<H', r, 6, rnd.randrange(len(chans(p))))
+        arr = p.call(0x12d16e0, rnd.randrange(1, 12), 0); rec = p.alloc(24); p.w(rec, bytes(r)); p.call(va(p, p.q(p.q(arr) + 8)), arr, rec)
+    def autoclip(p, k): p.call(0x1191a50, mix_id(inner(p), 0x1fc0), 1, 0, 1, 1)
+    ops = [rename_ch, add_ch, del_ch, mute, mixname, vol, route, mixins, mixmove, fxmove, note, note, vol, mute, autoclip]
+    n = int(os.environ.get('FLIM_STRESS_OPS', '40'))
+    for phase, who in (('A alone', (a,)), ('both', (a, b))):
+        for k in range(n):
+            p = rnd.choice(who); op = rnd.choice(ops)
+            try: op(p, k)
+            except Exception as e: print('   %s on %s: %s' % (op.__name__, 'A' if p is a else 'B', e))
+            time.sleep(rnd.choice((0.03, 0.1, 0.25, 0.5)))
+        time.sleep(5)
+        sa = sb = None
+        t0 = time.time()
+        while time.time() - t0 < 90:                            # a re-sync (the leader's project again) takes a while
+            try: sa, sb = shared_state(a), shared_state(b)
+            except RuntimeError as e: print('   (an FL was busy: %s; again)' % e); time.sleep(3); continue
+            if sa == sb: break
+            time.sleep(3)
+        for key in sa: check('stress (%s): %s' % (phase, key), lambda key=key: sa[key], lambda key=key: sb[key], wait=0)
+
+# A song saved while soloed has the solo in its file. The leader opening it is soloed (FL's doing); the
+# others get it without, every track enabled (opening it sets every track's +0x1c: what unsolo gives back).
+OPENSTR = 0x16bcca8                                             # FL's open handler (WM 0x566) opens the file named here
+def open_song(p, pid, path):
+    import ctypes, ctypes.wintypes
+    p.w(p.a(OPENSTR), struct.pack('<Q', p.mkstr(path)))
+    for w in fl.windows((pid,)):
+        if w[2] == 'TFruityLoopsMainForm': ctypes.windll.user32.PostMessageW(w[1], 0x566, 0, 0)
+    def left(k):
+        r = ctypes.wintypes.RECT(); ctypes.windll.user32.GetWindowRect(k, ctypes.byref(r)); return r.left
+    for _ in range(12):                                         # "Save changes to ...?" Yes / No / Cancel: No
+        time.sleep(0.5)
+        for q, h, c, t in fl.windows((pid,)):
+            btns = sorted((k for k, cc in fl.children(h) if cc == 'TQuickFocusBtn'), key=left) if c == 'TMsgForm' else []
+            if len(btns) == 3: fl.post_click(btns[1]); return
+
+def t_solo_song():
+    path = os.path.join(TMP, 'flim_live_soloed.flp')
+    a.call(SOLO, 3, 1, 2); time.sleep(1.5)
+    a.call(V(a, 'SAVEPROJ'), a.mkstr(path), 0)
+    a.call(SOLO, 3, 0, 2); time.sleep(1.5)
+    pos = os.path.getsize(LOG)
+    open_song(a, A, path)
+    check('soloed song: B opened it', lambda: any('PROJECT opened' in l for l in log_since(pos, B)), lambda: True, wait=30)
+    time.sleep(3)
+    check('soloed song: A opened it soloed', lambda: mixb(a, 3, 0x1a), lambda: 1)
+    check('soloed song: B has no solo', lambda: [mixb(b, t, 0x1a) for t in range(mix_count(b))], lambda: [0] * mix_count(b))
+    check('soloed song: B\'s mutes are A\'s shared ones', lambda: mutes(b), lambda: [mixb(a, t, 0x1c) for t in range(mix_count(a))])
+    a.call(SOLO, 3, 0, 2)
+    check('soloed song: A unsolos to the same', lambda: mutes(a), lambda: mutes(b), wait=4)
 
 if __name__ == '__main__':
     T = {k[2:]: v for k, v in list(globals().items()) if k.startswith('t_')}

@@ -58,7 +58,9 @@ BEGIN
 
     GROUPBOX        "Session", -1, 340, 6, 214, 265
     LTEXT           "FL isn't running.", IDC_S_STATUS, 348, 18, 198, 50
-    LISTBOX         IDC_S_LOG, 348, 72, 198, 174, LBS_NOINTEGRALHEIGHT | LBS_NOSEL | WS_VSCROLL | WS_HSCROLL | WS_BORDER
+    EDITTEXT        IDC_S_LOG, 348, 72, 198, 158, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | WS_VSCROLL | WS_HSCROLL
+    AUTOCHECKBOX    "Detailed log", IDC_S_DETAIL, 348, 235, 70, 10
+    PUSHBUTTON      "Export log...", IDC_S_EXPORT, 488, 232, 58, 14
     LTEXT           "Keep a plugin I change locked to me for", -1, 348, 253, 128, 10
     EDITTEXT        IDC_S_LOCK, 478, 251, 20, 13, ES_NUMBER
     LTEXT           "s (1-10)", -1, 502, 253, 44, 10
@@ -70,6 +72,7 @@ BEGIN
     PUSHBUTTON      "Projects folder", IDC_M_PROJECTS, 262, 279, 62, 14
     PUSHBUTTON      "Change...", IDC_M_PROJDIR, 326, 279, 40, 14
     PUSHBUTTON      "Crash reports", IDC_M_CRASHES, 370, 279, 58, 14
+    PUSHBUTTON      "Shared folder", IDC_M_SHARED, 432, 279, 58, 14
     PUSHBUTTON      "Close", IDCANCEL, 500, 279, 54, 14
 END
 
