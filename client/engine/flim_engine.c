@@ -5955,9 +5955,19 @@ static volatile DWORD g_plugInputAt = 0;   //   when (stored after it)
 // Message hook: input that went into a plugin window. Only that is work in the plugin: keys, the wheel
 // and drags elsewhere after a click in one used to count too, and kept a drifting plugin going out
 // every PLUGFOCUS_LONG_MS while its user worked anywhere in FL.
-static void plugin_input(HWND h) {
+static void plugin_input(HWND h, int press) {
+    static int fromPlug = 0;                   // the last press outside FL's small dialogs / menus went to g_plugForm
+    HWND root = h ? GetAncestor(h, GA_ROOT) : NULL;
+    if (root && (wnd_class_is(root, "TNameEditForm") || wnd_class_is(root, "#32768") || wnd_class_is(root, "TMsgForm") ||
+                 wnd_class_is(root, "#32770"))) {
+        // a knob's "Type in value..." box / context menu opened from a plugin window: its own top-level window, but
+        // the value it sets is that plugin's (a state-only one, like the sampler's time stretch, went out late)
+        if (fromPlug && g_plugForm) g_plugInputAt = g_lastInput;
+        return;
+    }
     while (h && h != g_mainForm && !wnd_class_is(h, "TPluginForm")) h = GetParent(h);
-    if (h && h != g_mainForm) { g_plugForm = h; g_plugInputAt = g_lastInput; }
+    if (h && h != g_mainForm) { g_plugForm = h; g_plugInputAt = g_lastInput; fromPlug = 1; }
+    else if (press) fromPlug = 0;              // (a key-up lands wherever the focus is: not work elsewhere)
 }
 // Poll thread: the user worked in a plugin window and paused (or has been at it for a while).
 static void plugfocus_poll(DWORD now) {
@@ -6382,6 +6392,24 @@ static int sc_rebase(QItem *it) {
             resync("a new channel crossed a mixer change");
             task_free(it);
             return 0;
+        }
+        if (g_isLeader && it->type == T_ADDCH && it->mode >= 0 && it->a == it->mode && it->sc[SC_MIX] == g_sc[SC_MIX] &&
+            it->sc[SC_CH] < g_sc[SC_CH] && g_sc[SC_CH] - it->sc[SC_CH] <= SC_LOG && it->mode + (g_sc[SC_CH] - it->sc[SC_CH]) == g_nChKnown) {
+            // a channel appended at the end, crossing only channels appended here (two people making automation clips
+            // at once): it goes after them, so the member's re-sync brings it back (skipped, it was lost; its links
+            // follow it: a load makes them this channel's)
+            int ok = 1, i;
+            for (e = it->sc[SC_CH]; e < g_sc[SC_CH] && ok; e++) {
+                const ScEnt *s = &g_scLog[SC_CH][e % SC_LOG];
+                ok = s->sc == e && s->n > 0 && s->from[s->n - 1] == -1;
+                for (i = 0; ok && i < s->n - 1; i++) ok = s->from[i] == i;
+            }
+            if (ok) {
+                logmsg("STRUCT a new channel made at count %d reached this FL at %ld: it crossed channels added here; "
+                       "added after them (its sender loads the leader's project)", it->sc[SC_CH], g_sc[SC_CH]);
+                it->a = it->mode = g_nChKnown;
+                return 1;
+            }
         }
         logmsg("STRUCT a structure op made at count %d reached this FL at %ld: it crossed another one; %s", it->sc[kind], g_sc[kind],
                g_isLeader ? "skipped (its sender loads the leader's project)" : "loading the leader's project");
@@ -6944,15 +6972,15 @@ static LRESULT CALLBACK getMsgHook(int code, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_KEYDOWN:
             g_focusHwnd = msg->hwnd;
             g_lastInput = GetTickCount();
-            plugin_input(msg->hwnd);
+            plugin_input(msg->hwnd, 1);
             break;
         case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MOUSEWHEEL: case WM_KEYUP:
         case WM_SYSKEYDOWN: case WM_LBUTTONDBLCLK:
             g_lastInput = GetTickCount();
-            plugin_input(msg->hwnd);
+            plugin_input(msg->hwnd, 0);
             break;
         case WM_MOUSEMOVE:
-            if (msg->wParam & (MK_LBUTTON | MK_RBUTTON)) { g_lastInput = GetTickCount(); plugin_input(msg->hwnd); }   // drags
+            if (msg->wParam & (MK_LBUTTON | MK_RBUTTON)) { g_lastInput = GetTickCount(); plugin_input(msg->hwnd, 0); }   // drags
             break;
         case WM_FL_OPENPROJ:
             if (msg->hwnd != g_mainForm) break;

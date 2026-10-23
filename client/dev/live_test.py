@@ -172,6 +172,36 @@ def t_vst():
     rec_set(a, pid, (rec_get(a, pid) + 3000) % 65536)
     check('VST param 0', lambda: rec_get(a, pid), lambda: rec_get(b, pid), wait=4)
 
+# A knob's "Type in value..." box (TNameEditForm) is a top-level window of its own: typing a value there is work in
+# the plugin window it came from, so that plugin gets checked again (a state-only value, like the sampler's time
+# stretch, went out late). Here: a pattern insert's rename box stands in for it (its pattern op holds flim's tasks
+# until it closes, so the check comes after).
+def t_typein():
+    import ctypes
+    if not has_plug(a, 1, 0): return
+    u = ctypes.windll.user32
+    def checks(pos): return [l for l in log_since(pos, A) if 'PLUGFOCUS: window' in l and ' is fx 1/0' in l]
+    slot = fx_slot(a, 1, 0); show = va(a, a.q(a.q(slot) + 0xE0)); a.call(show, slot, 1); time.sleep(2)
+    win = [k for p, h, c, ti in fl.windows((A,)) for k, cc in [(h, c)] + fl.children(h) if cc == 'TPluginForm' and u.IsWindowVisible(k)]
+    if not win: print('   (no plugin window: typein skipped)'); return
+    pos = os.path.getsize(LOG); fl.post_click(win[0])
+    check('typein: a click in the plugin window checks it', lambda: len(checks(pos)) > 0, lambda: True, wait=10)
+    time.sleep(1); pos = os.path.getsize(LOG)
+    def typer():
+        for _ in range(40):
+            time.sleep(0.25)
+            for q, h, c, t in fl.windows((A,)):
+                if c == 'TNameEditForm':
+                    tgt = next((k for k, cc in fl.children(h) if 'Edit' in cc), h)
+                    for ch in 'ABC':
+                        u.PostMessageW(tgt, 0x100, ord(ch), 0); u.PostMessageW(tgt, 0x102, ord(ch.lower()), 0); u.PostMessageW(tgt, 0x101, ord(ch), 0)
+                        time.sleep(0.2)
+                    time.sleep(0.5); u.PostMessageW(h, 0x10, 0, 0); return
+    threading.Thread(target=typer, daemon=True).start()
+    patop(a, 0x118, 3, 0, 0, 0, 0)
+    check('typein: typing in its box checks it again', lambda: len(checks(pos)) > 0, lambda: True, wait=10)
+    a.call(show, slot, 0)
+
 def t_vst_remove():
     if not os.path.exists(VST_FST): return
     time.sleep(5)                                               # let the editor FL opened on load finish starting
@@ -771,6 +801,18 @@ def t_auto_remove():
     src = srcs[min(1, len(srcs) - 1)]
     a.call(0xf832b0, src, src | 0xffff)                         # FL's delete of a source's links
     check('automation links removed: gone on B too', lambda: links(a), lambda: links(b), wait=10)
+def t_auto_both():                                              # both make a clip at the same moment: the two chan.adds
+    n = len(chans(a))                                           # cross; the leader keeps B's after its own (it was lost)
+    go = threading.Event()
+    def mk(p, t): go.wait(); p.call(0x1191a50, t, 1, 0, 1, 1)
+    th = [threading.Thread(target=mk, args=(a, mix_id(7, 0x1fc0))), threading.Thread(target=mk, args=(b, mix_id(8, 0x1fc0)))]
+    for t in th: t.start()
+    go.set()
+    for t in th: t.join()
+    check('two clips at once: both kept', lambda: (len(chans(a)), len(chans(b))), lambda: (n + 2, n + 2), wait=20)
+    check('two clips at once: same channels', lambda: chan_names(a), lambda: chan_names(b), wait=10)
+    check('two clips at once: both linked', lambda: links(a), lambda: links(b), wait=10)
+    check('two clips at once: B\'s clip has its link', lambda: sorted(set(l[0] >> 16 for l in links(a)) & {n, n + 1}), lambda: [n, n + 1], wait=0)
 
 # FL's "Move down" on a track's first effect swaps two slot objects inside the track (sub_1233B30); flim
 # took slot 0's object for the track and replayed it as a track deleted and inserted.

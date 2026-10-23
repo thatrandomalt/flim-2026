@@ -528,6 +528,12 @@ Now:
   an editor every key-up or wheel turn anywhere counted as work in it: kHs Gate went out 20 times in a
   minute with the fake user typing. A click is checked once, `PLUGFOCUS_IDLE_MS` after the work stops
   (or every `PLUGFOCUS_LONG_MS` while it goes on); it used to be checked at once and again after.
+- A knob's "Type in value..." box is a `TNameEditForm`, a top-level window of its own, as are FL's
+  context menus (`#32768`) and message boxes. Input there now counts as work in the plugin window the
+  last press came from (`plugin_input`'s `fromPlug`; a key-up elsewhere doesn't end it, as it lands
+  wherever the focus is). Before, a typed value that moves no watched param (the sampler's time stretch)
+  only went out with the next click in that plugin: the check after the right-click ran while the box
+  was still open and found nothing (`live_test` `typein`).
 - Working in a kHs plugin's window used to send it at each check (and the other FL reloaded it: a
   glitch): the hash couldn't tell its zip times from an edit, and the first open of its editor after a
   load moved its size in the plugin record by a pixel. Both are left out now ("Window state" and "Zip
@@ -653,6 +659,13 @@ made before a structure change reached them still names channels / tracks by the
   a crossing too (they apply the leader's op at a count it wasn't made for), so all end up with the
   leader's lists. In a test run the member had the leader's project 60 ms after the crossing, instead
   of 30 s+ through the safety net.
+  Skipping lost the member's change: two people making an automation clip at the same moment (FL's
+  "Create automation clip" appends a channel) ended with only the leader's clip. Now the leader keeps a
+  crossing `chan.add` that appended at the end when everything it did to channels since was appends too
+  (the `g_scLog` maps: identity plus a new last channel) and no mixer change came between: it goes after
+  the leader's own ("added after them"), and the member's re-sync brings it back. Its links come in the
+  op's "lk" and a load makes their source the channel it loads into (`linkfix_cb`), so it stays linked.
+  Anything else crossing is still skipped (`live_test` `auto_both`).
 - One cross-kind case: a new channel (`chan.add`) made before a mixer change it hadn't seen. An
   automation channel's link names a mixer track by number. Only the FL receiving the channel can tell
   (the mixer op crosses nothing on the other side), so it re-syncs, and if it is the leader, it sends
