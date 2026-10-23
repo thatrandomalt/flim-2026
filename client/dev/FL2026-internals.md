@@ -721,6 +721,36 @@ made before a structure change reached them still names channels / tracks by the
   tracks, found only by the safety net or not at all. After them, seeds 11–15 converged, and crossings
   were re-synced at once. Note order within the same position can differ between FLs, so
   `stress_both` compares notes as sets.
+- **A channel's mixer target is a param whose value is a track number.** FL's
+  `channels.setTargetFxTrack` (Python API `sub_D5BF70`, its work in `sub_D5BE90`) writes REC id
+  `channel base + 8` (`CH_TARGET_SUB`), one of the channel params flim syncs. A channel's saved state
+  carries it too: FL's loader sets the target from the state. A mixer track move renumbers the target in
+  every FL, and a quick burst of moves (Shift + mouse wheel over an insert, or the keyboard shortcut) left
+  numbers from one FL's numbering landing in the other's after it had moved again: the channel was routed
+  to another insert (`live_test.py target_move` reproduced it: A 4, B 5). Now:
+  - `slots_rebase` renumbers a target's seen value with the move, so FL's own renumbering isn't an edit;
+  - `sc_rebase` maps a target param's value through the mixer changes it hadn't seen (gone track: master);
+  - after loading a peer's channel state made before mixer changes here, `do_load` maps the target the
+    loader set (`sc_mix_map_value`).
+- **Params never went through `sc_rebase`.** `drain_queue_mainthread` applies `T_PARAM` inline instead of
+  through `run_task`, so a param edit made before a structure change wasn't moved at all. It now runs the
+  same `mix_struct` flush and `sc_rebase` as `run_task` before applying.
+- Shift + mouse wheel moves in the channel rack (FL's move selected, `MOVECHAN`) and the playlist (move
+  selected playlist tracks `sub_12EB580(arrangement, direction, track: -1 = the selected one)`; a track is
+  selected by its byte at `+0xe5`; `EEPLTrackUpMenuClick` passes -1 / track -1) stay in step in quick
+  bursts, also with both people at once (`live_test.py chan_wheel`, `pl_wheel`). Playlist track moves
+  travel as names, colors and clips of the tracks involved.
+- Not synced: a playlist track's link (`+0xd8` type: 1 audio track linked to a mixer track, 3 instrument
+  track linked to a channel; `+0xdc` the track / channel). Linking itself doesn't travel, so moving a
+  linked track can't carry it either.
+- **Project number** (`g_projEpoch`, `"ep"` on every op next to `"sc"`). The leader counts the projects
+  it sends (`send_project`); a member takes the number of the one it receives. An op made before the
+  project an FL has (or is loading) is dropped there ("SYNC an edit made before project N ... dropped").
+  When the leader sent everyone its project (a crossing), a member's edit already on its way was applied
+  by the leader after its snapshot, but wiped on the member by the load. Both now lose that one edit.
+- The mixer's last track ("Current") keeps a live mute that FL's save / load doesn't: after a reload the
+  member's differs from the leader's live one. The safety net doesn't count it; `stress_both` compares
+  mutes without it.
 - `resync` allows one re-sync per `RESYNC_MS` (10 s). A second crossing caught 6 s after a re-sync was
   simply dropped, and the member stayed out of step until the safety net (whose own valve then waited
   too, about 2 minutes). Now one asked for inside the window is kept (`g_resyncPending`) and sent when

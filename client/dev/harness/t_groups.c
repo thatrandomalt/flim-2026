@@ -265,6 +265,11 @@ int main(void) {
         CHECK(!sc_rebase(&it));
         it.id = (3u << 16) | 5u; SC(21, 11, 30);                    // made after both: as it is
         CHECK(sc_rebase(&it) && it.id == ((3u << 16) | 5u));
+        it.id = (3u << 16) | CH_TARGET_SUB; it.v = 4; SC(21, 10, 30);   // a channel routed to track 4 -> track 5 (the
+        CHECK(sc_rebase(&it) && it.id == ((3u << 16) | CH_TARGET_SUB) && it.v == 5);   // value is a track number)
+        it.v = 0; SC(21, 10, 30);                                   // master stays master
+        CHECK(sc_rebase(&it) && it.v == 0);
+        CHECK(sc_mix_map_value(4, 10) == 5 && sc_mix_map_value(2, 10) == 2 && sc_mix_map_value(4, 11) == 4);
         memset(&it, 0, sizeof(it));
         it.type = T_META; it.peer = 1; SC(20, 10, 30);
         it.path = _strdup("{\"t\":\"op\",\"op\":{\"kind\":\"meta.set\",\"e\":\"rt\",\"i\":4,\"r\":[[0,12800],[3,100],[5,7]]}}");

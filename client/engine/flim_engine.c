@@ -108,6 +108,10 @@ static wchar_t g_flBuild[32];      // FLEngine_x64.dll's file version
 #define GLOBAL_ID(sub)        (0x40000000u + (sub))
 #define MUTE_ID(t)            (0xF0000000u | (uint32_t)(t))
 #define IS_MUTE_ID(id)        (((id) & 0xFFF00000u) == 0xF0000000u)
+// A channel's mixer target (FL's channels.setTargetFxTrack writes it): a param whose VALUE is a mixer track
+// number. Mixer track changes renumber it (FL does, on every FL); a value sent before one is mapped through it.
+#define CH_TARGET_SUB         8
+#define IS_CH_TARGET(id)      ((id) < 0x70000000u && ((id) >> 16) < MAX_CH && ((id) & 0xFFFFu) == CH_TARGET_SUB)
 #define POLL_MS      30
 #define LOCK_IDLE_MS 600           // release a param lock after this much idle
 
@@ -352,11 +356,18 @@ static __declspec(thread) int t_msgSc[SC_N] = { -1, -1, -1 };   // ... and the "
 // Main thread changes them (sc_done). -1: not known (a member until the leader's project comes; an older
 // leader's project has none).
 static volatile LONG g_sc[SC_N] = { 0, 0, 0 };
+// Project number: the leader counts the projects it sends (send_project), a member takes the number of the one
+// it got (on_project_load); every op carries its sender's ("ep"). An op made before the project an FL has (or is
+// loading) is dropped there: the leader applied a member's edit after its snapshot while the member's load
+// wiped it, and the two differed until the safety net. Now both lose that one edit.
+static volatile LONG g_projEpoch = 0;
+static __declspec(thread) int t_msgEp = -1;
 static void sc_done(int kind, const int *from, int n);
 static void sc_done_patop(int k, const int *pats, int n, int delta, int target);
 static void pat_sigs_take(int k, const int *pats, int n);
 static void ulock_release_moved(const char *pre1, const char *pre2, const int *from, int n);
 static void sc_done_del(int k, int n0);
+static uint32_t sc_mix_map_value(uint32_t v, int from);
 static void sc_done_add(int k, int n0);
 static volatile LONG g_peerQueued = 0;     // such tasks still waiting in the queue
 static volatile LONG g_structGen;          // (with the units below)
@@ -599,6 +610,8 @@ static void slots_rebase(const int *chFrom, int nch, const int *mixFrom, int nmi
         if (!rebase_slot_id(s->id, chFrom != NULL, chToNew, mixFrom != NULL, mixToNew, &nid)) continue;
         ns = *s;
         ns.id = nid;
+        if (mixFrom && IS_CH_TARGET(nid) && ns.last != REC_NONE)   // FL renumbered the target too: not an edit
+            ns.last = ns.last < MAX_MIX && mixToNew[ns.last] >= 0 ? (uint32_t)mixToNew[ns.last] : 0;
         InterlockedIncrement(&ns.gen);
         ns.echoAt = 0;
         g_slots[w] = ns;
@@ -1613,6 +1626,15 @@ static void do_load(const QItem *it) {
     free(in);
     u->inst = plugin_inst(obj);                 // ours: the structure scan must not report it back
     if (it->unit == U_CH) meta_take_channel(it->a, mh0);   // the name / color it brought: known now, a rename after it is an edit
+    if (it->unit == U_CH && it->peer && it->sc[SC_MIX] >= 0 && g_sc[SC_MIX] > it->sc[SC_MIX]) {
+        // FL's loader set the channel's mixer target from the state: a track number as its sender had them,
+        // before mixer track changes this FL has done since. Through them (like a target param, sc_rebase).
+        uint32_t id = ((uint32_t)it->a << 16) | CH_TARGET_SUB, t = read_value(id), nt;
+        if (t != REC_NONE && (nt = sc_mix_map_value(t, it->sc[SC_MIX])) != t) {
+            write_value(id, nt);
+            logmsg("LOAD channel %d: its mixer target %u is track %u here (moved since the state was made)", it->a, t, nt);
+        }
+    }
     // The load moved this unit's params; take them as the new truth right away
     // (instead of ignoring local edits for seconds), plus a short window for
     // plugins that update params asynchronously after a state load.
@@ -4019,8 +4041,9 @@ static void send_project(const unsigned char *d, size_t n, const wchar_t *name) 
     int len = sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"project.load\",\"name\":\"%s\",\"data\":\"", esc);
     b64enc(d, (int)n, m + len);
     strcat_s(m, cap, "\"}}");
+    InterlockedIncrement(&g_projEpoch);                       // (stamped on it: the members take it)
     ws_send_samples(m, d, n);
-    logmsg("PROJECT sent %S (%zu bytes)", (name && *name) ? name : L"(untitled)", n);
+    logmsg("PROJECT sent %S (%zu bytes, project %ld)", (name && *name) ? name : L"(untitled)", n, g_projEpoch);
 }
 
 // A snapshot carries no solo of ours: each track gets its own mute state back and loses the solo.
@@ -6032,6 +6055,20 @@ static void sc_done_patop(int k, const int *pats, int n, int delta, int target) 
     sc_done(SC_PAT, from, MAX_PAT);
     pat_rebase(from);
 }
+// A mixer track number as it was at mixer count `from`, as it is now (a gone track: master); as it is if a
+// change since has no map.
+static uint32_t sc_mix_map_value(uint32_t v, int from) {
+    LONG e, now = g_sc[SC_MIX];
+    int j;
+    if (from < 0 || now < 0 || from >= now || now - from > SC_LOG) return v;
+    for (e = from; e < now; e++) if (g_scLog[SC_MIX][e % SC_LOG].sc != e || g_scLog[SC_MIX][e % SC_LOG].n < 0) return v;
+    for (e = from; e < now && v; e++) {
+        const ScEnt *s = &g_scLog[SC_MIX][e % SC_LOG];
+        for (j = 0; j < s->n && s->from[j] != (int)v; j++) {}
+        v = j < s->n ? (uint32_t)j : 0;
+    }
+    return v;
+}
 // one channel deleted at k (of n0) / added at k (n0 before it)
 static void sc_done_del(int k, int n0) {
     static int from[MAX_CH];
@@ -6068,7 +6105,7 @@ static int meta_kind(const char *m) {
 static int names_mix_tracks(const QItem *it) {
     switch (it->type) {
     case T_MIXSTRUCT: case T_ADDCH: return 1;
-    case T_PARAM:   return it->id >= 0x70000000u;
+    case T_PARAM:   return it->id >= 0x70000000u || IS_CH_TARGET(it->id);
     case T_LOAD: case T_FXCLEAR: return it->unit == U_FX;
     case T_META:    return meta_kind(it->path) == SC_MIX;
     }
@@ -6192,6 +6229,8 @@ static int sc_rebase(QItem *it) {
             case T_PARAM:
                 if (!rebase_slot_id(it->id, k == SC_CH, chToNew, k == SC_MIX, mixToNew, &nid)) gone = 1;
                 else it->id = nid;
+                if (!gone && k == SC_MIX && IS_CH_TARGET(it->id))   // the track it routes to (a gone one: master)
+                    it->v = it->v < (uint32_t)cap && toNew[it->v] >= 0 ? (uint32_t)toNew[it->v] : 0;
                 break;
             case T_LOAD: case T_FXCLEAR:
                 if (it->a < 0 || it->a >= cap || toNew[it->a] < 0) gone = 1;
@@ -6446,6 +6485,9 @@ static void drain_queue_mainthread(void) {
             if (g_qh != g_qt) wake_main();
             break;
         }
+        // (params don't go through run_task: the same structure handling as there, sc_rebase included)
+        if (it.peer && it.sc[SC_MIX] >= 0 && g_sc[SC_MIX] >= 0 && names_mix_tracks(&it) && mix_layout_changed()) mix_struct();
+        if (!sc_rebase(&it)) { g_runAt = 0; continue; }
         Slot *s = slot_by_id(it.id);
         if (s && it.mode == 2 && s->applied != it.v) continue;
         if (s) {
@@ -7579,6 +7621,14 @@ static void handle_msg(const char *m) {
             if (e == q) { t_msgSc[0] = t_msgSc[1] = t_msgSc[2] = -1; break; }
             q = *e == ',' ? e + 1 : e;
         }
+    }
+    t_msgEp = -1;
+    int_after(m, NULL, "\"ep\":", &t_msgEp);
+    if (strstr(m, "\"kind\":\"project.load\"")) {
+        if (!g_isLeader && t_msgEp >= 0) InterlockedExchange(&g_projEpoch, t_msgEp);   // (on_project_load: the one we load)
+    } else if (t_msgEp >= 0 && t_msgEp < g_projEpoch && op_changes_song(m)) {
+        logmsg("SYNC an edit made before project %ld (the sender's FL was on %d) dropped: that project replaced it", g_projEpoch, t_msgEp);
+        return;
     }
     t_peerMsg++; handle_msg_body(m); t_peerMsg--;
     t_msgSc[0] = t_msgSc[1] = t_msgSc[2] = -1;
@@ -9021,9 +9071,9 @@ static char *sc_stamp(const char *msg) {
     size_t n;
     char *out;
     if (c < 0 || x < 0 || p < 0 || strncmp(msg, OP, sizeof(OP) - 1) != 0) return NULL;
-    n = strlen(msg) + 48;
+    n = strlen(msg) + 80;
     out = (char *)malloc(n);
-    sprintf_s(out, n, "%s\"sc\":[%ld,%ld,%ld],%s", OP, c, x, p, msg + sizeof(OP) - 1);
+    sprintf_s(out, n, "%s\"sc\":[%ld,%ld,%ld],\"ep\":%ld,%s", OP, c, x, p, (LONG)g_projEpoch, msg + sizeof(OP) - 1);
     return out;
 }
 

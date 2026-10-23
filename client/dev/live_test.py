@@ -218,6 +218,67 @@ def t_patop_split():                                            # notes on two c
     check('pattern split: notes', lambda: [sorted(unsel(notes(a, p))) for p in range(1, 12)], lambda: [sorted(unsel(notes(b, p))) for p in range(1, 12)], wait=4)
     check('pattern split: its map matched', lambda: any('isn\'t old pattern' in l for l in log_since(pos, A) + log_since(pos, B)), lambda: False, wait=0)
 
+# A channel routed to a mixer track; the track then moved in a quick burst of single steps (Shift + mouse
+# wheel over it, or the keyboard shortcut). The target is a channel param whose value is a track number.
+def target(p, ch): return rec_get(p, (ch << 16) | 8)
+def t_target_move():
+    rec_set(a, (0 << 16) | 8, 3)
+    check('channel target set', lambda: target(b, 0), lambda: 3, wait=4)
+    seq = [(3, 1), (4, 1), (5, 1), (6, 1), (7, -1), (6, -1), (5, -1), (4, 1), (5, 1)]   # one wheel notch each
+    for t, d in seq:
+        mix_move(a, t, d); time.sleep(0.06)
+    check('channel target after the moves (A)', lambda: target(a, 0), lambda: 6, wait=3)
+    check('channel target after the moves (B)', lambda: target(b, 0), lambda: target(a, 0), wait=5)
+    time.sleep(4)                                               # (and it stays: nothing echoes back)
+    check('channel target stays', lambda: target(b, 0), lambda: target(a, 0), wait=0)
+    for t, d in [(6, -1), (5, -1)]:                             # B moves it back while A's still fresh
+        mix_move(b, t, d); time.sleep(0.06)
+    check('channel target after B\'s moves', lambda: target(a, 0), lambda: target(b, 0), wait=5)
+
+# Shift + mouse wheel over a channel / a playlist track header moves it one step per notch: quick bursts.
+def chan_step(p, i, d):                                         # FL's move selected (4 up / 5 down) with only channel i
+    for k, c in enumerate(chans(p)): p.w(c + 0x32c, bytes([k == i]))
+    p.call(0x1042800, p.q(p.g(0x15e14a0)), 4 if d < 0 else 5, p.d(p.g(0x15e3a60)), 1)
+def rack(p): return [(n, target(p, i)) for i, n in enumerate(chan_names(p))]
+def t_chan_wheel():
+    while len(chans(a)) < 5: add_named(a, len(chans(a)), 'W%d' % len(chans(a))); time.sleep(1.5)
+    for i in range(len(chans(a))): rec_set(a, (i << 16) | 8, i + 1)   # each routed to its own track
+    time.sleep(3)
+    check('rack before', lambda: rack(a), lambda: rack(b), wait=4)
+    for i, d in [(0, 1), (1, 1), (2, 1), (3, -1), (2, -1)]:      # channel 0 down 3, back up 2
+        chan_step(a, i, d); time.sleep(0.06)
+    check('rack after A\'s burst', lambda: rack(a), lambda: rack(b), wait=6)
+    def burst_b():
+        for i, d in [(4, -1), (3, -1), (2, -1)]: chan_step(b, i, d); time.sleep(0.06)
+    t = threading.Thread(target=burst_b); t.start()
+    for i, d in [(0, 1), (1, 1)]: chan_step(a, i, d); time.sleep(0.06)
+    t.join()
+    check('rack after both at once', lambda: rack(a), lambda: rack(b), wait=30)
+
+def pl_names(p, n=8): return [ustr(p, p.q(arr(p) + t * 0x114 + 0x24)) for t in range(1, n + 1)]
+def pl_step(p, t, d):                                           # FL's move selected playlist tracks: up (-1) / down (+1)
+    for k in range(1, 12): p.w(arr(p) + k * 0x114 + 0xe5, bytes([k == t]))   # (+0xe5: selected)
+    p.call(0x12eb580, arr(p), d & 0xffffffff, t)                # (arr, direction, track: -1 = the selected one)
+def t_pl_wheel():
+    for t in range(1, 7): a.call(0x12e60f0, arr(a), t, a.mkstr('T%d' % t), 0x404040 + t)
+    ca = a.q(arr(a) + 0x14); vmt = a.q(ca); rec = a.alloc(0x58)
+    a.call(va(a, a.q(vmt + 16)), ca, rec)
+    for t in (2, 4):                                            # a clip on tracks 2 and 4
+        a.w(rec, struct.pack('<IIIH', 96 * t, 0x5000 + 1, 384, 500 - t)); a.call(va(a, a.q(vmt + 8)), ca, rec)
+    a.call(0xe39560, a.q(a.g(PLFORM)))
+    time.sleep(3)
+    pl = lambda p: (pl_names(p), sorted(r[:16] for r in clips(p)[1]))
+    check('playlist before', lambda: pl(a), lambda: pl(b), wait=5)
+    for t, d in [(2, 1), (3, 1), (4, 1), (5, -1), (4, -1)]:      # track 2 down 3, back up 2
+        pl_step(a, t, d); time.sleep(0.06)
+    check('playlist after A\'s burst', lambda: pl(a), lambda: pl(b), wait=8)
+    def burst_b():
+        for t, d in [(6, -1), (5, -1)]: pl_step(b, t, d); time.sleep(0.06)
+    th = threading.Thread(target=burst_b); th.start()
+    for t, d in [(1, 1), (2, 1)]: pl_step(a, t, d); time.sleep(0.06)
+    th.join()
+    check('playlist after both at once', lambda: pl(a), lambda: pl(b), wait=30)
+
 def t_patlen():
     a.w(pat_rec(a, 2) + 0x44, struct.pack('<i', 4 * a.d(a.g(0x15e25f8))))   # 4 beats of PPQ
     a.call(0x12d2350, 2)
@@ -811,7 +872,9 @@ def t_stress_both():
     for t in ts: t.join()
     def state(p):                                           # (notes at the same spot: in either order)
         s = shared_state(p); s['notes'] = [sorted(unsel(notes(p, pt))) for pt in range(1, 16)]
-        s['patterns'] = pat_names(p, 15); return s
+        s['patterns'] = pat_names(p, 15)
+        s['mutes'] = s['mutes'][:-1]                        # (not the Current track: FL's save / load doesn't keep its mute)
+        return s
     time.sleep(6)
     try:                                                    # what differs before any re-sync repairs it
         sa, sb = state(a), state(b)
