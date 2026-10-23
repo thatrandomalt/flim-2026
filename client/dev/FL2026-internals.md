@@ -605,9 +605,113 @@ the structure op:
   track or channel moved still goes out, and a state check queued before a move is tried again.
 - The poll thread doesn't re-read values while a structure change is pending or after it; what bumps
   `g_structGen` without a map (a project load, an order FL didn't follow) re-reads itself (`slots_reread`).
-- Not covered: pattern ops still re-take note, clip and pattern baselines, and two people changing
-  structure in the same instant can still send an edit by an old number (the safety net below reloads
-  the member then).
+- An edit read just as a structure change landed could still be lost in two places, both fixed:
+  - the poll thread used to take a changed value as seen (`Slot.last`) before checking whether the tick
+    was clean; when a rebase came in between, the rollback couldn't find the renamed slot and the value
+    was never sent. Now a change becomes seen only once the tick is clean (`slot_take`, and the commit
+    after the `g_structGen` check);
+  - a `T_METASNAP` (name / color / route send) is queued by number; run after a renumbering it looked at
+    the wrong entity and sent nothing. Now, if `g_structGen` moved since it was queued, `do_metasnap`
+    hands every unsent edit of that kind back to `scan_meta` (`g_mAt = 1`), which queues them again
+    under their new numbers.
+  - a new channel's / track's values aren't watched until `rescan` adds them (`RESCAN_MS`), and `rescan`
+    takes what they are then as their start: an edit made on a just-inserted track was never sent.
+    `chan_rebase` / `mix_rebaseline` now ask for a rescan on the next tick (`g_rescanNow`).
+- A plain param edit whose lock the server refused (someone else held that knob) was dropped by the
+  server but stayed in the editor's FL. The first edit of a lock now keeps its old value (`Slot.undo`,
+  `hasUndo`, as plugin params already did), and a refusal applies it back ("lock denied ...: local edit
+  put back").
+- Pattern ops carry note and pattern-name / marker baselines through their map too (`pat_rebase`, from
+  `sc_done_patop`): a note edit made in the same moment still goes out. Clips are still re-taken: their
+  baseline is one hash for the whole arrangement. The moves (`0x108`, `0x110`) and split (`0x120`) have
+  no known map and still re-take everything.
+
+### Structure ops that cross (the structure count)
+Two people changing channels or mixer tracks in the same instant each change their own list first, and
+the other's op lands on a list it wasn't made for. Example from a test run: A inserts a mixer track
+while B moves one. The track count is the same either way, so the `n0` checks pass, and the lists
+differ from then on: every later edit by number lands on different tracks. Separately, an edit someone
+made before a structure change reached them still names channels / tracks by their old numbers.
+- `g_sc[SC_CH | SC_MIX | SC_PAT]` count the structure ops of each kind this FL has applied, its own
+  included: channels (`chan.add`, `chan.del`, `chan.order`), mixer tracks (`mix.struct`), patterns
+  (`pat.op`). `sc_done` counts on send (`chan_struct_local`, `mix_struct`, `patop_common`) and on
+  apply (`do_addch`, `do_delch`, `do_order`, `do_mixstruct`, `do_patop`); `run_task` counts one that
+  failed here too. The server orders all ops, so FLs in step count alike. `ws_send` /
+  `ws_send_samples` stamp every op with the sender's counts:
+  `{"t":"op","op":{"sc":[ch,mix,pat],...}}` (`sc_stamp`). No server change was needed.
+- One count per kind, not one for all: kinds don't conflict, so two FLs may apply a channel op and a
+  mixer op in either order. With a single count, both then held the same number for different
+  histories. A's next channel op reached B at B's count, and B missed that it crossed B's own channel
+  op (the leader saw the crossing and skipped it; B drifted until the safety net). Found by
+  `stress_both`.
+- A structure op whose sender's count of its kind isn't ours crossed another one (`sc_rebase`). The
+  leader skips it. A member re-syncs (loads the leader's project). Everyone who already applied it sees
+  a crossing too (they apply the leader's op at a count it wasn't made for), so all end up with the
+  leader's lists. In a test run the member had the leader's project 60 ms after the crossing, instead
+  of 30 s+ through the safety net.
+- One cross-kind case: a new channel (`chan.add`) made before a mixer change it hadn't seen. An
+  automation channel's link names a mixer track by number. Only the FL receiving the channel can tell
+  (the mixer op crosses nothing on the other side), so it re-syncs, and if it is the leader, it sends
+  everyone its project.
+- A change made in this FL counts only once flim sends it (`do_struct`, a poll tick or more after FL
+  did it). Channel ops from peers are applied through the known list (`g_chKnown`), so a local channel
+  change not yet sent doesn't matter to them. Mixer ops and edits name FL's current tracks, though.
+  A peer's op that names mixer tracks (`names_mix_tracks`) is therefore preceded by any track change
+  still waiting here (`run_task` calls `mix_struct`), then moved through it or found crossed.
+- Each applied structure op is logged with its map (`g_scLog[kind]`, `SC_LOG` = 64 each, new number ->
+  old). A peer's edit with an older count of a kind it names is moved through the ones of that kind it
+  hadn't seen, before it runs:
+  - `T_PARAM` through `rebase_slot_id`;
+  - `T_LOAD` / `T_FXCLEAR` by channel or track;
+  - `T_NOTES`: its pattern; the channel filter and each note's channel;
+  - `T_CLIPS`: each clip's channel (`ch << 16 | 0x5000` at `+4`) or pattern (`(0x5000 + p) << 16 |
+    0x5000`), clips of gone ones left out (`recs_remap`);
+  - `T_META`: `"i"` (channel, mixer track or pattern, by its tag) and a route's targets
+    (`meta_path_remap`).
+
+  An edit for something a structure op removed is dropped. A log entry with no map of a kind the edit
+  names (FL didn't do it as sent, a pattern move), or a newer `sc` (a crossing this FL skipped), leaves
+  the edit as it is.
+- Pattern op maps (`patop_map`, measured on FL 2026 with uniquely named patterns): `Insert(p)` puts an
+  empty pattern at `p`, later ones one up; `Clone(pats)` puts each copy right after its source (sources
+  in ascending order); `Delete(pats)` closes the gap. The probe couldn't run Delete itself (its
+  confirmation is modal); removing and closing the gap is the only thing it can do to the numbers.
+- Members start at -1 (unknown) and take the counts from the leader's `project.load` when it runs
+  (`T_PROJLOAD`, in queue order). Without counts (an older flim on either side) all of this is skipped
+  and things work as before.
+- Locks name units by number too: `plug:ch:<i>`, `plug:fx:<t>:<s>`, `pat:<p>:<ch>`. Kept across a
+  renumbering, a lock held for one channel then sat on whichever channel moved into that number. Found
+  in the full suite: B held `plug:ch:13`, channels shifted, the leader's new automation channel landed
+  at 13, its settled state was refused (lock) and reverted, so B never got it. Now when numbers
+  actually move (`chan_rebase`, `mix_rebaseline`, `pat_rebase` / a pattern op with no map), each FL
+  gives back its own locks of that kind (`ulock_release_moved`). The next edit takes them again.
+- A channel rename made within 2 s around a remote state loading into that channel was taken as
+  coming from the load (`absorbUntil` in `scan_meta`) and never sent. An automation channel's state
+  doesn't carry its name, so the load doesn't touch it. Found in the full suite: A renamed B's new
+  automation channel just as B's state for it loaded. Now `do_load` hashes the channel's name and
+  color before the load, and takes them as known after it only if the load changed them
+  (`meta_take_channel`); the window is gone.
+- After a remote name / color apply, `meta_absorb` took every entity's current value as known (FL's
+  setters touch others: a mixer rename renames linked playlist tracks), which swallowed a rename made
+  since the scanner's last look. Now only what changed during the apply (`meta_absorb_begin` hashes
+  before it; user edits run on the same main thread, so none land inside it).
+- `notes_apply` leaves out notes for channels the FL doesn't have. FL calls them "invalid notes" and
+  stops the next load of the project with a modal about them.
+- Tests:
+  - `client/dev/harness/t_groups.c`: moving and dropping edits; a crossing skipped, ops of other kinds
+    not; the pattern op maps; notes, clips and pattern names through a pattern insert.
+  - `live_test.py stress_both`: A and B on a thread each, at the same moment (channels, mixer
+    tracks, pattern insert / clone, notes, names, volumes, mutes); `FLIM_STRESS_SEED` sets the seed.
+
+  Before these changes, seeds 11–15 all ended with volumes, names, mutes and routes on different
+  tracks, found only by the safety net or not at all. After them, seeds 11–15 converged, and crossings
+  were re-synced at once. Note order within the same position can differ between FLs, so
+  `stress_both` compares notes as sets.
+- Not covered:
+  - edits made before a pattern move / split go as they are (no map);
+  - edits a member makes while it loads the leader's project (a crossing's re-sync takes 1–3 s) are
+    absorbed by the load. `stress_both` keeps editing through a re-sync and sometimes needs the safety
+    net afterwards for that.
 - **A pattern's length is cached** in its record: `+0x48` / `+0x4c` / `+0x50` (length in ticks), `+0x54`,
   `+0x5c` (60 when empty). `UpdatePatternLength(p, flag)` (`PATLENUPD`, `sub_12D17A0`) works them out from
   the notes and markers. Its last step, `sub_E4B5F0(playlist, p, old, new)`, resizes the pattern's

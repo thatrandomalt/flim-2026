@@ -633,7 +633,9 @@ def t_auto_add():                                               # another link o
     a.call(0xf825b0, L)                                         # FL's sort, as its own "add target link" does
     check('automation link added: reached B', lambda: links(a), lambda: links(b), wait=10)
 def t_auto_remove():
-    src = sorted(set(l[0] for l in links(a)))[1]
+    srcs = sorted(set(l[0] for l in links(a)))
+    if not srcs: print('   (no automation links: skipped)'); return
+    src = srcs[min(1, len(srcs) - 1)]
     a.call(0xf832b0, src, src | 0xffff)                         # FL's delete of a source's links
     check('automation links removed: gone on B too', lambda: links(a), lambda: links(b), wait=10)
 
@@ -701,6 +703,14 @@ def t_stress():
             except Exception as e: print('   %s on %s: %s' % (op.__name__, 'A' if p is a else 'B', e))
             time.sleep(rnd.choice((0.03, 0.1, 0.25, 0.5)))
         time.sleep(5)
+        try:                                                    # what differs before any re-sync repairs it
+            sa, sb = shared_state(a), shared_state(b)
+            for key in sa:
+                x, y = sa[key], sb[key]
+                if x == y: continue
+                d = [(i, x[i], y[i]) for i in range(len(x)) if x[i] != y[i]][:6] if len(x) == len(y) else (x, y)
+                print('   (%s: %s differ at first: %r)' % (phase, key, d))
+        except RuntimeError: pass
         sa = sb = None
         t0 = time.time()
         while time.time() - t0 < 90:                            # a re-sync (the leader's project again) takes a while
@@ -709,6 +719,59 @@ def t_stress():
             if sa == sb: break
             time.sleep(3)
         for key in sa: check('stress (%s): %s' % (phase, key), lambda key=key: sa[key], lambda key=key: sb[key], wait=0)
+
+# A and B at the same moment (a thread each): structure ops cross and edits travel by old numbers (the
+# structure count, FL2026-internals.md). Converging may take one reload of the leader's project.
+def t_stress_both():
+    import random
+    src = next(iter(notes(a, 1)), bytes(24))
+    def worker(p, odd, seed):
+        rnd = random.Random(seed)
+        pid = B if odd else A
+        def inner(): return rnd.randrange(1, mix_count(p) - 1)
+        def note():
+            r = bytearray(src); struct.pack_into('<I', r, 0, rnd.randrange(64) * 24); struct.pack_into('<H', r, 6, rnd.randrange(len(chans(p))))
+            pat = rnd.randrange(1, 12)
+            arr = p.call(0x12d16e0, pat, 0); rec = p.alloc(24); p.w(rec, bytes(r)); p.call(va(p, p.q(p.q(arr) + 8)), arr, rec)
+            p.call(PATLENUPD, pat, 1)
+        ops = [lambda k: (lambda c: p.call(va(p, p.q(p.q(c) + 0x70)), c, p.mkstr('S%d' % k)))(rnd.choice(chans(p))),
+               lambda k: add_named(p, rnd.randrange(len(chans(p)) + 1), 'Add%d' % k),
+               lambda k: len(chans(p)) > 3 and p.call(0x1004a60, rnd.randrange(len(chans(p))), 0, 3),
+               lambda k: p.call(MUTE, inner(), rnd.randrange(2)),
+               lambda k: p.call(MIXNAME, inner(), p.mkstr('M%d' % k), 1),
+               lambda k: rec_set(p, mix_id(inner(), 0x1fc0), rnd.randrange(12800)),
+               lambda k: mix_insert(p, inner()),
+               lambda k: mix_move(p, rnd.randrange(2, mix_count(p) - 2), rnd.choice((-1, 1))),
+               lambda k: note(), lambda k: note(),
+               lambda k: (closer(pid), patop(p, 0x118, rnd.randrange(1, 10), 0, 0, 0, 0)),          # pattern insert
+               lambda k: (closer(pid), patop(p, 0xe8, (lambda buf: (p.w(buf, struct.pack('<i', rnd.randrange(1, 10))), buf)[1])(p.alloc(8)), 0, 0, 0, 0))]   # clone
+        for k in range(int(os.environ.get('FLIM_STRESS_OPS', '40'))):
+            try: rnd.choice(ops)(k * 2 + odd)
+            except Exception as e: print('   op on %s: %s' % ('AB'[odd], e))
+            time.sleep(rnd.choice((0.0, 0.02, 0.05, 0.15)))
+    seed = int(os.environ.get('FLIM_STRESS_SEED', '11'))
+    ts = [threading.Thread(target=worker, args=(p, odd, seed + odd * 1000)) for odd, p in ((0, a), (1, b))]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    def state(p):                                           # (notes at the same spot: in either order)
+        s = shared_state(p); s['notes'] = [sorted(unsel(notes(p, pt))) for pt in range(1, 16)]
+        s['patterns'] = pat_names(p, 15); return s
+    time.sleep(6)
+    try:                                                    # what differs before any re-sync repairs it
+        sa, sb = state(a), state(b)
+        for key in sa:
+            x, y = sa[key], sb[key]
+            if x != y:
+                d = [(i, x[i], y[i]) for i in range(len(x)) if x[i] != y[i]][:4] if len(x) == len(y) else (x, y)
+                print('   (stress_both: %s differ at first: %r)' % (key, d))
+    except RuntimeError: pass
+    t0 = time.time()
+    while time.time() - t0 < 90:
+        try: sa, sb = state(a), state(b)
+        except RuntimeError: time.sleep(3); continue
+        if sa == sb: break
+        time.sleep(3)
+    for key in sa: check('stress_both: ' + key, lambda key=key: sa[key], lambda key=key: sb[key], wait=0)
 
 # A song saved while soloed has the solo in its file. The leader opening it is soloed (FL's doing); the
 # others get it without, every track enabled (opening it sets every track's +0x1c: what unsolo gives back).

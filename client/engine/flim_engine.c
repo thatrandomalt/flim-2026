@@ -156,6 +156,8 @@ static void meta_rebaseline(void);
 static void meta_rebase_type(int type);
 static void meta_rebase_patterns(void);
 static void meta_rebase_channels(void);
+static uint64_t meta_chan_hash(int ch);
+static void meta_take_channel(int ch, uint64_t before);
 static void digest_tick(DWORD now);
 static void pat_len_recalc(int p);
 static void meta_remap(int type, const int *from, int n);
@@ -235,6 +237,7 @@ static HINSTANCE g_hinst = NULL;
 #define NOTES_DATA    0x08         // note array: record pointer
 #define NOTES_COUNT   0x14         //             record count (u32); element size (0x18) at +0x10
 #define NOTE_SIZE     24
+#define NOTE_CH_OFS   0x06         // note record: u16 channel (FLP event 224 "rack channel")
 #define NOTE_SEL_OFS  0x13         // byte: low bits = note color, bit 0x80 = SELECTED (client-only, never synced)
 #define NOTE_SEL_BIT  0x80
 #define NOTEARR_VA    FLVA(NOTEARR) // NoteArray(pattern, create) -> note array object
@@ -334,11 +337,26 @@ typedef struct {
     int peer;                // someone else's op: channel index a is in the list as everyone has it (g_chKnown)
                              // when it runs, after the ops before it
     LONG gen;                // g_structGen when queued: a state check queued before channels moved is stale
+    int sc[3];               // someone else's op: the sender's structure counts when it sent it (-1: none; sc_rebase)
 } QItem;
 static void run_task_inner(const QItem *it);
 static QItem g_q[QCAP];
 static int g_qh = 0, g_qt = 0;
 static __declspec(thread) int t_peerMsg;   // inside handle_msg: what gets queued is someone else's op
+enum { SC_CH, SC_MIX, SC_PAT, SC_N };       // what a structure op renumbers: channels, mixer tracks, patterns
+static __declspec(thread) int t_msgSc[SC_N] = { -1, -1, -1 };   // ... and the "sc" that op carried
+// Structure counts, one per kind: how many channel (chan.add / chan.del / chan.order), mixer track (mix.struct)
+// and pattern (pat.op) structure ops this FL has applied, its own included. Ops of one kind are applied in the
+// same order everywhere, so in-step FLs count alike; each op carries its sender's counts ("sc":[ch,mix,pat]).
+// (One count for all kinds matched on two FLs whose histories differed once kinds applied in either order.)
+// Main thread changes them (sc_done). -1: not known (a member until the leader's project comes; an older
+// leader's project has none).
+static volatile LONG g_sc[SC_N] = { 0, 0, 0 };
+static void sc_done(int kind, const int *from, int n);
+static void sc_done_patop(int k, const int *pats, int n);
+static void ulock_release_moved(const char *pre1, const char *pre2, const int *from, int n);
+static void sc_done_del(int k, int n0);
+static void sc_done_add(int k, int n0);
 static volatile LONG g_peerQueued = 0;     // such tasks still waiting in the queue
 static volatile LONG g_structGen;          // (with the units below)
 // The detailed log (flim.ini log_detailed, "Detailed log" in flim's window): every op sent and received,
@@ -593,6 +611,12 @@ static void slots_rebase(const int *chFrom, int nch, const int *mixFrom, int nmi
     g_nslot = w;
     LeaveCriticalSection(&g_slotLock);
 }
+// Poll thread: v (read under generation g0) is what this slot is now, unless an apply or a rebase came between.
+static void slot_take(Slot *s, LONG g0, uint32_t v) {
+    EnterCriticalSection(&g_slotLock);
+    if (s->gen == g0) s->last = v;
+    LeaveCriticalSection(&g_slotLock);
+}
 // No map to carry them through (a project load, an order FL didn't follow): every value is taken as it is.
 static void slots_reread(void) {
     int k;
@@ -771,6 +795,7 @@ static void enqueue(const QItem *it) {
         QItem *q = &g_q[g_qt];
         *q = *it;
         q->peer = q->peer || t_peerMsg;
+        for (i = 0; i < SC_N; i++) q->sc[i] = t_peerMsg ? t_msgSc[i] : -1;
         q->gen = g_structGen;
         if (q->peer) InterlockedIncrement(&g_peerQueued);
         g_qt = nt;
@@ -1550,6 +1575,7 @@ static void do_load(const QItem *it) {
     size_t n = 0, m = 0;
     unsigned char *in = read_file(it->path, &n), *own;
     LinkFix lf;
+    uint64_t mh0;                                // the channel's name / color before the load (meta_take_channel)
     lf.base = unit_rec_base(it->unit, it->a, it->b); lf.has = 0;
     if (in) flp_walk(in, n, linkfix_cb, &lf);
     own = unit_save(it->unit, it->a, it->b, &m);
@@ -1574,6 +1600,7 @@ static void do_load(const QItem *it) {
     int r = -1;
     if ((it->mode & LOAD_LINKS) || lf.has) links_drop(it->unit, it->a, it->b);   // the state's links replace this unit's
     progress_quiet(1);
+    mh0 = it->unit == U_CH ? meta_chan_hash(it->a) : 0;
     g_flimLoad = 1;
     __try { r = loadpreset_call(g_loadPreset, w, unit_mask(it->unit), obj, LOADPRESET_NOEDITOR); }
     __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("LOAD faulted unit=%d %d/%d", it->unit, it->a, it->b); }
@@ -1584,6 +1611,7 @@ static void do_load(const QItem *it) {
     if (in) phload_note(obj, in, n, u->editGen);
     free(in);
     u->inst = plugin_inst(obj);                 // ours: the structure scan must not report it back
+    if (it->unit == U_CH) meta_take_channel(it->a, mh0);   // the name / color it brought: known now, a rename after it is an edit
     // The load moved this unit's params; take them as the new truth right away
     // (instead of ignoring local edits for seconds), plus a short window for
     // plugins that update params asynchronously after a state load.
@@ -1689,6 +1717,7 @@ static void do_addch(const QItem *it) {
         int i;
         for (i = 0; i <= nk; i++) from[i] = i < a ? i : i == a ? -1 : i - 1;
         chan_rebase(from, nk + 1);
+        sc_done(SC_CH, from, nk + 1);
     }
     logmsg("CHAN added index %d (remote)", a);
     {   // its state loads on a later tick, into this channel wherever it is by then
@@ -1718,6 +1747,7 @@ static void do_delch(const QItem *it) {
         int i;
         for (i = 0; i < nk - 1; i++) from[i] = i < a ? i : i + 1;
         chan_rebase(from, nk - 1);
+        sc_done(SC_CH, from, nk - 1);
     }
     logmsg("CHAN deleted index %d (remote)", a);
 }
@@ -1838,7 +1868,7 @@ static void do_order(const QItem *it) {
         plug_agreed_reset(1, 0);
     }
     known_from_list();
-    if (ok) chan_rebase(from, n);
+    if (ok) { chan_rebase(from, n); sc_done(SC_CH, from, n); }
     else {                                            // no map to carry baselines through: take them as they are
         slots_reread();
         notes_rebaseline();
@@ -1882,6 +1912,7 @@ static void chan_struct_local(void **items, int n, DWORD now) {
         if (index_of(items, n, K[k]) >= 0 && index_of(g_chDead, g_nChDead, K[k]) < 0) continue;   // (dead: its memory is a new channel's)
         sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"chan.del\",\"ch\":%d,\"n0\":%d}}", k, nk);
         ws_send(m);
+        sc_done_del(k, nk);
         logmsg("CHAN deleted locally: index %d (sent)", k);
         units_shift_after_delete(k, nk);
         memmove(K + k, K + k + 1, sizeof(void *) * (size_t)(nk - k - 1));
@@ -1897,6 +1928,7 @@ static void chan_struct_local(void **items, int n, DWORD now) {
         for (i = 0; i < nc; i++) len += sprintf_s(m + len, sizeof(m) - len, "%s%d", i ? "," : "", from[i]);
         strcat_s(m, sizeof(m), "]}}");
         ws_send(m);
+        sc_done(SC_CH, from, nc);
         units_permute(from, nc);
         logmsg("CHAN list reordered locally (sent chan.order)");
     }
@@ -1906,6 +1938,7 @@ static void chan_struct_local(void **items, int n, DWORD now) {
         g_chU[i].inst = plugin_inst(items[i]);
         g_chU[i].identAt = now;
         chan_add_send(i, k);
+        sc_done_add(i, k);
         added[na++] = i;
         k++;
     }
@@ -2141,7 +2174,15 @@ static void notes_apply(int p, const unsigned char *recs, unsigned n, int g) {
             // top down, so the indices still to delete stay valid
             for (k = (int)nold - 1; k >= 0; k--)
                 if (g < 0 || (int)rec_group(1, old + (size_t)k * NOTE_SIZE) == g) g_noteDel(a, k, 0);
-            for (i = 0; i < n; i++) add(a, in + (size_t)i * NOTE_SIZE);
+            {   // never a note on a channel this FL doesn't have (an edit made before channels changed that
+                // couldn't be moved along): FL calls those invalid and asks about them in a modal on load
+                void **items; int nc = chan_list(&items), bad = 0;
+                for (i = 0; i < n; i++) {
+                    if (*(uint16_t *)(in + (size_t)i * NOTE_SIZE + NOTE_CH_OFS) >= nc) { bad++; continue; }
+                    add(a, in + (size_t)i * NOTE_SIZE);
+                }
+                if (bad) logmsg("NOTES pattern %d: %d notes for channels this FL doesn't have, left out", p, bad);
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("NOTES apply faulted pat %d", p); }
     LeaveCriticalSection(note_lock());
@@ -2814,6 +2855,15 @@ static void meta_rebase_type(int type) {
 }
 static void meta_rebase_patterns(void) { meta_rebase_type(M_PAT); meta_rebase_type(M_PMARK); }
 static void meta_rebase_channels(void) { meta_rebase_type(M_CHAN); }
+// A remote state loaded into channel ch: the name / color it brought are known, if it brought any (before:
+// meta_chan_hash before the load). A rename made here before it, that the load didn't touch, is still an edit.
+static uint64_t meta_chan_hash(int ch) { return ch >= 0 && ch < MAX_CH ? meta_hash(M_CHAN, ch) : 0; }
+static void meta_take_channel(int ch, uint64_t before) {
+    uint64_t h = meta_chan_hash(ch);
+    if (!h || h == before) return;
+    g_mSeen[M_CHAN][ch] = g_mHash[M_CHAN][ch] = h;
+    g_mAt[M_CHAN][ch] = 0;
+}
 
 // Channels / tracks renumbered: each entity keeps the hashes (and a pending local edit) it had under its
 // old number, so an edit made in the same moment still goes out. A new entity is taken as it is.
@@ -2845,12 +2895,22 @@ static void meta_rebaseline(void) {
 
 // After applying a remote change: FL's setters touch other entities too (a mixer rename
 // renames its linked playlist tracks). Take those as known, except where a local edit is pending.
-static void meta_absorb(void) {
+// Only what changed during the apply (meta_absorb_begin before it): the user's edits run on the same
+// main thread, so none lands inside it, while one made since the scanner's last look (META_SCAN_MS)
+// was taken as known too and never sent.
+static uint64_t g_mPre[M_NTYPES][META_MAX];
+static void meta_absorb_begin(void) {
     int t, i;
     for (t = 0; t < M_NTYPES; t++)
+        for (i = 0; i < meta_cap(t); i++) g_mPre[t][i] = meta_hash(t, i);
+}
+static void meta_absorb(void) {
+    int t, i;
+    uint64_t h;
+    for (t = 0; t < M_NTYPES; t++)
         for (i = 0; i < meta_cap(t); i++) {
-            if (g_mAt[t][i] || g_mSeen[t][i] != g_mHash[t][i]) continue;
-            g_mSeen[t][i] = g_mHash[t][i] = meta_hash(t, i);
+            if (g_mAt[t][i] || g_mSeen[t][i] != g_mHash[t][i] || (h = meta_hash(t, i)) == g_mPre[t][i]) continue;
+            g_mSeen[t][i] = g_mHash[t][i] = h;
         }
 }
 
@@ -2869,8 +2929,7 @@ static void meta_absorb(void) {
 // the ones that made a loop, and a bus with many senders went over META_BULK and wasn't sent at all.
 // The poll thread sends nothing while the order differs from the last known one either (values read
 // mid-move would go out by number and be moved a second time by the others' replay).
-// ponytail: ops someone else sends in the same instant still carry the old numbers and can land on
-// the neighbouring track; rebasing in-flight ops on structural ones would fix that.
+// Ops someone else sent before this change reached them carry the old numbers: sc_rebase moves them along.
 #define MIXINS_VA     FLVA(MIXINS) // InsertMixerTracks(pos, count, flags): 1 undo step, 2 select + scroll, 4 dock
                                    //   side from the neighbour (the menu passes 7); count <= 502 - tracks
 #define MIXDEL_VA     FLVA(MIXDEL) // DeleteMixerTracks(int dynarray, last index, flags): 2 delete (sends through a
@@ -2957,8 +3016,11 @@ static void mix_rebaseline(const int *from, int n) {
     slots_rebase(NULL, 0, from, n);                          // values, names, colors and sends go with their tracks,
     meta_remap(M_MIX, from, n);                              // so edits made in the same moment still go out
     meta_remap(M_ROUTE, from, n);
+    ulock_release_moved("plug:fx:", NULL, from, n);
     mix_known_take();
     InterlockedIncrement(&g_structGen);
+    InterlockedExchange(&g_rescanNow, 1);                    // a new track's values watched now: an edit made on it
+                                                             // before the next periodic rescan was taken as its start
 }
 
 static int int_in(const int *a, int n, int v) { int i; for (i = 0; i < n; i++) if (a[i] == v) return 1; return 0; }
@@ -3003,6 +3065,7 @@ static void mix_struct(void) {
         free(m);
     }
     logmsg("MIX tracks changed locally: %d deleted, %d inserted%s, %d -> %d tracks (sent)", nd, ni, moved ? ", moved" : "", n0, n);
+    sc_done(SC_MIX, from, n);
     mix_rebaseline(from, n);
 }
 
@@ -3097,6 +3160,7 @@ static void do_mixstruct(const QItem *it) {
     logmsg("MIX tracks changed (remote): %d deleted, %d inserted, %d -> %d tracks%s", nd, ni, have, mix_count(),
            mix_count() == want ? "" : " (NOT THE SENDER'S COUNT)");
     mix_rebaseline(from, mix_count());
+    if (mix_count() == want) sc_done(SC_MIX, from, want);
 }
 
 // {"t":"op","op":{"kind":"meta.set","e":"<tag>","i":N, ...fields}}; name = base64 UTF-16LE.
@@ -3177,8 +3241,15 @@ static char *meta_json(int t, int i) {
 }
 
 static void do_metasnap(const QItem *it) {
-    int t = it->unit, i = it->a;
-    uint64_t h = meta_hash(t, i);
+    int t = it->unit, i = it->a, j;
+    uint64_t h;
+    if (it->gen != g_structGen) {
+        // renumbered since it was queued (meta_remap moved the edit's baseline along): the index is stale, so
+        // every unsent edit of this kind goes back to scan_meta, which queues it again under its new number
+        for (j = 0; j < meta_cap(t); j++) if (g_mSeen[t][j] != g_mHash[t][j] && !g_mAt[t][j]) g_mAt[t][j] = 1;
+        return;
+    }
+    h = meta_hash(t, i);
     if (!h || h == g_mHash[t][i]) return;
     char *m = meta_json(t, i);
     if (!m) return;
@@ -3204,11 +3275,9 @@ static void scan_meta(DWORD now) {
             if (!g_mAt[t][i] || now - g_mAt[t][i] < META_SETTLE_MS) continue;
             g_mAt[t][i] = 0;
             if (g_mSeen[t][i] == g_mHash[t][i]) continue;
-            if (!g_mSeen[t][i] || !g_mHash[t][i] ||   // gone / just appeared: structural sync handles it
-                (t == M_CHAN && (LONG)(now - g_chU[i].absorbUntil) < 0)) {
-                g_mHash[t][i] = g_mSeen[t][i];        // new / remotely loaded channel: its name came with its state
-                continue;
-            }
+            // gone / just appeared: structural sync handles it. (A remotely loaded channel's name is taken as
+            // known when the load ends, meta_take_channel: a time window after it swallowed real renames.)
+            if (!g_mSeen[t][i] || !g_mHash[t][i]) { g_mHash[t][i] = g_mSeen[t][i]; continue; }
             pend[np++] = t * META_MAX + i;
         }
     if (np >= META_BULK) {
@@ -3349,6 +3418,7 @@ static void do_meta(const QItem *it) {
     }
     if ((q = strstr(m, "\"c\":")) != NULL) { color = (uint32_t)strtoul(q + 4, NULL, 10); hasC = 1; }
     hasL = int_after(m, NULL, "\"l\":", &len);
+    meta_absorb_begin();
     __try {
         switch (t) {
         case M_MIX: {
@@ -4397,8 +4467,18 @@ static uint64_t patop_common(int k, void *self, uint64_t a, uint64_t b, uint64_t
         sprintf_s(m + o, sizeof(m) - o, "],\"a\":%d,\"b\":%d,\"c\":%u}}", (int)c, (int)d, (unsigned)(uint16_t)e);
         ws_send(m);
         logmsg("PATTERN op sent: %.200s", m);
+        {   // counted, and the baselines carried through it (sc_done_patop)
+            static int pl[MAX_PAT];
+            int np = 1, ok = 1;
+            if (k == PATOP_INSERT) pl[0] = (int)a;
+            else {
+                np = (int)b + 1 < MAX_PAT ? (int)b + 1 : MAX_PAT;
+                __try { memcpy(pl, (const int *)a, sizeof(int) * (size_t)np); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+            }
+            if (ok) sc_done_patop(k, pl, np);
+            else { sc_done(SC_PAT, NULL, 0); notes_rebaseline(); }
+        }
     }
-    notes_rebaseline();
     return r;
 }
 #define PATOP_HOOK(k) static uint64_t patop_hook##k(void *s, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) \
@@ -4487,11 +4567,12 @@ static void do_patop(const QItem *it) {
     __try {
         if (k == PATOP_INSERT) g_patOrig[k](proj, (uint64_t)(int64_t)pats[0], 0, 0, 0, 0);
         else g_patOrig[k](proj, (uint64_t)pats, (uint64_t)(int64_t)(n - 1), (uint64_t)(int64_t)a, (uint64_t)(int64_t)b, (uint64_t)(uint16_t)c);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("PATTERN op 0x%x faulted", slot); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("PATTERN op 0x%x faulted", slot); slot = -1; }
     InterlockedDecrement(&g_patDepth);
     InterlockedExchange(&g_mbAuto, 0);
     InterlockedExchange(&g_patRemote, 0);
-    notes_rebaseline();
+    if (slot >= 0) sc_done_patop(k, pats, n);               // (faulted: run_task counts it; baselines re-taken)
+    else notes_rebaseline();
     logmsg("PATTERN op applied: slot 0x%x, %d patterns (first %d)", slot, n, pats[0]);
 }
 
@@ -4538,8 +4619,7 @@ static void ustate_set(UState *s, const unsigned char *d, unsigned n, size_t rec
     s->n = n; s->known = 1;
 }
 
-// ---- groups inside a unit: a note's channel, a clip's playlist track ----
-#define NOTE_CH_OFS   0x06         // note record: u16 channel (FLP event 224 "rack channel")
+// ---- groups inside a unit: a note's channel (NOTE_CH_OFS), a clip's playlist track ----
 #define CLIP_TRK_OFS  0x0c         // clip record: u16 playlist track, reversed: 499 = track 1 (FLP event 233)
 static size_t rec_size(int isPat) { return isPat ? NOTE_SIZE : CLIP_SIZE; }
 static unsigned rec_group(int isPat, const unsigned char *r) { return *(const uint16_t *)(r + (isPat ? NOTE_CH_OFS : CLIP_TRK_OFS)); }
@@ -4664,7 +4744,9 @@ static void chan_rebase(const int *from, int n) {
     slots_rebase(from, n, NULL, 0);
     meta_remap(M_CHAN, from, n);
     notes_remap(from, n);
+    ulock_release_moved("plug:ch:", "pat:", from, n);
     InterlockedIncrement(&g_structGen);
+    InterlockedExchange(&g_rescanNow, 1);           // (as mix_rebaseline: a new channel's values watched now)
 }
 
 // "pat:<p>[:<ch>]" / "clips:<a>[:<track>]" -> unit + group (-1 = whole unit). 0 = not such a key.
@@ -4787,6 +4869,25 @@ static void ulock_release_idle(DWORD now) {
             ws_send(m);
             l->mine = 0; l->granted = 0;
         }
+    }
+    LeaveCriticalSection(&g_ulockLock);
+}
+
+// Channels / tracks / patterns renumbered (from: new -> old) and our locks name them by number: a lock kept
+// would hold someone else's channel at that number (who then couldn't send it, and reverted). Ours under
+// these prefixes go back; the next edit takes them again under the new numbers.
+static void ulock_release_moved(const char *pre1, const char *pre2, const int *from, int n) {
+    int i;
+    char m[96];
+    for (i = 0; from && i < n && (from[i] < 0 || from[i] == i); i++) {}
+    if (from && i == n) return;                             // nothing moved (added or removed at the end); NULL: not known
+    EnterCriticalSection(&g_ulockLock);
+    for (i = 0; i < g_nulocks; i++) {
+        ULock *l = &g_ulocks[i];
+        if (!l->mine || (strncmp(l->key, pre1, strlen(pre1)) != 0 && (!pre2 || strncmp(l->key, pre2, strlen(pre2)) != 0))) continue;
+        sprintf_s(m, sizeof(m), "{\"t\":\"lock_release\",\"key\":\"%s\"}", l->key);
+        ws_send(m);
+        l->mine = 0; l->granted = 0;
     }
     LeaveCriticalSection(&g_ulockLock);
 }
@@ -5725,6 +5826,301 @@ static void sel_restore(void) {
     if (moved) logmsg("SELECT a peer's change moved our selection / pattern: put back (pattern %d)", best > 0 ? best : now);
 }
 
+// ---- structure ops that cross ----
+// Two people changing channels or mixer tracks in the same instant each change their own list first and
+// the other's op lands on a list it wasn't made for (an insert here and a move there: the same count, so the
+// n0 checks pass, and the lists differ from then on). And an edit someone made before a structure change
+// reached them still names channels / tracks by their old numbers. The structure counts (g_sc, one per kind:
+// channels, mixer tracks, patterns) tell both: a structure op whose sender's count of its kind isn't ours
+// crossed another one: the leader skips it, a member loads the leader's project (everyone who has it applied
+// sees a crossing too, so all end up with the leader's lists). Kinds don't cross each other (a channel deleted
+// while a mixer track moved: each FL can do them in either order), except a new channel, whose automation
+// link names a mixer track. An edit with an older count is moved through the structure ops of that kind it
+// hadn't seen, which the log keeps (new number -> old). Without counts (an older flim) all of it works as before.
+#define SC_LOG 64
+typedef struct { LONG sc; int n; int *from; } ScEnt;        // n -1: not known (FL didn't do it as sent, a move)
+static ScEnt g_scLog[SC_N][SC_LOG];                         // per kind, by count
+static int sc_struct(int type) { return type == T_ADDCH || type == T_DELCH || type == T_ORDER || type == T_MIXSTRUCT || type == T_PATOP; }
+static int sc_kind(int type) { return type == T_MIXSTRUCT ? SC_MIX : type == T_PATOP ? SC_PAT : SC_CH; }
+
+// Main thread: a structure op applied (or sent); from (new number -> old, -1 = new) NULL if not known.
+static void sc_done(int kind, const int *from, int n) {
+    ScEnt *e;
+    LONG sc = g_sc[kind];
+    if (sc < 0) return;
+    e = &g_scLog[kind][sc % SC_LOG];
+    free(e->from);
+    e->from = NULL;
+    e->sc = sc; e->n = from ? n : -1;
+    if (from) { e->from = (int *)malloc(sizeof(int) * (size_t)(n > 0 ? n : 1)); memcpy(e->from, from, sizeof(int) * (size_t)n); }
+    InterlockedExchange(&g_sc[kind], sc + 1);
+}
+// A pattern op (k: PATOP_SLOT index) on pats[0..n). Insert, clone and delete have known maps (checked on FL
+// 2026: Insert(p) puts an empty pattern at p; Clone puts each copy right after its source); the moves and
+// split are counted without one (edits made before them go as they are).
+static int int_cmp(const void *a, const void *b) { int x = *(const int *)a, y = *(const int *)b; return (x > y) - (x < y); }
+
+// Patterns renumbered (from: new number -> old, -1 = new): each pattern's note hashes, agreed / pending /
+// base states and name / marker baselines follow it, so a note edit made in the same moment still goes
+// out. New patterns are taken as they are. Clips are re-taken (one hash for the whole arrangement).
+static void pat_rebase(const int *from) {
+    static uint64_t h[MAX_PAT], sn[MAX_PAT];
+    static DWORD at[MAX_PAT];
+    static UState L[MAX_PAT], P[MAX_PAT], B[MAX_PAT];
+    static unsigned char used[MAX_PAT];
+    int p, f;
+    memcpy(h, g_patHash, sizeof(h)); memcpy(sn, g_patSeen, sizeof(sn)); memcpy(at, g_patChangedAt, sizeof(at));
+    memset(used, 0, sizeof(used));
+    EnterCriticalSection(&g_ulockLock);
+    memcpy(L, g_patLast, sizeof(L)); memcpy(P, g_patPend, sizeof(P)); memcpy(B, g_patBase, sizeof(B));
+    for (p = 1; p < MAX_PAT; p++) {
+        f = from[p];
+        if (f >= 1 && f < MAX_PAT && !used[f]) {
+            used[f] = 1;
+            g_patHash[p] = h[f]; g_patSeen[p] = sn[f]; g_patChangedAt[p] = at[f];
+            g_patLast[p] = L[f]; g_patPend[p] = P[f]; g_patBase[p] = B[f];
+        } else {
+            g_patSeen[p] = g_patHash[p] = notes_hash(p); g_patChangedAt[p] = 0;
+            memset(&g_patLast[p], 0, sizeof(UState)); memset(&g_patPend[p], 0, sizeof(UState)); memset(&g_patBase[p], 0, sizeof(UState));
+        }
+    }
+    for (f = 1; f < MAX_PAT; f++) if (!used[f]) { free(L[f].d); free(P[f].d); free(B[f].d); }   // deleted
+    LeaveCriticalSection(&g_ulockLock);
+    for (p = 1; p < MAX_PAT; p++) if (from[p] < 1) pat_capture(p);
+    meta_remap(M_PAT, from, MAX_PAT);
+    meta_remap(M_PMARK, from, MAX_PAT);
+    ulock_release_moved("pat:", NULL, from, MAX_PAT);
+    clips_rebaseline();
+}
+
+// What a pattern op (k: PATOP_SLOT index) on pats[0..n) does to pattern numbers: from[new] = old, -1 = new.
+// Insert, clone and delete are known (checked on FL 2026: Insert(p) puts an empty pattern at p; Clone puts
+// each copy right after its source); 0 for the moves and split.
+static int patop_map(int k, const int *pats, int n, int *from) {
+    static int src[MAX_PAT];
+    int i, j, m = 0;
+    if (k == 2 || k == 3 || k == 5) return 0;
+    for (i = 0; i < MAX_PAT; i++) from[i] = i;
+    if (k == PATOP_INSERT) {
+        if (n < 1 || pats[0] < 1 || pats[0] >= MAX_PAT) return 0;
+        memmove(from + pats[0] + 1, from + pats[0], sizeof(int) * (size_t)(MAX_PAT - pats[0] - 1));
+        from[pats[0]] = -1;
+        return 1;
+    }
+    for (i = 0; i < n; i++) if (pats[i] >= 1 && pats[i] < MAX_PAT) src[m++] = pats[i];
+    qsort(src, m, sizeof(int), int_cmp);
+    if (k == 1) {                                               // delete: the rest close the gap
+        int w = 0;
+        for (i = 0; i < MAX_PAT; i++) if (!bsearch(&i, src, m, sizeof(int), int_cmp)) from[w++] = i;
+        for (; w < MAX_PAT; w++) from[w] = -1;
+    } else for (i = 0; i < m; i++) {                            // clone: a copy after each source
+        for (j = 0; j < MAX_PAT && from[j] != src[i]; j++) {}
+        if (j >= MAX_PAT - 1) break;
+        memmove(from + j + 2, from + j + 1, sizeof(int) * (size_t)(MAX_PAT - j - 2));
+        from[j + 1] = -1;
+    }
+    return 1;
+}
+
+// Main thread, after a pattern op ran here: counted (moves and split without a map), and the pattern
+// baselines carried through it (or re-taken).
+static void sc_done_patop(int k, const int *pats, int n) {
+    static int from[MAX_PAT];
+    if (!patop_map(k, pats, n, from)) { sc_done(SC_PAT, NULL, 0); notes_rebaseline(); ulock_release_moved("pat:", NULL, NULL, 0); return; }
+    sc_done(SC_PAT, from, MAX_PAT);
+    pat_rebase(from);
+}
+// one channel deleted at k (of n0) / added at k (n0 before it)
+static void sc_done_del(int k, int n0) {
+    static int from[MAX_CH];
+    int i;
+    for (i = 0; i < n0 - 1; i++) from[i] = i < k ? i : i + 1;
+    sc_done(SC_CH, from, n0 - 1);
+}
+static void sc_done_add(int k, int n0) {
+    static int from[MAX_CH];
+    int i;
+    for (i = 0; i <= n0; i++) from[i] = i < k ? i : i == k ? -1 : i - 1;
+    sc_done(SC_CH, from, n0 + 1);
+}
+
+static void task_free(QItem *it) {
+    switch (it->type) {
+    case T_LOAD: case T_ADDCH: DeleteFileA(it->path); free(it->path); break;
+    case T_META: case T_MIXSTRUCT: case T_PATOP: free(it->path); break;
+    case T_ORDER: case T_NOTES: case T_CLIPS: free(it->order); break;
+    }
+}
+
+// A meta.set's kind of number: channel (SC_CH), mixer track (SC_MIX: names, routes) or pattern (SC_PAT:
+// names, markers); -1: none (playlist tracks, arrangement markers, time signature).
+static int meta_kind(const char *m) {
+    const char *e = strstr(m, "\"e\":\"");
+    int t;
+    if (!e) return -1;
+    for (t = 0; t < M_NTYPES && strncmp(e + 5, M_TAG[t], 2) != 0; t++) {}
+    return t == M_CHAN ? SC_CH : t == M_MIX || t == M_ROUTE ? SC_MIX : t == M_PAT || t == M_PMARK ? SC_PAT : -1;
+}
+
+// Does a peer's task name mixer tracks by number? (run_task sends a track change still waiting here first)
+static int names_mix_tracks(const QItem *it) {
+    switch (it->type) {
+    case T_MIXSTRUCT: case T_ADDCH: return 1;
+    case T_PARAM:   return it->id >= 0x70000000u;
+    case T_LOAD: case T_FXCLEAR: return it->unit == U_FX;
+    case T_META:    return meta_kind(it->path) == SC_MIX;
+    }
+    return 0;
+}
+
+// Does a structure op of this kind renumber what this task names?
+static int sc_touches(const QItem *it, int kind) {
+    switch (it->type) {
+    case T_PARAM:   return kind != SC_PAT;
+    case T_LOAD: case T_FXCLEAR: return kind == (it->unit == U_FX ? SC_MIX : SC_CH);
+    case T_NOTES: case T_CLIPS: return kind != SC_MIX;
+    case T_META:    return kind == meta_kind(it->path);
+    }
+    return 0;
+}
+
+// A meta.set's numbers ("i", and a route's targets) through toNew; 0: its entity is gone.
+static int meta_path_remap(QItem *it, int cap, const int *toNew) {
+    const char *m = it->path, *e = strstr(m, "\"e\":\""), *pi = strstr(m, "\"i\":"), *p;
+    int i, route, ni, d, l;
+    size_t sz = strlen(m) + 32 + 4 * MAX_MIX;                  // (renumbered targets can be a digit longer)
+    char *out, *o;
+    if (!e || !pi) return 1;
+    route = strncmp(e + 5, M_TAG[M_ROUTE], 2) == 0;
+    i = atoi(pi + 4);
+    if (i < 0 || i >= cap || (ni = toNew[i]) < 0) return 0;
+    out = o = (char *)malloc(sz);
+    memcpy(o, m, (size_t)(pi - m)); o += pi - m;
+    o += sprintf_s(o, sz - (size_t)(o - out), "\"i\":%d", ni);
+    for (p = pi + 4; *p == '-' || isdigit((unsigned char)*p); p++) {}
+    if (route && (e = strstr(p, "\"r\":[")) != NULL) {       // [[target,level],...]: targets renumbered, gone ones out
+        int k = 0;
+        memcpy(o, p, (size_t)(e + 5 - p)); o += e + 5 - p;
+        for (p = e + 5; *p == '['; ) {
+            char *x;
+            d = (int)strtol(p + 1, &x, 10);
+            if (*x != ',') break;
+            l = (int)strtol(x + 1, &x, 10);
+            if (*x != ']') break;
+            p = x + 1;
+            if (*p == ',') p++;
+            if (d >= 0 && d < MAX_MIX && toNew[d] >= 0) o += sprintf_s(o, sz - (size_t)(o - out), "%s[%d,%d]", k++ ? "," : "", toNew[d], l);
+        }
+    }
+    strcpy_s(o, sz - (size_t)(o - out), p);
+    free(it->path);
+    it->path = out;
+    return 1;
+}
+
+// Records (notes: their channel; clips: the channel or pattern they play) through toNew; the ones whose
+// channel / pattern is gone are left out. Returns how many are left.
+static int recs_remap(unsigned char *r, int n, int isPat, int kind, const int *toNew, int cap) {
+    int k, w = 0;
+    size_t rs = isPat ? NOTE_SIZE : CLIP_SIZE;
+    for (k = 0; k < n; k++) {
+        unsigned char *x = r + k * rs;
+        int old = -1, neu;
+        if (isPat) old = *(uint16_t *)(x + NOTE_CH_OFS);
+        else {
+            uint32_t item = *(uint32_t *)(x + 0x04);
+            if ((item & 0xFFFFu) == 0x5000u) {
+                int hi = (int)(item >> 16);                     // ch << 16 | 0x5000, or (0x5000 + pattern) << 16 | 0x5000
+                old = kind == SC_CH ? (hi < 0x5000 ? hi : -1) : (hi >= 0x5000 ? hi - 0x5000 : -1);
+            }
+        }
+        if (old >= 0) {
+            if (old >= cap || (neu = toNew[old]) < 0) continue;
+            if (isPat) *(uint16_t *)(x + NOTE_CH_OFS) = (uint16_t)neu;
+            else *(uint32_t *)(x + 0x04) = ((uint32_t)(kind == SC_CH ? neu : 0x5000 + neu) << 16) | 0x5000u;
+        }
+        if (w != k) memmove(r + w * rs, x, rs);
+        w++;
+    }
+    return w;
+}
+
+// Before a peer's task runs (main thread): 0 = drop it (freed here).
+static int sc_rebase(QItem *it) {
+    static int chToNew[MAX_CH], mixToNew[MAX_MIX], patToNew[MAX_PAT];
+    static const int CAP[SC_N] = { MAX_CH, MAX_MIX, MAX_PAT };
+    int *const TONEW[SC_N] = { chToNew, mixToNew, patToNew };
+    int k, j, moved = 0;
+    LONG e, now;
+    if (!it->peer) return 1;
+    for (k = 0; k < SC_N; k++) if (it->sc[k] < 0 || g_sc[k] < 0) return 1;
+    if (sc_struct(it->type)) {
+        int kind = sc_kind(it->type);
+        if (it->sc[kind] == g_sc[kind]) {
+            if (it->type != T_ADDCH || it->sc[SC_MIX] == g_sc[SC_MIX]) return 1;
+            // a new channel made before a mixer change it hadn't seen (an automation channel's link names a track by
+            // number): only this FL can tell (that mixer change doesn't cross anything there), so whoever finds it
+            // re-syncs; the leader sends everyone its project
+            logmsg("STRUCT a new channel made at mixer count %d reached this FL at %ld: %s", it->sc[SC_MIX], g_sc[SC_MIX],
+                   g_isLeader ? "skipped, sending everyone the leader's project" : "loading the leader's project");
+            resync("a new channel crossed a mixer change");
+            task_free(it);
+            return 0;
+        }
+        logmsg("STRUCT a structure op made at count %d reached this FL at %ld: it crossed another one; %s", it->sc[kind], g_sc[kind],
+               g_isLeader ? "skipped (its sender loads the leader's project)" : "loading the leader's project");
+        if (!g_isLeader) resync("two structure changes crossed");
+        task_free(it);
+        return 0;
+    }
+    for (k = 0; k < SC_N; k++) {                               // each kind on its own (they don't renumber each other)
+        int *toNew = TONEW[k], cap = CAP[k], ok = 1;
+        now = g_sc[k];
+        if (!sc_touches(it, k) || it->sc[k] >= now || now - it->sc[k] > SC_LOG) continue;   // (newer: a crossing skipped here)
+        for (e = it->sc[k]; e < now && ok; e++) ok = g_scLog[k][e % SC_LOG].sc == e && g_scLog[k][e % SC_LOG].n >= 0;
+        if (!ok) continue;                                     // a map missing: as it is
+        for (e = it->sc[k]; e < now; e++) {
+            const ScEnt *s = &g_scLog[k][e % SC_LOG];
+            uint32_t nid;
+            int gone = 0;
+            for (j = 0; j < cap; j++) toNew[j] = -1;
+            for (j = 0; j < s->n; j++) if (s->from[j] >= 0 && s->from[j] < cap) toNew[s->from[j]] = j;
+            moved++;
+            switch (it->type) {
+            case T_PARAM:
+                if (!rebase_slot_id(it->id, k == SC_CH, chToNew, k == SC_MIX, mixToNew, &nid)) gone = 1;
+                else it->id = nid;
+                break;
+            case T_LOAD: case T_FXCLEAR:
+                if (it->a < 0 || it->a >= cap || toNew[it->a] < 0) gone = 1;
+                else it->a = toNew[it->a];
+                break;
+            case T_NOTES:
+                if (k == SC_PAT) {                              // its pattern
+                    if (it->a < 0 || it->a >= cap || toNew[it->a] < 0) gone = 1; else it->a = toNew[it->a];
+                    break;
+                }
+                if (it->b >= 0) { if (it->b >= cap || toNew[it->b] < 0) { gone = 1; break; } it->b = toNew[it->b]; }
+                it->mode = recs_remap((unsigned char *)it->order, it->mode, 1, SC_CH, toNew, cap);
+                break;
+            case T_CLIPS:                                       // (its group is a playlist track: not renumbered)
+                it->mode = recs_remap((unsigned char *)it->order, it->mode, 0, k, toNew, cap);
+                break;
+            case T_META:
+                gone = !meta_path_remap(it, cap, toNew);
+                break;
+            }
+            if (gone) {
+                logmsg("STRUCT an edit (task type %d) made before a structure change here is for something that change removed: dropped", it->type);
+                task_free(it);
+                return 0;
+            }
+        }
+    }
+    if (moved) logmsg("STRUCT an edit (task type %d) moved through %d structure change%s", it->type, moved, moved == 1 ? "" : "s");
+    return 1;
+}
+
 // A channel task queued before channels moved (a reorder, a delete) is for the channel it was queued
 // for, not for whatever now sits at its old index: a revert of channel 0 queued just before someone
 // moved channel 1 up would otherwise load channel 0's state (and name) over the moved channel.
@@ -5756,6 +6152,15 @@ static int task_rebind(QItem *it) {
 
 static void run_task(const QItem *in) {
     QItem copy = *in, *it = &copy;
+    LONG sc0;
+    if (it->peer && it->sc[SC_MIX] >= 0 && g_sc[SC_MIX] >= 0 && names_mix_tracks(it) && mix_layout_changed()) {
+        // tracks moved here and that isn't sent yet (do_struct hasn't run): it happened before this op came,
+        // so it goes out first and the op is moved through it (or crossed it)
+        logmsg("STRUCT a mixer track change made here goes out before a peer's op that names tracks");
+        mix_struct();
+    }
+    sc0 = sc_struct(it->type) ? g_sc[sc_kind(it->type)] : -1;
+    if (!sc_rebase(it)) return;
     if (!task_rebind(it)) return;
     int remoteHeavy = it->type == T_LOAD || it->type == T_ADDCH || it->type == T_DELCH || it->type == T_FXCLEAR;
     int remote = remoteHeavy || it->type == T_ORDER || it->type == T_PATOP || it->type == T_NOTES || it->type == T_NOTESYNC ||
@@ -5763,6 +6168,7 @@ static void run_task(const QItem *in) {
     if (remoteHeavy) wguard_begin();
     if (remote) sel_save();
     run_task_inner(it);
+    if (sc_struct(it->type) && sc0 >= 0 && g_sc[sc_kind(it->type)] == sc0) sc_done(sc_kind(it->type), NULL, 0);   // counted like everyone, even when it failed here
     if (remote) sel_restore();
     if (remoteHeavy) wguard_pass();
     if (remoteHeavy || it->type == T_ORDER || it->type == T_MIXSTRUCT || it->type == T_FXSYNC) g_linkQuiet = GetTickCount();
@@ -5782,7 +6188,13 @@ static void run_task_inner(const QItem *it) {
     case T_NOTESNAP: do_notesnap(it); break;
     case T_NOTES:  do_notes(it); free(it->order); break;
     case T_NOTESYNC: do_notesync(it); free(it->order); break;
-    case T_PROJLOAD: do_projload(it); free(it->path); break;
+    case T_PROJLOAD:                          // the leader's project: its structure count from here on
+        if (it->peer) {
+            int k;
+            for (k = 0; k < SC_N; k++) InterlockedExchange(&g_sc[k], it->sc[k]);
+            logmsg("STRUCT counts %d / %d / %d (the leader's project)", it->sc[0], it->sc[1], it->sc[2]);
+        }
+        do_projload(it); free(it->path); break;
     case T_PROJDONE: do_projdone(); break;
     case T_PROJSNAP: do_projsnap(); break;
     case T_CLIPSNAP: do_clipsnap(it); break;
@@ -6498,24 +6910,25 @@ static DWORD WINAPI pollThread(LPVOID p) {
                 continue;
             }
             if (IS_MUTE_ID(s->id) && !mute_settled(s, v, now)) continue;
-            EnterCriticalSection(&g_slotLock);
+            // A change becomes "seen" (last) only once this tick turns out clean (below): a structure change
+            // mid-tick renumbers the slot, and a value taken as seen there was never sent.
             uint32_t prev = s->last;
-            if (v != prev) s->last = v;
-            LeaveCriticalSection(&g_slotLock);
+            if (v != prev && (v == REC_NONE || prev == REC_NONE)) slot_take(s, g0, v);
             if (v != prev && v != REC_NONE && prev != REC_NONE) {
                 int unit, a, b;
                 Unit *u;
                 if (auto_target(s->id)) {               // a clip / controller drives it: each FL plays its own
                     static DWORD said = 0;
                     if (now - said > 10000) { said = now; logmsg("PARAM 0x%08x is automated: each FL plays its own, not synced", s->id); }
+                    slot_take(s, g0, v);
                     continue;
                 }
                 u = unit_of_id(s->id, &unit, &a, &b) ? unit_ptr(unit, a, b) : NULL;
-                if (u && now < u->suppressUntil) continue;   // caused by a remote state load
+                if (u && now < u->suppressUntil) { slot_take(s, g0, v); continue; }   // caused by a remote state load
                 // its plugin is being replaced here (the structure scan may not have seen it yet): the old
                 // plugin's params "changing" aren't edits, the new one's whole state goes out (SNAP_FORCE)
-                if (u && (u->identAt || plugin_inst(unit_obj(unit, a, b)) != u->inst)) continue;
-                if ((v == s->echo || v == s->applied) && now - s->echoAt < (DWORD)(IS_MUTE_ID(s->id) ? MUTE_FADE_MS : ECHO_MS)) continue;   // our apply (rounded, or late)
+                if (u && (u->identAt || plugin_inst(unit_obj(unit, a, b)) != u->inst)) { slot_take(s, g0, v); continue; }
+                if ((v == s->echo || v == s->applied) && now - s->echoAt < (DWORD)(IS_MUTE_ID(s->id) ? MUTE_FADE_MS : ECHO_MS)) { slot_take(s, g0, v); continue; }   // our apply (rounded, or late)
                 if (active < 0) active = input_recent(now);
                 g_changes[nc].s = s; g_changes[nc].prev = prev; g_changes[nc].v = v;
                 g_changes[nc].id = s->id; g_changes[nc].gen = g0;
@@ -6529,13 +6942,20 @@ static DWORD WINAPI pollThread(LPVOID p) {
             }
         }
         if (g_structGen != gen0 || chan_list_changed() || mix_count_changed() || mix_ids_hash() != mixH) {
-            // indices moved mid-tick: forget this tick's changes (moved mixer tracks show up whole next tick)
-            EnterCriticalSection(&g_slotLock);
-            for (i = 0; i < nc; i++) if (g_changes[i].s->id == g_changes[i].id && g_changes[i].s->gen == g_changes[i].gen &&
-                                        g_changes[i].s->last == g_changes[i].v) g_changes[i].s->last = g_changes[i].prev;
-            LeaveCriticalSection(&g_slotLock);
+            // indices moved mid-tick: forget this tick's changes; they're found again, under their new numbers
             Sleep(POLL_MS);
             continue;
+        }
+        {   // a clean tick: take the changes as seen; one whose slot an apply or a rebase touched meanwhile: next tick
+            int w = 0;
+            EnterCriticalSection(&g_slotLock);
+            for (i = 0; i < nc; i++)
+                if (g_changes[i].s->id == g_changes[i].id && g_changes[i].s->gen == g_changes[i].gen) {
+                    g_changes[i].s->last = g_changes[i].v;
+                    g_changes[w++] = g_changes[i];
+                }
+            LeaveCriticalSection(&g_slotLock);
+            nc = w;
         }
 
         // per-unit activity: remember it, and flag preset-sized bursts
@@ -6594,7 +7014,10 @@ static DWORD WINAPI pollThread(LPVOID p) {
                     enqueue_apply(s->id, g_changes[i].prev, 0);
                     continue;
                 }
-                if (!s->lockedByMe) { send_lock("lock_acquire", s->id); s->lockedByMe = 1; }
+                if (!s->lockedByMe) {                       // (what to put back if someone else holds it after all)
+                    send_lock("lock_acquire", s->id); s->lockedByMe = 1;
+                    s->undo = g_changes[i].prev; s->hasUndo = 1;
+                }
                 s->lastTouch = now;
                 sprintf_s(key, sizeof(key), "param:%u", s->id);
             }
@@ -7031,7 +7454,19 @@ static void sh_joined(void);
 static void handle_msg(const char *m) {
     log_op("in", m);
     if (op_changes_song(m)) g_lastOpAt = GetTickCount();
+    {   // "sc":[ch,mix,pat]
+        const char *q = strstr(m, "\"sc\":[");
+        int k;
+        for (k = 0; k < SC_N; k++) t_msgSc[k] = -1;
+        if (q) for (q += 6, k = 0; k < SC_N; k++) {
+            char *e;
+            t_msgSc[k] = (int)strtol(q, &e, 10);
+            if (e == q) { t_msgSc[0] = t_msgSc[1] = t_msgSc[2] = -1; break; }
+            q = *e == ',' ? e + 1 : e;
+        }
+    }
     t_peerMsg++; handle_msg_body(m); t_peerMsg--;
+    t_msgSc[0] = t_msgSc[1] = t_msgSc[2] = -1;
 }
 static void handle_msg_body(const char *m) {    uint32_t id, v;
     int unit, a, b;
@@ -7114,6 +7549,7 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         // our own role is the first "role" field; later ones belong to the peers list
         const char *r = strstr(m, "\"role\":\"");
         g_isLeader = r && strncmp(r + 8, "leader", 6) == 0;
+        if (!g_isLeader) { int k; for (k = 0; k < SC_N; k++) InterlockedExchange(&g_sc[k], -1); }   // until the leader's project says
         net_show_connected(m);
         if (!g_isLeader) ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");
         else enqueue_unit(T_NAMEPROJ, 0, 0, 0, 0, NULL);  // an untitled project gets the song name, if one is set
@@ -7132,7 +7568,13 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         int mine = strstr(m, ownerPat) != NULL;
         if (s) {
             if (granted && !mine) s->lockedByPeer = 1;
-            if (!granted && !mine) { s->lockedByMe = 0; s->lockedByPeer = 1; logmsg("lock denied id=0x%08x", id); }
+            if (granted && mine) s->hasUndo = 0;
+            if (!granted && !mine) {
+                // someone else holds it: the server dropped our edit, so it goes back to what everyone has
+                s->lockedByMe = 0; s->lockedByPeer = 1;
+                if (s->hasUndo) { enqueue_apply(id, s->undo, 0); s->hasUndo = 0; }
+                logmsg("lock denied id=0x%08x: local edit put back", id);
+            }
         }
     } else if (strstr(m, "\"t\":\"lock_released\"") && jget_paramkey(m, &id)) {
         Slot *s = slot_by_id(id);
@@ -8456,21 +8898,40 @@ static void out_push(char *msg, unsigned char *blob, size_t n) {   // caller hol
 // (an op waiting for its samples or its upload) -- then behind it, to keep the order. A big one
 // always goes to the outbox ("big messages"). The leader's "alive" and the mouse arrows don't
 // need the order: never behind an upload (a long one would look like a frozen leader).
+// An op with this FL's structure counts in front of its fields ({"t":"op","op":{"sc":[ch,mix,pat],...});
+// NULL: as it is.
+static char *sc_stamp(const char *msg) {
+    static const char OP[] = "{\"t\":\"op\",\"op\":{";
+    LONG c = g_sc[SC_CH], x = g_sc[SC_MIX], p = g_sc[SC_PAT];
+    size_t n;
+    char *out;
+    if (c < 0 || x < 0 || p < 0 || strncmp(msg, OP, sizeof(OP) - 1) != 0) return NULL;
+    n = strlen(msg) + 48;
+    out = (char *)malloc(n);
+    sprintf_s(out, n, "%s\"sc\":[%ld,%ld,%ld],%s", OP, c, x, p, msg + sizeof(OP) - 1);
+    return out;
+}
+
 static void ws_send(const char *msg) {
     static const char ALIVE[] = "{\"t\":\"op\",\"op\":{\"kind\":\"alive\"", CUR[] = "{\"t\":\"op\",\"op\":{\"kind\":\"cur\"";
+    char *st;
     if (strncmp(msg, ALIVE, sizeof(ALIVE) - 1) == 0 || strncmp(msg, CUR, sizeof(CUR) - 1) == 0) { ws_send_now(msg); return; }
+    if ((st = sc_stamp(msg)) != NULL) msg = st;
     log_op("out", msg);
     if (op_changes_song(msg)) g_lastOpAt = GetTickCount();
     EnterCriticalSection(&g_outLock);
     if (g_outBusy || g_outHead || strlen(msg) > BIG_MSG) { out_push(_strdup(msg), NULL, 0); SetEvent(g_outEvt); }
     else ws_send_now(msg);
     LeaveCriticalSection(&g_outLock);
+    free(st);
 }
 
 // An op whose data (an .flp / .fst image) may reference samples. Takes ownership of msg.
 static void ws_send_samples(char *msg, const unsigned char *blob, size_t n) {
     unsigned char *copy;
+    char *st;
     if (!g_ws) { free(msg); return; }
+    if ((st = sc_stamp(msg)) != NULL) { free(msg); msg = st; }
     log_op("out", msg);
     g_lastOpAt = GetTickCount();
     copy = (unsigned char *)malloc(n ? n : 1);

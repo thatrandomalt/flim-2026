@@ -245,6 +245,81 @@ int main(void) {
         CHECK(task_rebind(&it) && it.a == 5);
         g_flBase = NULL;
     }
+    {   // structure counts (channels, mixer tracks, patterns): someone's edits made before structure changes they
+        // hadn't seen move through them; a structure op made at another count of its kind crossed one (leader: skip)
+        static const int mixIns[7] = { 0, 1, 2, -1, 3, 4, 5 };   // a mixer track inserted at 3 (6 -> 7 tracks)
+        unsigned char *r;
+        QItem it;
+#define SC(c, m, p) (it.sc[0] = (c), it.sc[1] = (m), it.sc[2] = (p))
+        g_sc[SC_CH] = 20; g_sc[SC_MIX] = 10; g_sc[SC_PAT] = 30; g_isLeader = 1;
+        sc_done(SC_MIX, mixIns, 7);                                 // mixer 10 -> 11
+        sc_done_del(1, 4);                                          // channel 1 of 4 deleted: channels 20 -> 21
+        CHECK(g_sc[SC_CH] == 21 && g_sc[SC_MIX] == 11);
+        memset(&it, 0, sizeof(it));
+        it.type = T_PARAM; it.peer = 1; SC(21, 10, 30);
+        it.id = 0x70000000u + (((4u << 6) | 0u) << 16) + 0x1fc0u;   // track 4's volume -> track 5's
+        CHECK(sc_rebase(&it) && it.id == 0x70000000u + ((5u << 6) << 16) + 0x1fc0u);
+        it.id = (2u << 16) | 5u; SC(20, 11, 30);                    // channel 2's param -> channel 1's
+        CHECK(sc_rebase(&it) && it.id == ((1u << 16) | 5u));
+        it.id = (1u << 16) | 5u; SC(20, 10, 30);                    // the deleted channel's: dropped
+        CHECK(!sc_rebase(&it));
+        it.id = (3u << 16) | 5u; SC(21, 11, 30);                    // made after both: as it is
+        CHECK(sc_rebase(&it) && it.id == ((3u << 16) | 5u));
+        memset(&it, 0, sizeof(it));
+        it.type = T_META; it.peer = 1; SC(20, 10, 30);
+        it.path = _strdup("{\"t\":\"op\",\"op\":{\"kind\":\"meta.set\",\"e\":\"rt\",\"i\":4,\"r\":[[0,12800],[3,100],[5,7]]}}");
+        CHECK(sc_rebase(&it) && strcmp(it.path, "{\"t\":\"op\",\"op\":{\"kind\":\"meta.set\",\"e\":\"rt\",\"i\":5,\"r\":[[0,12800],[4,100],[6,7]]}}") == 0);
+        free(it.path);
+        memset(&it, 0, sizeof(it));
+        it.type = T_NOTES; it.peer = 1; SC(20, 11, 30); it.b = -1; it.mode = 3;
+        it.order = (int *)(r = (unsigned char *)calloc(3, NOTE_SIZE));
+        r[NOTE_CH_OFS] = 0; r[NOTE_SIZE + NOTE_CH_OFS] = 2; r[2 * NOTE_SIZE + NOTE_CH_OFS] = 1;
+        CHECK(sc_rebase(&it) && it.mode == 2 && r[NOTE_CH_OFS] == 0 && r[NOTE_SIZE + NOTE_CH_OFS] == 1);   // ch 1's note gone
+        free(it.order);
+        memset(&it, 0, sizeof(it));
+        it.type = T_MIXSTRUCT; it.peer = 1; SC(21, 10, 30); it.path = _strdup("{}");
+        CHECK(!sc_rebase(&it));                                     // crossed the mixer insert: skipped (and freed)
+        SC(20, 11, 30); it.path = NULL;
+        CHECK(sc_rebase(&it));                                      // only a channel op it hadn't seen: no crossing
+        memset(&it, 0, sizeof(it));
+        it.type = T_DELCH; it.peer = 1; SC(20, 11, 30);             // a channel op that hadn't seen the channel delete:
+        CHECK(!sc_rebase(&it));                                     // crossed, whatever the other counts
+        {   // pattern ops: insert / clone / delete maps (as FL 2026 does them), moves without one
+            static int f[MAX_PAT];
+            int p4 = 4, c36[2] = { 6, 3 }, d26[2] = { 2, 6 };
+            CHECK(patop_map(PATOP_INSERT, &p4, 1, f) && f[3] == 3 && f[4] == -1 && f[5] == 4);
+            CHECK(patop_map(0, c36, 2, f) && f[3] == 3 && f[4] == -1 && f[5] == 4 && f[7] == 6 && f[8] == -1 && f[9] == 7);
+            CHECK(patop_map(1, d26, 2, f) && f[1] == 1 && f[2] == 3 && f[4] == 5 && f[5] == 7);
+            CHECK(!patop_map(2, d26, 2, f));
+            patop_map(PATOP_INSERT, &p4, 1, f);
+            sc_done(SC_PAT, f, MAX_PAT);                            // patterns 30 -> 31
+        }
+        memset(&it, 0, sizeof(it));
+        it.type = T_NOTES; it.peer = 1; SC(21, 11, 30); it.a = 5; it.b = -1; it.mode = 0; it.order = (int *)malloc(1);
+        CHECK(sc_rebase(&it) && it.a == 6);                         // pattern 5's notes -> pattern 6's
+        free(it.order);
+        memset(&it, 0, sizeof(it));
+        it.type = T_CLIPS; it.peer = 1; SC(20, 11, 30); it.mode = 3;
+        it.order = (int *)(r = (unsigned char *)calloc(3, CLIP_SIZE));
+        *(uint32_t *)(r + 4) = (2u << 16) | 0x5000u;                // channel 2's clip -> channel 1's
+        *(uint32_t *)(r + CLIP_SIZE + 4) = ((0x5000u + 5) << 16) | 0x5000u;   // pattern 5's -> pattern 6's
+        *(uint32_t *)(r + 2 * CLIP_SIZE + 4) = (1u << 16) | 0x5000u;          // the deleted channel's: gone
+        CHECK(sc_rebase(&it) && it.mode == 2 && *(uint32_t *)(r + 4) == ((1u << 16) | 0x5000u) &&
+              *(uint32_t *)(r + CLIP_SIZE + 4) == (((0x5000u + 6) << 16) | 0x5000u));
+        free(it.order);
+        memset(&it, 0, sizeof(it));
+        it.type = T_META; it.peer = 1; SC(21, 11, 30);
+        it.path = _strdup("{\"t\":\"op\",\"op\":{\"kind\":\"meta.set\",\"e\":\"pt\",\"i\":4,\"c\":1,\"n\":\"\"}}");
+        CHECK(sc_rebase(&it) && strstr(it.path, "\"i\":5,") != NULL);
+        free(it.path);
+        memset(&it, 0, sizeof(it));                                 // a new channel names mixer tracks (its automation
+        it.type = T_ADDCH; it.peer = 1; SC(21, 10, 31);             // link): a mixer change crosses it, a pattern op doesn't
+        CHECK(!sc_rebase(&it));
+        SC(21, 11, 30);
+        CHECK(sc_rebase(&it));
+#undef SC
+        g_isLeader = 0;
+    }
     {   // FL 2026 projects: event byte 172 escapes a 32-bit id (here a varlen and a byte one); the
         // sample path after them must still be found
         static const unsigned char img[] = { 'F','L','h','d', 6,0,0,0, 0,0,2,0,0x60,0, 'F','L','d','t', 36,0,0,0,
