@@ -353,7 +353,8 @@ static __declspec(thread) int t_msgSc[SC_N] = { -1, -1, -1 };   // ... and the "
 // leader's project has none).
 static volatile LONG g_sc[SC_N] = { 0, 0, 0 };
 static void sc_done(int kind, const int *from, int n);
-static void sc_done_patop(int k, const int *pats, int n);
+static void sc_done_patop(int k, const int *pats, int n, int delta, int target);
+static void pat_sigs_take(int k, const int *pats, int n);
 static void ulock_release_moved(const char *pre1, const char *pre2, const int *from, int n);
 static void sc_done_del(int k, int n0);
 static void sc_done_add(int k, int n0);
@@ -3841,6 +3842,15 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
 static volatile LONG  g_inHook = 0;
 static volatile LONG  g_projBusy = 0;          // project mode
 static volatile LONG  g_projRemote = 0;        // member: loading the leader's project
+static volatile DWORD g_projAskedAt = 0;       // member: asked for it (state.req: join, re-sync), until it comes
+#define PROJ_ASK_MAX_MS 15000                  // (no answer by then: let the user work again)
+// Member: the leader's project is on its way or loading. What the user does meanwhile would be lost to the
+// load (it replaces the song), so input is held off then, as while the host saves (input_held).
+static int member_reloading(void) {
+    DWORD a = g_projAskedAt;
+    if (g_isLeader) return 0;
+    return (g_projBusy && g_projRemote) || (a && GetTickCount() - a < PROJ_ASK_MAX_MS);
+}
 static volatile LONG  g_projDoneQueued = 0;
 static volatile DWORD g_projSince = 0;
 static volatile DWORD g_closingUntil = 0;      // FL is closing: never broadcast what teardown does
@@ -4180,15 +4190,27 @@ static void do_projload(const QItem *it) {
 // every later channel op would land on the wrong channel. The leader's project is the reference: a
 // member asks for it again, the leader sends it to everyone. At most once every RESYNC_MS.
 #define RESYNC_MS 10000
+// One re-sync per RESYNC_MS. One asked for sooner isn't dropped (it stayed out of step until the safety
+// net, minutes later): it goes out when its turn comes (resync_tick), unless the leader's project arrives
+// first (on_project_load), which covers it.
+static volatile LONG g_resyncPending = 0;
+static volatile DWORD g_resyncAt = 0;
 static void resync(const char *why) {
-    static DWORD at = 0;
     DWORD now = GetTickCount();
-    if (at && now - at < RESYNC_MS) return;
-    at = now;
+    if ((g_resyncAt && now - g_resyncAt < RESYNC_MS) || (g_isLeader && g_projBusy)) {
+        if (!InterlockedExchange(&g_resyncPending, 1)) logmsg("SYNC out of step with the others (%s): re-syncing when the last re-sync's turn is over", why);
+        return;
+    }
+    g_resyncAt = now;
+    InterlockedExchange(&g_resyncPending, 0);
     logmsg("SYNC out of step with the others (%s): %s", why,
            g_isLeader ? "sending everyone the leader's project" : "loading the leader's project again");
     if (!g_isLeader) ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");
-    else if (!g_projBusy) enqueue_unit(T_PROJSNAP, 0, 0, 0, 0, NULL);
+    else enqueue_unit(T_PROJSNAP, 0, 0, 0, 0, NULL);
+}
+// Poll thread.
+static void resync_tick(DWORD now) {
+    if (g_resyncPending && now - g_resyncAt >= RESYNC_MS && !g_projBusy) resync("a re-sync that waited for its turn");
 }
 
 // Leader: a member asked for the project (join or re-sync).
@@ -4286,6 +4308,8 @@ static void on_project_load(const char *m) {
     LeaveCriticalSection(&g_heldLock);
     InterlockedExchange(&g_projBusy, 1);
     InterlockedExchange(&g_projRemote, 1);
+    g_projAskedAt = 0;                                         // (it came: member_reloading goes by g_projBusy now)
+    InterlockedExchange(&g_resyncPending, 0);                  // (a re-sync asked for before it: this is the one)
     InterlockedExchange(&g_projDoneQueued, 0);
     g_projSince = GetTickCount();
     logmsg("PROJECT received %S (%zu bytes): loading", path, n);
@@ -4450,35 +4474,31 @@ static uint64_t pat_sig(void) {
 static uint64_t patop_common(int k, void *self, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) {
     int send = !g_patRemote && !g_patDepth && g_ws && !g_projBusy && !closing_now();
     uint64_t sig = send ? pat_sig() : 0, r;
+    static int pl[MAX_PAT];                      // the pattern list, as it was before the op
+    int np = 1, ok = 1, i;
+    if (send) {
+        if (k == PATOP_INSERT) pl[0] = (int)a;
+        else {
+            np = (int)b + 1 < MAX_PAT ? (int)b + 1 : MAX_PAT;
+            __try { memcpy(pl, (const int *)a, sizeof(int) * (size_t)(np > 0 ? np : 0)); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
+        }
+        if (ok && np > 0) pat_sigs_take(k, pl, np);
+    }
     InterlockedIncrement(&g_patDepth);
     r = g_patOrig[k](self, a, b, c, d, e);
     InterlockedDecrement(&g_patDepth);
     if (!send) return r;
     if (pat_sig() == sig) { logmsg("PATTERN op 0x%x: nothing changed (cancelled?), not sent", PATOP_SLOT[k]); return r; }
+    if (!ok || np < 1) { logmsg("PATTERN op 0x%x: bad pattern list, not sent", PATOP_SLOT[k]); notes_rebaseline(); return r; }
     {
         char m[8192];
         int o = sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"pat.op\",\"s\":%d,\"p\":[", PATOP_SLOT[k]);
-        if (k == PATOP_INSERT) o += sprintf_s(m + o, sizeof(m) - o, "%d", (int)a);
-        else {
-            int i, n = (int)b + 1;
-            __try { for (i = 0; i < n && i < MAX_PAT; i++) o += sprintf_s(m + o, sizeof(m) - o, "%s%d", i ? "," : "", ((int *)a)[i]); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("PATTERN op 0x%x: bad pattern list, not sent", PATOP_SLOT[k]); return r; }
-        }
+        for (i = 0; i < np; i++) o += sprintf_s(m + o, sizeof(m) - o, "%s%d", i ? "," : "", pl[i]);
         sprintf_s(m + o, sizeof(m) - o, "],\"a\":%d,\"b\":%d,\"c\":%u}}", (int)c, (int)d, (unsigned)(uint16_t)e);
         ws_send(m);
         logmsg("PATTERN op sent: %.200s", m);
-        {   // counted, and the baselines carried through it (sc_done_patop)
-            static int pl[MAX_PAT];
-            int np = 1, ok = 1;
-            if (k == PATOP_INSERT) pl[0] = (int)a;
-            else {
-                np = (int)b + 1 < MAX_PAT ? (int)b + 1 : MAX_PAT;
-                __try { memcpy(pl, (const int *)a, sizeof(int) * (size_t)np); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = 0; }
-            }
-            if (ok) sc_done_patop(k, pl, np);
-            else { sc_done(SC_PAT, NULL, 0); notes_rebaseline(); }
-        }
     }
+    sc_done_patop(k, pl, np, (int)c, (int)d);    // counted, and the baselines carried through it
     return r;
 }
 #define PATOP_HOOK(k) static uint64_t patop_hook##k(void *s, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e) \
@@ -4561,6 +4581,7 @@ static void do_patop(const QItem *it) {
     int_after(m, NULL, "\"a\":", &a);
     int_after(m, NULL, "\"b\":", &b);
     int_after(m, NULL, "\"c\":", &c);
+    pat_sigs_take(k, pats, n);                               // (sc_done_patop checks the map against what FL did)
     InterlockedExchange(&g_patRemote, 1);
     InterlockedExchange(&g_mbAuto, 1);
     InterlockedIncrement(&g_patDepth);
@@ -4571,7 +4592,7 @@ static void do_patop(const QItem *it) {
     InterlockedDecrement(&g_patDepth);
     InterlockedExchange(&g_mbAuto, 0);
     InterlockedExchange(&g_patRemote, 0);
-    if (slot >= 0) sc_done_patop(k, pats, n);               // (faulted: run_task counts it; baselines re-taken)
+    if (slot >= 0) sc_done_patop(k, pats, n, a, b);         // (faulted: run_task counts it; baselines re-taken)
     else notes_rebaseline();
     logmsg("PATTERN op applied: slot 0x%x, %d patterns (first %d)", slot, n, pats[0]);
 }
@@ -5893,18 +5914,71 @@ static void pat_rebase(const int *from) {
     clips_rebaseline();
 }
 
+// Each pattern's identity just before a pattern op (pat_sigs_take): its notes (a move swaps note contents
+// between the arrays, which stay put) and its name and marker list pointers, which move with the record.
+// (drain_queue_mainthread runs nothing while a pattern op is under way: FL's rename box after an Insert runs a
+// modal loop, and a channel delete run in it renumbered the notes' channels.) For split: how many channels each
+// source has notes in.
+typedef struct { uint64_t notes; void *name, *marks; } PatSig;
+static PatSig g_patPre[MAX_PAT];
+static unsigned char g_patPreCh[MAX_PAT];
+static PatSig pat_sig_of(int p) {
+    PatSig g;
+    char *r = pat_rec(p);
+    g.notes = notes_hash(p); g.name = *(void **)(r + PAT_NAME); g.marks = *(void **)(r + PAT_MARKERS);
+    return g;
+}
+static void pat_sigs_take(int k, const int *pats, int n) {
+    int p, i;
+    __try {
+        for (p = 1; p < MAX_PAT; p++) g_patPre[p] = pat_sig_of(p);
+        for (i = 0; k == 5 && i < n; i++) {                     // split: channels with notes in each source
+            static unsigned char seen[MAX_CH];
+            unsigned cnt = 0, j;
+            unsigned char *d;
+            if (pats[i] < 1 || pats[i] >= MAX_PAT) continue;
+            d = notes_copy(pats[i], &cnt);
+            memset(seen, 0, sizeof(seen));
+            g_patPreCh[pats[i]] = 0;
+            for (j = 0; d && j < cnt; j++) {
+                uint16_t c = *(uint16_t *)(d + (size_t)j * NOTE_SIZE + NOTE_CH_OFS);
+                if (c < MAX_CH && !seen[c]) { seen[c] = 1; g_patPreCh[pats[i]]++; }
+            }
+            free(d);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("PATTERN op: couldn't read the patterns before it"); }
+}
+
 // What a pattern op (k: PATOP_SLOT index) on pats[0..n) does to pattern numbers: from[new] = old, -1 = new.
-// Insert, clone and delete are known (checked on FL 2026: Insert(p) puts an empty pattern at p; Clone puts
-// each copy right after its source); 0 for the moves and split.
-static int patop_map(int k, const int *pats, int n, int *from) {
+// Measured on FL 2026 with uniquely named patterns:
+//   Insert(p)          an empty pattern at p, the rest one up
+//   Clone(pats)        each copy right after its source (sources in ascending order)
+//   Delete(pats)       the rest close the gap
+//   0x108 (pats, delta, target)  target -1: each pattern swaps with the one delta away, in list order for a
+//                      negative delta, from the end for a positive one (that keeps a moved block together);
+//                      another target looks patterns up by a record field that is -1 here: nothing moves
+//   0x110              renames / recolors (FL's name and color setters): nothing moves
+//   SplitByChannel     each source keeps its number (its first channel's notes); one new pattern per other
+//                      channel with notes goes right after it (g_patPreCh); one channel: FL refuses
+// FL can skip a move by its own state, so sc_done_patop checks the result against what FL did.
+static int patop_map(int k, const int *pats, int n, int delta, int target, int *from) {
     static int src[MAX_PAT];
     int i, j, m = 0;
-    if (k == 2 || k == 3 || k == 5) return 0;
     for (i = 0; i < MAX_PAT; i++) from[i] = i;
+    if (k == 3) return 1;
     if (k == PATOP_INSERT) {
         if (n < 1 || pats[0] < 1 || pats[0] >= MAX_PAT) return 0;
         memmove(from + pats[0] + 1, from + pats[0], sizeof(int) * (size_t)(MAX_PAT - pats[0] - 1));
         from[pats[0]] = -1;
+        return 1;
+    }
+    if (k == 2) {
+        if (target != -1) return 1;
+        for (j = 0; j < n; j++) {
+            int p = pats[delta < 0 ? j : n - 1 - j], q = p + delta, t;
+            if (p < 1 || p >= MAX_PAT || q < 1 || q >= MAX_PAT || q == p) continue;
+            t = from[p]; from[p] = from[q]; from[q] = t;
+        }
         return 1;
     }
     for (i = 0; i < n; i++) if (pats[i] >= 1 && pats[i] < MAX_PAT) src[m++] = pats[i];
@@ -5913,20 +5987,48 @@ static int patop_map(int k, const int *pats, int n, int *from) {
         int w = 0;
         for (i = 0; i < MAX_PAT; i++) if (!bsearch(&i, src, m, sizeof(int), int_cmp)) from[w++] = i;
         for (; w < MAX_PAT; w++) from[w] = -1;
-    } else for (i = 0; i < m; i++) {                            // clone: a copy after each source
+        return 1;
+    }
+    for (i = 0; i < m; i++) {                                   // clone: a copy after each source; split: one per
+        int add = k == 5 ? g_patPreCh[src[i]] - 1 : 1, x;       // other channel
         for (j = 0; j < MAX_PAT && from[j] != src[i]; j++) {}
-        if (j >= MAX_PAT - 1) break;
-        memmove(from + j + 2, from + j + 1, sizeof(int) * (size_t)(MAX_PAT - j - 2));
-        from[j + 1] = -1;
+        for (x = 0; x < add && j < MAX_PAT - 1; x++) {
+            memmove(from + j + 2, from + j + 1, sizeof(int) * (size_t)(MAX_PAT - j - 2));
+            from[j + 1] = -1;
+        }
     }
     return 1;
 }
 
-// Main thread, after a pattern op ran here: counted (moves and split without a map), and the pattern
-// baselines carried through it (or re-taken).
-static void sc_done_patop(int k, const int *pats, int n) {
+// Did FL do what the map says? Every pattern that only moved is where the map puts it (a split source and new
+// patterns change, so they aren't compared). Patterns that look alike (empty, unnamed) can't be told apart,
+// and needn't be.
+static int patop_map_ok(int k, const int *pats, int n, const int *from) {
+    int j, i, x;
+    __try {
+        for (j = 1; j < MAX_PAT; j++) {
+            PatSig now;
+            if ((i = from[j]) < 1) continue;
+            for (x = 0; k == 5 && x < n && pats[x] != i; x++) {}
+            if (k == 5 && x < n) continue;
+            now = pat_sig_of(j);
+            if (now.notes != g_patPre[i].notes || now.name != g_patPre[i].name || now.marks != g_patPre[i].marks) {
+                logmsg("PATTERN op: pattern %d isn't old pattern %d as expected", j, i);
+                return 0;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return 1;
+}
+
+// Main thread, after a pattern op ran here (pat_sigs_take before it): counted, and the pattern baselines
+// carried through its map, or re-taken when FL didn't do what the map says.
+static void sc_done_patop(int k, const int *pats, int n, int delta, int target) {
     static int from[MAX_PAT];
-    if (!patop_map(k, pats, n, from)) { sc_done(SC_PAT, NULL, 0); notes_rebaseline(); ulock_release_moved("pat:", NULL, NULL, 0); return; }
+    if (!patop_map(k, pats, n, delta, target, from) || !patop_map_ok(k, pats, n, from)) {
+        sc_done(SC_PAT, NULL, 0); notes_rebaseline(); ulock_release_moved("pat:", NULL, NULL, 0);
+        return;
+    }
     sc_done(SC_PAT, from, MAX_PAT);
     pat_rebase(from);
 }
@@ -6301,6 +6403,7 @@ static int main_busy(char *why, int cap) {
 
 static void drain_queue_mainthread(void) {
     static DWORD waitSince = 0;
+    if (g_patDepth) { if (g_taskWnd) SetTimer(g_taskWnd, BUSY_TIMER, BUSY_RETRY_MS, NULL); return; }   // inside FL's pattern op
     if (InterlockedExchange(&g_inHook, 1)) return;     // FL may pump messages inside a plugin load
     for (;;) {
         QItem it;
@@ -6475,6 +6578,15 @@ static int host_saving(void) {
     DWORD u = g_hostSavingUntil;
     return u && (LONG)(GetTickCount() - u) < 0;
 }
+// Clicks and key presses don't reach FL now: the host saves, or the leader's project is loading here.
+static int input_held(void) { return host_saving() || member_reloading(); }
+// ... except in a dialog FL shows meanwhile (a message box, a missing plugin's warning): it needs its answer.
+static int input_to_dialog(HWND h) {
+    char c[32];
+    HWND root = h ? GetAncestor(h, GA_ROOT) : NULL;
+    if (!root || !GetClassNameA(root, c, sizeof(c))) return 0;
+    return strcmp(c, "TMsgForm") == 0 || strcmp(c, "#32770") == 0 || strcmp(c, "TNameEditForm") == 0;
+}
 static char save_detour(const wchar_t *path, uint8_t flag) {
     int tell = !g_ownSave && g_isLeader && g_netState == NET_ON;
     char r;
@@ -6546,7 +6658,7 @@ static void loadpreset_detour_install(void) {
     else logmsg("PLUG: FL's preset loader looks different: a preset loaded here that moves no knob syncs later");
 }
 static LRESULT CALLBACK savepop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
-    if (m == WM_TIMER) { if (!host_saving()) DestroyWindow(h); return 0; }
+    if (m == WM_TIMER) { if (!input_held()) DestroyWindow(h); else InvalidateRect(h, NULL, TRUE); return 0; }
     if (m == WM_DESTROY) { g_savePopup = NULL; return 0; }
     if (m == WM_PAINT) {
         PAINTSTRUCT ps;
@@ -6555,7 +6667,8 @@ static LRESULT CALLBACK savepop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         char who[64];
         HDC dc = BeginPaint(h, &ps);
         peer_name(g_hostSaver, who, sizeof(who));
-        swprintf_s(t, 160, L"%S is saving the project. One moment, then try again.", who);
+        if (host_saving()) swprintf_s(t, 160, L"%S is saving the project. One moment, then try again.", who);
+        else wcscpy_s(t, 160, L"Loading the session leader's project. One moment, then try again.");
         GetClientRect(h, &r);
         FillRect(dc, &r, GetSysColorBrush(COLOR_WINDOW));
         SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
@@ -6566,12 +6679,12 @@ static LRESULT CALLBACK savepop_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     }
     return DefWindowProcW(h, m, wp, lp);
 }
-// Main thread: someone tried to change something while the host saves.
+// Main thread: someone tried to change something while the host saves / the leader's project loads.
 static void save_popup(void) {
     static ATOM cls = 0;
     RECT f;
     int w, hgt;
-    if (g_savePopup || !host_saving()) return;
+    if (g_savePopup || !input_held()) return;
     if (!cls) {
         WNDCLASSW wc;
         memset(&wc, 0, sizeof(wc));
@@ -6590,7 +6703,7 @@ static void save_popup(void) {
     if (!g_savePopup) return;
     ShowWindow(g_savePopup, SW_SHOWNOACTIVATE);
     SetTimer(g_savePopup, 1, 200, NULL);
-    logmsg("PROJECT the host is saving: held off a change here");
+    logmsg("PROJECT %s: held off a change here", host_saving() ? "the host is saving" : "the leader's project is loading");
 }
 
 static LRESULT CALLBACK getMsgHook(int code, WPARAM wp, LPARAM lp) {
@@ -6598,8 +6711,9 @@ static LRESULT CALLBACK getMsgHook(int code, WPARAM wp, LPARAM lp) {
         MSG *msg = (MSG *)lp;
         UINT k = msg->message;
         if ((k == WM_LBUTTONDOWN || k == WM_RBUTTONDOWN || k == WM_MBUTTONDOWN || k == WM_LBUTTONDBLCLK || k == WM_RBUTTONDBLCLK ||
-             k == WM_MOUSEWHEEL || k == WM_KEYDOWN || k == WM_SYSKEYDOWN || k == WM_CHAR) && host_saving()) {
-            msg->message = WM_NULL;                       // the host is saving: this input never reaches FL
+             k == WM_MOUSEWHEEL || k == WM_KEYDOWN || k == WM_SYSKEYDOWN || k == WM_CHAR) && input_held() &&
+            !input_to_dialog(msg->hwnd)) {
+            msg->message = WM_NULL;                       // the host is saving / the leader's project loads: never reaches FL
             if (g_taskWnd) PostMessageW(g_taskWnd, WM_FLIM_SAVEPOPUP, 0, 0);
         }
         switch (msg->message) {
@@ -6882,6 +6996,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
         scan_meta(now);
         state_digest(now);
         digest_tick(now);
+        resync_tick(now);
         focus_poll(now);
         cursor_poll(now);
         solo_poll(now);
@@ -8916,7 +9031,14 @@ static void ws_send(const char *msg) {
     static const char ALIVE[] = "{\"t\":\"op\",\"op\":{\"kind\":\"alive\"", CUR[] = "{\"t\":\"op\",\"op\":{\"kind\":\"cur\"";
     char *st;
     if (strncmp(msg, ALIVE, sizeof(ALIVE) - 1) == 0 || strncmp(msg, CUR, sizeof(CUR) - 1) == 0) { ws_send_now(msg); return; }
+    if (member_reloading() && op_changes_song(msg)) {
+        // the leader's project is on its way: an edit sent now reached the leader after its snapshot for us
+        // and was wiped here by the load (the two then differed); the leader's song wins instead
+        logmsg("SYNC an edit not sent: this FL is loading the leader's project (%.80s)", msg);
+        return;
+    }
     if ((st = sc_stamp(msg)) != NULL) msg = st;
+    if (!g_isLeader && strstr(msg, "\"kind\":\"state.req\"")) g_projAskedAt = GetTickCount() | 1;   // (member_reloading)
     log_op("out", msg);
     if (op_changes_song(msg)) g_lastOpAt = GetTickCount();
     EnterCriticalSection(&g_outLock);
@@ -8931,6 +9053,7 @@ static void ws_send_samples(char *msg, const unsigned char *blob, size_t n) {
     unsigned char *copy;
     char *st;
     if (!g_ws) { free(msg); return; }
+    if (member_reloading()) { logmsg("SYNC an edit not sent: this FL is loading the leader's project (%.80s)", msg); free(msg); return; }   // (ws_send)
     if ((st = sc_stamp(msg)) != NULL) { free(msg); msg = st; }
     log_op("out", msg);
     g_lastOpAt = GetTickCount();
@@ -10377,6 +10500,7 @@ static void net_disconnect(void) {
     LeaveCriticalSection(&g_sendLock);
     net_reset();
     g_hostSavingUntil = 0;
+    g_projAskedAt = 0;
     g_leaderAliveAt = 0;
     net_status(NET_OFF, "Not connected");
 }

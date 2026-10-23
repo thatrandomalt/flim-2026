@@ -284,14 +284,20 @@ int main(void) {
         memset(&it, 0, sizeof(it));
         it.type = T_DELCH; it.peer = 1; SC(20, 11, 30);             // a channel op that hadn't seen the channel delete:
         CHECK(!sc_rebase(&it));                                     // crossed, whatever the other counts
-        {   // pattern ops: insert / clone / delete maps (as FL 2026 does them), moves without one
+        {   // pattern ops: the maps measured on FL 2026
             static int f[MAX_PAT];
-            int p4 = 4, c36[2] = { 6, 3 }, d26[2] = { 2, 6 };
-            CHECK(patop_map(PATOP_INSERT, &p4, 1, f) && f[3] == 3 && f[4] == -1 && f[5] == 4);
-            CHECK(patop_map(0, c36, 2, f) && f[3] == 3 && f[4] == -1 && f[5] == 4 && f[7] == 6 && f[8] == -1 && f[9] == 7);
-            CHECK(patop_map(1, d26, 2, f) && f[1] == 1 && f[2] == 3 && f[4] == 5 && f[5] == 7);
-            CHECK(!patop_map(2, d26, 2, f));
-            patop_map(PATOP_INSERT, &p4, 1, f);
+            int p4 = 4, c36[2] = { 6, 3 }, d26[2] = { 2, 6 }, m3[1] = { 3 }, m34[2] = { 3, 4 }, m36[2] = { 3, 6 };
+            CHECK(patop_map(PATOP_INSERT, &p4, 1, 0, 0, f) && f[3] == 3 && f[4] == -1 && f[5] == 4);
+            CHECK(patop_map(0, c36, 2, 0, 0, f) && f[3] == 3 && f[4] == -1 && f[5] == 4 && f[7] == 6 && f[8] == -1 && f[9] == 7);
+            CHECK(patop_map(1, d26, 2, 0, 0, f) && f[1] == 1 && f[2] == 3 && f[4] == 5 && f[5] == 7);
+            CHECK(patop_map(2, m3, 1, 3, -1, f) && f[3] == 6 && f[6] == 3 && f[4] == 4);          // N1 N2 N6 N4 N5 N3
+            CHECK(patop_map(2, m34, 2, 2, -1, f) && f[3] == 5 && f[4] == 6 && f[5] == 3 && f[6] == 4);   // N1 N2 N5 N6 N3 N4
+            CHECK(patop_map(2, m36, 2, -1, -1, f) && f[2] == 3 && f[3] == 2 && f[5] == 6 && f[6] == 5);  // N1 N3 N2 N4 N6 N5
+            CHECK(patop_map(2, m3, 1, 0, 7, f) && f[3] == 3 && f[7] == 7);                         // target mode: nothing
+            CHECK(patop_map(3, m3, 1, 0, 0, f) && f[3] == 3);
+            g_patPreCh[3] = 2;                                      // split: pattern 3 keeps channel one, a new one after it
+            CHECK(patop_map(5, m3, 1, 0, 0, f) && f[3] == 3 && f[4] == -1 && f[5] == 4);
+            patop_map(PATOP_INSERT, &p4, 1, 0, 0, f);
             sc_done(SC_PAT, f, MAX_PAT);                            // patterns 30 -> 31
         }
         memset(&it, 0, sizeof(it));

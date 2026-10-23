@@ -198,6 +198,9 @@ The server listens on port **8080**. Give your friends your address and the pass
   drops), a popup tells you you're no longer in the session; your FL keeps the project as it is.
 - **While the leader saves** (Ctrl+S, Save as, autosave), nobody else can change the project: clicks and
   key presses wait, and a small *"Alex is saving the project"* popup shows until the save is done.
+- **While your FL loads the leader's project** (when you join, or when two people changed the same
+  channels or tracks in the same instant and your FL catches up), clicks and key presses wait the same
+  way for the second or two it takes, so nothing you do then gets lost. FL's own dialogs still work.
 - **If the leader's FL stops responding** for 30 s (some plugins take a while to load, so not sooner),
   everyone else gets a popup suggesting they save their own copy.
 

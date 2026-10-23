@@ -623,8 +623,8 @@ the structure op:
   put back").
 - Pattern ops carry note and pattern-name / marker baselines through their map too (`pat_rebase`, from
   `sc_done_patop`): a note edit made in the same moment still goes out. Clips are still re-taken: their
-  baseline is one hash for the whole arrangement. The moves (`0x108`, `0x110`) and split (`0x120`) have
-  no known map and still re-take everything.
+  baseline is one hash for the whole arrangement. If FL didn't do what the map says (see the maps
+  below), everything is re-taken as before.
 
 ### Structure ops that cross (the structure count)
 Two people changing channels or mixer tracks in the same instant each change their own list first, and
@@ -672,10 +672,24 @@ made before a structure change reached them still names channels / tracks by the
   An edit for something a structure op removed is dropped. A log entry with no map of a kind the edit
   names (FL didn't do it as sent, a pattern move), or a newer `sc` (a crossing this FL skipped), leaves
   the edit as it is.
-- Pattern op maps (`patop_map`, measured on FL 2026 with uniquely named patterns): `Insert(p)` puts an
-  empty pattern at `p`, later ones one up; `Clone(pats)` puts each copy right after its source (sources
-  in ascending order); `Delete(pats)` closes the gap. The probe couldn't run Delete itself (its
-  confirmation is modal); removing and closing the gap is the only thing it can do to the numbers.
+- Pattern op maps (`patop_map`, measured on FL 2026 with uniquely named patterns):
+
+  | slot | op | what it does to pattern numbers |
+  |---|---|---|
+  | `0x118` | `Insert(p)` | an empty pattern at `p`, later ones one up |
+  | `0xe8` | `Clone(pats)` | each copy right after its source (sources in ascending order) |
+  | `0xf8` | `Delete(pats)` | the gap closes |
+  | `0x108` | move `(pats, delta, target)` | target -1: each pattern swaps with the one `delta` away (`sub_12D98B0`), in list order for a negative delta and from the end for a positive one, so a moved block stays together; any other target looks patterns up by record `+0x10`, which is -1 here, so nothing moves |
+  | `0x110` | `(pats, a, b, c)` | renames / recolors through FL's own setters (`PATNAME`, `PATCOLOR`): nothing moves |
+  | `0x120` | `SplitByChannel(pats)` | each source keeps its number (now its first channel's notes, renamed "<name> - <channel>"); one new pattern per other channel with notes goes right after it, the rest move up. With notes in one channel FL refuses ("Splitting only makes sense if the pattern contains [several channels] that have data") |
+
+  The probe couldn't run Delete itself (its confirmation is modal); removing and closing the gap is the
+  only thing it can do to the numbers. FL can skip a move by its own state (`sub_12D8D70` on the
+  target), so `sc_done_patop` checks the map against what FL did. Before the op, `pat_sigs_take` keeps
+  each pattern's note hash and its name and marker list pointers (they travel with the record) and,
+  for a split, how many channels each source has notes in. Afterwards every pattern that only moved
+  must be where the map puts it (`patop_map_ok`; a split source and new patterns aren't compared).
+  If not: "PATTERN op: pattern N isn't old pattern M as expected", no map, baselines re-taken.
 - Members start at -1 (unknown) and take the counts from the leader's `project.load` when it runs
   (`T_PROJLOAD`, in queue order). Without counts (an older flim on either side) all of this is skipped
   and things work as before.
@@ -707,11 +721,24 @@ made before a structure change reached them still names channels / tracks by the
   tracks, found only by the safety net or not at all. After them, seeds 11–15 converged, and crossings
   were re-synced at once. Note order within the same position can differ between FLs, so
   `stress_both` compares notes as sets.
-- Not covered:
-  - edits made before a pattern move / split go as they are (no map);
-  - edits a member makes while it loads the leader's project (a crossing's re-sync takes 1–3 s) are
-    absorbed by the load. `stress_both` keeps editing through a re-sync and sometimes needs the safety
-    net afterwards for that.
+- `resync` allows one re-sync per `RESYNC_MS` (10 s). A second crossing caught 6 s after a re-sync was
+  simply dropped, and the member stayed out of step until the safety net (whose own valve then waited
+  too, about 2 minutes). Now one asked for inside the window is kept (`g_resyncPending`) and sent when
+  the window is over (`resync_tick`, poll thread). The leader's project arriving first covers it
+  (`on_project_load` clears it).
+- From the moment a member asks for the leader's project until it has loaded (`member_reloading`), it
+  sends no song edits (`ws_send` / `ws_send_samples`: "SYNC an edit not sent"). Found in `stress_both`:
+  a note edit still settling went out 20 ms after the `state.req`. The leader applied it after taking
+  the snapshot for the member, and the member's load wiped it, so the two differed until the safety
+  net. Now the leader's song wins on both.
+- A member's own edits while it loads the leader's project (a crossing's re-sync takes 1–3 s) would be
+  absorbed by the load. So from the moment a member asks for the leader's project (`state.req`: join or
+  re-sync, `g_projAskedAt`, at most `PROJ_ASK_MAX_MS` 15 s) until the load settles (`g_projBusy` with
+  `g_projRemote`), its clicks and key presses are held off like during the host's save
+  (`input_held`, `member_reloading`). The popup then says "Loading the session leader's project".
+  Dialogs FL shows meanwhile (`TMsgForm`, `#32770`, `TNameEditForm`) still get their input
+  (`input_to_dialog`). The probe's edits bypass the input, so `stress_both` still edits through a re-sync
+  and may need the safety net afterwards; a real user can't. Test: `live_test.py reload_lock`.
 - **A pattern's length is cached** in its record: `+0x48` / `+0x4c` / `+0x50` (length in ticks), `+0x54`,
   `+0x5c` (60 when empty). `UpdatePatternLength(p, flag)` (`PATLENUPD`, `sub_12D17A0`) works them out from
   the notes and markers. Its last step, `sub_E4B5F0(playlist, p, old, new)`, resizes the pattern's

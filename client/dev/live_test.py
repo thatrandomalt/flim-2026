@@ -190,6 +190,34 @@ def t_patop_clone():
     time.sleep(0.5); fl.close_dialogs((A,))
     check('pattern clone', lambda: pat_names(a), lambda: pat_names(b), wait=5)
 
+def t_patop_move():                                             # (pats, delta, -1): each swaps with the one delta away
+    a.call(0x12d0fc0, 2, a.mkstr('MV')); time.sleep(1.5)       # (two empty unnamed patterns swapped: no change)
+    buf = a.alloc(8); a.w(buf, struct.pack('<i', 2))
+    pos = os.path.getsize(LOG)
+    patop(a, 0x108, buf, 0, 2, -1 & 0xffffffffffffffff, 0)
+    check('pattern move', lambda: pat_names(a), lambda: pat_names(b), wait=5)
+    check('pattern move: its map matched', lambda: any('isn\'t old pattern' in l for l in log_since(pos, A) + log_since(pos, B)), lambda: False, wait=0)
+
+def t_patop_split():                                            # notes on two channels in pattern 3, split by channel
+    if len(chans(a)) < 2: add_named(a, 1, 'SplitTwo'); time.sleep(2)
+    src = next((n for p in range(1, 12) for n in notes(a, p)), bytes(24))
+    for ch, at in ((0, 0), (1, 96)):
+        r = bytearray(src); struct.pack_into('<I', r, 0, at); struct.pack_into('<H', r, 6, ch)
+        arr = a.call(0x12d16e0, 3, 0); rec = a.alloc(24); a.w(rec, bytes(r)); a.call(va(a, a.q(a.q(arr) + 8)), arr, rec)
+    a.call(PATLENUPD, 3, 1)
+    time.sleep(2)
+    buf = a.alloc(8); a.w(buf, struct.pack('<i', 3))
+    pos = os.path.getsize(LOG)
+    def answer():
+        for _ in range(16):
+            time.sleep(0.25)
+            fl.confirm((A,), 0) if any(w[2] == 'TMsgForm' for w in fl.windows((A,))) else None
+    threading.Thread(target=answer, daemon=True).start()
+    patop(a, 0x120, buf, 0, 0, 0, 0)
+    check('pattern split', lambda: pat_names(a, 12), lambda: pat_names(b, 12), wait=6)
+    check('pattern split: notes', lambda: [sorted(unsel(notes(a, p))) for p in range(1, 12)], lambda: [sorted(unsel(notes(b, p))) for p in range(1, 12)], wait=4)
+    check('pattern split: its map matched', lambda: any('isn\'t old pattern' in l for l in log_since(pos, A) + log_since(pos, B)), lambda: False, wait=0)
+
 def t_patlen():
     a.w(pat_rec(a, 2) + 0x44, struct.pack('<i', 4 * a.d(a.g(0x15e25f8))))   # 4 beats of PPQ
     a.call(0x12d2350, 2)
@@ -725,9 +753,22 @@ def t_stress():
 def t_stress_both():
     import random
     src = next(iter(notes(a, 1)), bytes(24))
+    def answerer(pid, secs=4):                               # split's message boxes (one channel: "makes no sense";
+        def run():                                           # else its question): their first button
+            import ctypes
+            for _ in range(secs * 4):
+                time.sleep(0.25)
+                for q, h, c, t in fl.windows((pid,)):
+                    if c == 'TNameEditForm': ctypes.windll.user32.PostMessageW(h, 0x10, 0, 0)
+                    if c == 'TMsgForm':
+                        btns = [x for x, cc in fl.children(h) if cc == 'TQuickFocusBtn']
+                        if btns: fl.post_click(btns[0])
+        threading.Thread(target=run, daemon=True).start()
     def worker(p, odd, seed):
         rnd = random.Random(seed)
         pid = B if odd else A
+        def one(v):
+            buf = p.alloc(8); p.w(buf, struct.pack('<i', v)); return buf
         def inner(): return rnd.randrange(1, mix_count(p) - 1)
         def note():
             r = bytearray(src); struct.pack_into('<I', r, 0, rnd.randrange(64) * 24); struct.pack_into('<H', r, 6, rnd.randrange(len(chans(p))))
@@ -744,11 +785,26 @@ def t_stress_both():
                lambda k: mix_move(p, rnd.randrange(2, mix_count(p) - 2), rnd.choice((-1, 1))),
                lambda k: note(), lambda k: note(),
                lambda k: (closer(pid), patop(p, 0x118, rnd.randrange(1, 10), 0, 0, 0, 0)),          # pattern insert
-               lambda k: (closer(pid), patop(p, 0xe8, (lambda buf: (p.w(buf, struct.pack('<i', rnd.randrange(1, 10))), buf)[1])(p.alloc(8)), 0, 0, 0, 0))]   # clone
+               lambda k: (closer(pid), patop(p, 0xe8, one(rnd.randrange(1, 10)), 0, 0, 0, 0)),      # clone
+               lambda k: patop(p, 0x108, one(rnd.randrange(2, 10)), 0, rnd.choice((-1, 1, 2)), -1 & 0xffffffffffffffff, 0),   # move
+               lambda k: (answerer(pid), patop(p, 0x120, one(rnd.randrange(1, 10)), 0, 0, 0, 0))]  # split by channel
+        st = {'pos': pos0, 'loading': False}
+        def reloading():                                     # this FL asked for / loads the leader's project: a user
+            with open(LOG, 'rb') as f:                       # can't act then (input held), so neither does the probe
+                f.seek(st['pos']); data = f.read()
+            st['pos'] += data.rfind(b'\n') + 1               # (whole lines only; the rest next time)
+            for l in data[:data.rfind(b'\n') + 1].decode('utf-8', 'replace').splitlines():
+                if '[%d]' % pid not in l: continue
+                if 'kind":"state.req"' in l and 'OP out' in l or 'PROJECT received' in l: st['loading'] = True
+                elif 'PROJECT settled' in l: st['loading'] = False
+            return st['loading']
         for k in range(int(os.environ.get('FLIM_STRESS_OPS', '40'))):
+            t0 = time.time()
+            while reloading() and time.time() - t0 < 15: time.sleep(0.2)
             try: rnd.choice(ops)(k * 2 + odd)
             except Exception as e: print('   op on %s: %s' % ('AB'[odd], e))
             time.sleep(rnd.choice((0.0, 0.02, 0.05, 0.15)))
+    pos0 = os.path.getsize(LOG)
     seed = int(os.environ.get('FLIM_STRESS_SEED', '11'))
     ts = [threading.Thread(target=worker, args=(p, odd, seed + odd * 1000)) for odd, p in ((0, a), (1, b))]
     for t in ts: t.start()
@@ -803,6 +859,39 @@ def t_solo_song():
     check('soloed song: B\'s mutes are A\'s shared ones', lambda: mutes(b), lambda: [mixb(a, t, 0x1c) for t in range(mix_count(a))])
     a.call(SOLO, 3, 0, 2)
     check('soloed song: A unsolos to the same', lambda: mutes(a), lambda: mutes(b), wait=4)
+
+# While the leader's project loads on a member, the member's clicks and keys are held off (they'd be lost to
+# the load) and a small popup says why; afterwards they get through again.
+def t_reload_lock():
+    import ctypes
+    path = os.path.join(TMP, 'flim_live_reload.flp')
+    a.call(V(a, 'SAVEPROJ'), a.mkstr(path), 0)
+    main_b = next(w[1] for w in fl.windows((B,)) if w[2] == 'TFruityLoopsMainForm')
+    pos = os.path.getsize(LOG)
+    seen = {'popup': False}
+    def press():                                            # B presses a key in its FL while the project loads
+        t0 = time.time()
+        while time.time() - t0 < 20 and not any('PROJECT received' in l for l in log_since(pos, B)): time.sleep(0.02)
+        for _ in range(8):                                  # (F24 down / up: harmless when it gets through)
+            ctypes.windll.user32.PostMessageW(main_b, 0x0100, 0x87, 1)
+            ctypes.windll.user32.PostMessageW(main_b, 0x0101, 0x87, 0xC0000001)
+            time.sleep(0.1)
+            seen['popup'] = seen['popup'] or any(w[2] == 'FlimSaving' for w in fl.windows((B,)))
+        while not seen['popup'] and time.time() - t0 < 20 and not any('PROJECT settled' in l for l in log_since(pos, B)):
+            seen['popup'] = any(w[2] == 'FlimSaving' for w in fl.windows((B,)))   # (it opens once FL's main thread is free)
+            time.sleep(0.05)
+    t = threading.Thread(target=press, daemon=True); t.start()
+    open_song(a, A, path)
+    t.join()
+    check("reload lock: B's key press held off", lambda: any('project is loading: held off' in l for l in log_since(pos, B)), lambda: True, wait=3)
+    check('reload lock: B showed the popup', lambda: seen['popup'], lambda: True, wait=0)
+    check('reload lock: B loaded the project', lambda: any('PROJECT settled' in l for l in log_since(pos, B)), lambda: True, wait=30)
+    time.sleep(1)
+    pos2 = os.path.getsize(LOG)
+    ctypes.windll.user32.PostMessageW(main_b, 0x0100, 0x87, 1)
+    ctypes.windll.user32.PostMessageW(main_b, 0x0101, 0x87, 0xC0000001)
+    time.sleep(1)
+    check("reload lock: B's keys get through after", lambda: any('held off' in l for l in log_since(pos2, B)), lambda: False, wait=0)
 
 if __name__ == '__main__':
     T = {k[2:]: v for k, v in list(globals().items()) if k.startswith('t_')}
