@@ -613,7 +613,11 @@ the structure op:
   - a `T_METASNAP` (name / color / route send) is queued by number; run after a renumbering it looked at
     the wrong entity and sent nothing. Now, if `g_structGen` moved since it was queued, `do_metasnap`
     hands every unsent edit of that kind back to `scan_meta` (`g_mAt = 1`), which queues them again
-    under their new numbers.
+    under their new numbers. It also waits while FL's channel list or mixer layout has a change the
+    structure scan hasn't sent yet (`chan_list_changed` / `mix_layout_changed`): the index is already in
+    the new numbering, but the op's "sc" and the others aren't. Found in the full suite: a channel insert
+    at 2 renamed 4 / 6 / 8 by shifting, those went out before the `chan.add`, and the member put the
+    names one channel off.
   - a new channel's / track's values aren't watched until `rescan` adds them (`RESCAN_MS`), and `rescan`
     takes what they are then as their start: an edit made on a just-inserted track was never sent.
     `chan_rebase` / `mix_rebaseline` now ask for a rescan on the next tick (`g_rescanNow`).
@@ -689,7 +693,9 @@ made before a structure change reached them still names channels / tracks by the
   each pattern's note hash and its name and marker list pointers (they travel with the record) and,
   for a split, how many channels each source has notes in. Afterwards every pattern that only moved
   must be where the map puts it (`patop_map_ok`; a split source and new patterns aren't compared).
-  If not: "PATTERN op: pattern N isn't old pattern M as expected", no map, baselines re-taken.
+  If not: "PATTERN op: pattern N isn't old pattern M as expected", no map, baselines re-taken, and a re-sync
+  (the leader's song for everyone), since the FLs did different things. Seen in the full suite: FL skipped
+  a peer's move here (`sub_12D8D70` on the target) that the sender's FL had made.
 - Members start at -1 (unknown) and take the counts from the leader's `project.load` when it runs
   (`T_PROJLOAD`, in queue order). Without counts (an older flim on either side) all of this is skipped
   and things work as before.
@@ -740,9 +746,19 @@ made before a structure change reached them still names channels / tracks by the
   selected by its byte at `+0xe5`; `EEPLTrackUpMenuClick` passes -1 / track -1) stay in step in quick
   bursts, also with both people at once (`live_test.py chan_wheel`, `pl_wheel`). Playlist track moves
   travel as names, colors and clips of the tracks involved.
-- Not synced: a playlist track's link (`+0xd8` type: 1 audio track linked to a mixer track, 3 instrument
-  track linked to a channel; `+0xdc` the track / channel). Linking itself doesn't travel, so moving a
-  linked track can't carry it either.
+- **Playlist track links** travel with the track's name and color (`meta.set` `"pl"`, `"lk":[type, x]`).
+  The record holds `+0xd8` type: 0 none; 1 audio track, whose mixer track is at `+0xdc` (FL's
+  `sub_12F38F0(arrangement, track, mixer track)`, from Add audio track); 3 instrument track, whose
+  channel's own id (channel `+0x794`, not its index) is at `+0xe0` (written in `sub_12F1280`). Unlinked
+  is `-1` in both. `x` goes out as the mixer track or channel *index* (ids are each FL's own) and is
+  written back the way FL's setters leave the fields. The hash takes `[type, x]` as numbers: the safety
+  net compares these hashes between FLs, and a first version that hashed the target's address (to keep
+  renumbering from reading as an edit) made every linked track look out of step there. A renumbering now
+  reads as an edit and goes out again, which changes nothing on the other side. `sc_rebase` maps `x` through mixer
+  (type 1) or channel (type 3) changes the op hadn't seen; a gone target unlinks it. FL's mixer permute
+  renumbers `+0xdc` itself. Test: `live_test.py pl_links` (audio and instrument links, then the insert,
+  channels and the linked playlist tracks moved).
+- (`EEPLTrackLinkMenuClick` / `sub_12E8EF0` is playlist track *grouping*, the `+0x3e` byte, not this.)
 - **Project number** (`g_projEpoch`, `"ep"` on every op next to `"sc"`). The leader counts the projects
   it sends (`send_project`); a member takes the number of the one it receives. An op made before the
   project an FL has (or is loading) is dropped there ("SYNC an edit made before project N ... dropped").
@@ -761,6 +777,32 @@ made before a structure change reached them still names channels / tracks by the
   a note edit still settling went out 20 ms after the `state.req`. The leader applied it after taking
   the snapshot for the member, and the member's load wiped it, so the two differed until the safety
   net. Now the leader's song wins on both.
+  (`g_projAskedAt` is `now | 1`, so its age is compared signed: unsigned, it underflowed within the same
+  tick and a chan.order went out 2 ms after the `state.req`. Same for the leader-digest age.)
+- `member_reloading` lasts until the ops held during the load have *run* (`g_replaying`, cleared when no peer
+  task waits, at most `REPLAY_MAX_MS` 5 s later; "PROJECT caught up with the changes made during the load").
+  Replayed, they only wait in the queue. A mixer change made here in that gap was flushed out ahead of
+  them (`run_task`'s `mix_struct`), as if made before ops the leader had made earlier, and everything
+  after it crossed.
+- A split's result depends on the content: one new pattern per channel with notes. A note edit still on its
+  way gave the two FLs different channel sets in the source, so the same split came out different (another
+  number of new patterns; the structure counts can't see that, both counted one split). A split now carries
+  `"chh":[...]`, a hash of each source's notes at the sender (the sum of each note's FNV, selection bit
+  cleared: the array order can differ between FLs). A receiver whose source differs doesn't apply it and
+  re-syncs ("PATTERN split of N: its notes here aren't the sender's"). (It first sent the number of
+  channels with notes; an edit that kept that number, a note moved within a channel, still got through.)
+- A peer's new channel loads its state (name included) as a task of its own after `do_addch`. Queued at
+  the back, it ran after a rename of that channel that was already queued (a member replaying the ops
+  held during its load), and put the old name back. It now goes to the front (`enqueue_front`) and runs
+  next.
+- Before the leader takes the snapshot for a member (`do_projsnap`), it sends a structure change of its own
+  that isn't out yet (`chan_struct_local` / `mix_struct`, directly: `do_struct` may put it off while peer ops
+  wait). Sent after the project, every member did it a second time on top of the project, which already
+  had it. (Re-baselining after sending instead swallowed a rename that FL's save let in between.)
+- A member gives back all its locks (unit and param) when the leader's project loads (`T_PROJLOAD`): the
+  edits they were for are gone with the load. Kept, they made the leader revert its own edits to those
+  clips / notes / knobs ("LOCK ... held by another user: local change reverted"), and the two differed
+  until the safety net.
 - A member's own edits while it loads the leader's project (a crossing's re-sync takes 1–3 s) would be
   absorbed by the load. So from the moment a member asks for the leader's project (`state.req`: join or
   re-sync, `g_projAskedAt`, at most `PROJ_ASK_MAX_MS` 15 s) until the load settles (`g_projBusy` with
@@ -1015,6 +1057,26 @@ logged.
 4. Build. The engine log should say "all 75 signatures found once ... (equal to this build's
    table)". Run the harness (`t_groups` maps the installed DLL and resolves every signature) and
    `live_test.py`.
+
+### Mouse arrows (`cur`)
+Each FL sends where its mouse is over the piano roll or playlist grid (`cursor_poll`, every `CUR_SEND_MS`
+50 ms while it moves, as song position: tick and key / track), and draws the others' as small layered
+windows (`FlimCursor`, `cursor_update` on a 40 ms main-thread timer) where that position is in its own view.
+They flickered (shown / hidden many times a second):
+- The sender only counted the mouse as over the grid when the window under it *was* the grid. FL's hints,
+  tooltips and drag images open right under the mouse, so it kept flipping to "not over a grid". Now a
+  small FL pop-up (or another arrow) at the point doesn't count (`cur_passthrough`: our process, `WS_POPUP`,
+  under 520 x 240), and "left" only goes out after `CUR_LEAVE_MS` (350 ms) off the grid.
+- The receiver hid the arrow at once for a passing reason ("not over a grid", "not in view", "covered"),
+  and re-raised it (`SetWindowPos(HWND_TOP ... SWP_SHOWWINDOW)`) on every tick. Now such a reason keeps it
+  where it was for `CUR_HIDE_MS` (350 ms), and the window only moves when its spot changes. (The first
+  version of that grace period hid at once anyway: `hideSince = now | 1` can be 1 ms ahead of `now`, and the
+  unsigned difference was 4294967295 ms. Signed now.)
+- Measured with a scripted third person sending positions that flip to "not over a grid" every 200 ms:
+  before, the arrow flipped 13-16 times in 4.5 s; after, it showed once and stayed.
+- "Show cursors" in flim's window (`flim.ini` `show_cursors=0` to hide; `g_showCursors`, re-read on
+  `GUI_SETTINGS`) hides the others' arrows here. This FL still sends its own.
+- `FLIM_CURSOR_NOCOVER=1` (tests) draws arrows even where another window covers FL.
 
 ## 9. Networks and mixed FL builds
 

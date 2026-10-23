@@ -866,6 +866,7 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         SendDlgItemMessageW(dlg, IDC_S_LOCK, EM_LIMITTEXT, 2, 0);
         SendDlgItemMessageW(dlg, IDC_S_LOG, EM_SETLIMITTEXT, 0, 0);
         CheckDlgButton(dlg, IDC_S_DETAIL, flimcfg_log_detailed() ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(dlg, IDC_S_CURSORS, flimcfg_show_cursors() ? BST_CHECKED : BST_UNCHECKED);
         {
             int on, m = flimcfg_backup_min(&on);
             CheckDlgButton(dlg, IDC_M_BACKUP, on ? BST_CHECKED : BST_UNCHECKED);
@@ -998,6 +999,10 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
             return TRUE; }
         case IDC_M_SONG:                 // typed in while FL runs: an untitled project gets it now
             if (HIWORD(wp) == EN_KILLFOCUS) { main_save_song(dlg); engine_send(dlg, GUI_SETTINGS, NULL); }
+            return TRUE;
+        case IDC_S_CURSORS:              // the others' mouse arrows in this FL
+            flimcfg_set(L"show_cursors", IsDlgButtonChecked(dlg, IDC_S_CURSORS) == BST_CHECKED ? NULL : L"0");
+            engine_send(dlg, GUI_SETTINGS, NULL);
             return TRUE;
         case IDC_S_DETAIL: {
             int on = IsDlgButtonChecked(dlg, IDC_S_DETAIL) == BST_CHECKED;

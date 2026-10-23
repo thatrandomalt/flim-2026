@@ -232,11 +232,29 @@ def t_target_move():
     time.sleep(4)                                               # (and it stays: nothing echoes back)
     check('channel target stays', lambda: target(b, 0), lambda: target(a, 0), wait=0)
     for t, d in [(6, -1), (5, -1)]:                             # B moves it back while A's still fresh
-        mix_move(b, t, d); time.sleep(0.06)
+        wait_reload(b); mix_move(b, t, d); time.sleep(0.06)
     check('channel target after B\'s moves', lambda: target(a, 0), lambda: target(b, 0), wait=5)
 
 # Shift + mouse wheel over a channel / a playlist track header moves it one step per notch: quick bursts.
+# An FL asks for / loads the leader's project and catches up: a user can't act then (input held) and it sends
+# nothing, but the probe bypasses that, so test edits on that side wait for it like a user would.
+_rl = {}
+def reloading(pid):
+    st = _rl.setdefault(pid, {'pos': os.path.getsize(LOG), 'loading': False})
+    with open(LOG, 'rb') as f:
+        f.seek(st['pos']); data = f.read()
+    end = data.rfind(bytes([10])) + 1                       # (whole lines only; the rest next time)
+    st['pos'] += end
+    for l in data[:end].decode('utf-8', 'replace').splitlines():
+        if '[%d]' % pid not in l: continue
+        if 'kind":"state.req"' in l and 'OP out' in l or 'PROJECT received' in l: st['loading'] = True
+        elif 'PROJECT caught up' in l: st['loading'] = False
+    return st['loading']
+def wait_reload(p):
+    pid = A if p is a else B; t0 = time.time()
+    while reloading(pid) and time.time() - t0 < 15: time.sleep(0.2)
 def chan_step(p, i, d):                                         # FL's move selected (4 up / 5 down) with only channel i
+    wait_reload(p)
     for k, c in enumerate(chans(p)): p.w(c + 0x32c, bytes([k == i]))
     p.call(0x1042800, p.q(p.g(0x15e14a0)), 4 if d < 0 else 5, p.d(p.g(0x15e3a60)), 1)
 def rack(p): return [(n, target(p, i)) for i, n in enumerate(chan_names(p))]
@@ -257,6 +275,7 @@ def t_chan_wheel():
 
 def pl_names(p, n=8): return [ustr(p, p.q(arr(p) + t * 0x114 + 0x24)) for t in range(1, n + 1)]
 def pl_step(p, t, d):                                           # FL's move selected playlist tracks: up (-1) / down (+1)
+    wait_reload(p)
     for k in range(1, 12): p.w(arr(p) + k * 0x114 + 0xe5, bytes([k == t]))   # (+0xe5: selected)
     p.call(0x12eb580, arr(p), d & 0xffffffff, t)                # (arr, direction, track: -1 = the selected one)
 def t_pl_wheel():
@@ -278,6 +297,31 @@ def t_pl_wheel():
     for t, d in [(1, 1), (2, 1)]: pl_step(a, t, d); time.sleep(0.06)
     th.join()
     check('playlist after both at once', lambda: pl(a), lambda: pl(b), wait=30)
+
+# A playlist track's link: an audio track (linked to a mixer track, FL's sub_12F38F0) or an instrument track
+# (linked to a channel by the channel's own id, +0x794). Then the linked things move.
+def pl_link(p, t):
+    r = arr(p) + t * 0x114; lt = p.d(r + 0xd8)
+    if lt == 1: return (1, p.d(r + 0xdc))
+    if lt == 3: ids = [p.d(c + 0x794) for c in chans(p)]; i = p.d(r + 0xe0); return (3, ids.index(i) if i in ids else -1)
+    return (lt, -1)
+def links_pl(p): return [pl_link(p, t) for t in range(1, 9)]
+def t_pl_links():
+    while len(chans(a)) < 3: add_named(a, len(chans(a)), 'L%d' % len(chans(a))); time.sleep(1.5)
+    a.call(0x12f38f0, arr(a), 3, 5)                             # track 3: audio track on insert 5
+    check('audio track link', lambda: links_pl(a), lambda: links_pl(b), wait=5)
+    r = arr(a) + 4 * 0x114                                      # track 4: instrument track of channel 1
+    a.w(r + 0xd8, struct.pack('<i', 3)); a.w(r + 0xe0, struct.pack('<i', a.d(chans(a)[1] + 0x794)))
+    check('instrument track link', lambda: links_pl(a), lambda: links_pl(b), wait=5)
+    for t, d in [(5, 1), (6, 1), (7, -1)]: mix_move(a, t, d); time.sleep(0.06)   # its insert moved in a burst
+    check('links after the insert moved', lambda: links_pl(a), lambda: links_pl(b), wait=6)
+    chan_step(a, 1, -1); time.sleep(0.06); chan_step(a, 0, 1)   # its channel moved up and back
+    chan_step(b, 2, -1)                                         # (and B moves another at the same time)
+    check('links after channels moved', lambda: links_pl(a), lambda: links_pl(b), wait=30)
+    for t, d in [(3, 1), (4, 1)]: pl_step(a, t, d); time.sleep(0.06)   # the linked tracks moved in the playlist
+    check('links after playlist tracks moved', lambda: links_pl(a), lambda: links_pl(b), wait=8)
+    colors = lambda p: [p.d(c + 0x78) for c in chans(p)]       # (a linked channel takes no track's color on B only)
+    check('channel colors after the links', lambda: colors(a), lambda: colors(b), wait=4)
 
 def t_patlen():
     a.w(pat_rec(a, 2) + 0x44, struct.pack('<i', 4 * a.d(a.g(0x15e25f8))))   # 4 beats of PPQ
@@ -857,7 +901,7 @@ def t_stress_both():
             for l in data[:data.rfind(b'\n') + 1].decode('utf-8', 'replace').splitlines():
                 if '[%d]' % pid not in l: continue
                 if 'kind":"state.req"' in l and 'OP out' in l or 'PROJECT received' in l: st['loading'] = True
-                elif 'PROJECT settled' in l: st['loading'] = False
+                elif 'PROJECT caught up' in l: st['loading'] = False    # (its held changes have run too)
             return st['loading']
         for k in range(int(os.environ.get('FLIM_STRESS_OPS', '40'))):
             t0 = time.time()
@@ -871,9 +915,10 @@ def t_stress_both():
     for t in ts: t.start()
     for t in ts: t.join()
     def state(p):                                           # (notes at the same spot: in either order)
-        s = shared_state(p); s['notes'] = [sorted(unsel(notes(p, pt))) for pt in range(1, 16)]
-        s['patterns'] = pat_names(p, 15)
+        s = shared_state(p); s['notes'] = [sorted(unsel(notes(p, pt))) for pt in range(1, 61)]
+        s['patterns'] = [(i, ustr(p, p.q(pat_rec(p, i))), p.d(pat_rec(p, i) + 8), p.d(pat_rec(p, i) + 0x44)) for i in range(1, 61)]   # name, color, length
         s['mutes'] = s['mutes'][:-1]                        # (not the Current track: FL's save / load doesn't keep its mute)
+        s['channel colors'] = [p.d(c + 0x78) for c in chans(p)]
         return s
     time.sleep(6)
     try:                                                    # what differs before any re-sync repairs it

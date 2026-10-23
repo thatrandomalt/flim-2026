@@ -36,6 +36,7 @@
 #define IDC_S_LOCK       1132      //          seconds a plugin stays ours after our last change
 #define IDC_S_DETAIL     1133      //          the detailed log on / off
 #define IDC_S_EXPORT     1134      //          save the logs as a zip to send
+#define IDC_S_CURSORS    1135      //          the others' mouse arrows shown / not
 
 // Engine: flim's startup splash (shown instead of FL's Title.png, only in flim's FL)
 #define IDR_SPLASH       301

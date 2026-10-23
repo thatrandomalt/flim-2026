@@ -103,7 +103,8 @@ e.g. `Connected to flim.example.com · leader · 2 people · Alex: Piano roll - 
 
 When someone's mouse is over the piano roll or the playlist, you see a small arrow with their name at
 the same spot in yours (the same note and bar, whatever your zoom or scroll), as long as you are looking
-at the same pattern or arrangement. The arrows can't be clicked and never get in your way.
+at the same pattern or arrangement. The arrows can't be clicked and never get in your way. To hide them,
+untick **Show cursors** in flim's window.
 
 ---
 

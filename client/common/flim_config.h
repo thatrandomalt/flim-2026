@@ -95,6 +95,12 @@ static int flimcfg_log_detailed(void) {
     flimcfg_get(L"log_detailed", v, 8);
     return v[0] && _wtoi(v) != 0;
 }
+// the others' mouse arrows over the piano roll / playlist: on unless turned off ("show_cursors=0")
+static int flimcfg_show_cursors(void) {
+    wchar_t v[8];
+    flimcfg_get(L"show_cursors", v, 8);
+    return !v[0] || _wtoi(v) != 0;
+}
 
 // Documents\flim (crash reports, flim's own sample cache) and the projects folder (flim.ini
 // projects_dir, default Documents\flim\Projects): one folder per song, see the engine's song folders.

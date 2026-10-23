@@ -361,11 +361,15 @@ static volatile LONG g_sc[SC_N] = { 0, 0, 0 };
 // loading) is dropped there: the leader applied a member's edit after its snapshot while the member's load
 // wiped it, and the two differed until the safety net. Now both lose that one edit.
 static volatile LONG g_projEpoch = 0;
+static volatile LONG g_showCursors = 1;    // flim's window: "Show cursors" (flim.ini show_cursors)
 static __declspec(thread) int t_msgEp = -1;
 static void sc_done(int kind, const int *from, int n);
 static void sc_done_patop(int k, const int *pats, int n, int delta, int target);
 static void pat_sigs_take(int k, const int *pats, int n);
+static unsigned char g_patPreCh[MAX_PAT];   // split: channels with notes in each source (pat_sigs_take)
+static uint32_t g_patPreH[MAX_PAT];         // split: each source's notes, in any order (selection ignored)
 static void ulock_release_moved(const char *pre1, const char *pre2, const int *from, int n);
+static void send_lock(const char *t, uint32_t id);
 static void sc_done_del(int k, int n0);
 static uint32_t sc_mix_map_value(uint32_t v, int from);
 static void sc_done_add(int k, int n0);
@@ -813,6 +817,23 @@ static void enqueue(const QItem *it) {
         q->gen = g_structGen;
         if (q->peer) InterlockedIncrement(&g_peerQueued);
         g_qt = nt;
+    } else logmsg("queue full, dropped task type %d", it->type);
+    LeaveCriticalSection(&g_qLock);
+    wake_main();
+}
+
+// A task that must run next, ahead of what is already queued (main thread, from a task).
+static void enqueue_front(const QItem *it) {
+    int i, nh;
+    EnterCriticalSection(&g_qLock);
+    nh = (g_qh - 1 + QCAP) % QCAP;
+    if (nh != g_qt) {
+        QItem *q = &g_q[nh];
+        *q = *it;
+        for (i = 0; i < SC_N; i++) q->sc[i] = -1;
+        q->gen = g_structGen;
+        if (q->peer) InterlockedIncrement(&g_peerQueued);
+        g_qh = nh;
     } else logmsg("queue full, dropped task type %d", it->type);
     LeaveCriticalSection(&g_qLock);
     wake_main();
@@ -1746,8 +1767,8 @@ static void do_addch(const QItem *it) {
     {   // its state loads on a later tick, into this channel wherever it is by then
         QItem q; memset(&q, 0, sizeof(q));
         q.type = T_LOAD; q.unit = U_CH; q.a = pos < n ? pos : n; q.path = it->path; q.chobj = obj;
-        enqueue(&q);
-    }
+        enqueue_front(&q);                                // next: its name comes with it, and a rename queued
+    }                                                     // after the add (a replay) must not be overwritten by it
 }
 
 // A peer deleted channel a of the list everyone has (it->mode = that list's length then).
@@ -2794,6 +2815,31 @@ static char *pl_track(int i) {
     char *a = arr_obj(i / 512);
     return a ? a + (size_t)(i % 512) * PL_TRK_STRIDE : NULL;
 }
+// A playlist track's link (FL: sub_12F38F0(arrangement, track, mixer track) for an audio track; instrument tracks
+// write it in sub_12F1280): +0xd8 type (0 none, 1 audio track: mixer track at +0xdc; 3 instrument track: the
+// channel's own id, channel +0x794, at +0xe0; unlinked -1). Sent as [type, mixer track / channel INDEX] (ids are
+// each FL's own); hashed by what it points to, so renumbering it isn't an edit.
+#define PL_TRK_LTYPE  0xd8
+#define PL_TRK_LMIX   0xdc
+#define PL_TRK_LCHAN  0xe0
+#define CH_ID         0x794
+static int chan_index_of_id(int id) {
+    void **items; int n = chan_list(&items), k;
+    for (k = 0; items && k < n; k++) if (*(int32_t *)((char *)items[k] + CH_ID) == id) return k;
+    return -1;
+}
+static void pl_link_get(const char *r, int *type, int *x) {   // x: mixer track / channel index, -1 if none
+    *type = *(int32_t *)(r + PL_TRK_LTYPE);
+    *x = *type == 1 ? *(int32_t *)(r + PL_TRK_LMIX) : *type == 3 ? chan_index_of_id(*(int32_t *)(r + PL_TRK_LCHAN)) : -1;
+}
+// (By number, not by what it points to: the safety net compares these hashes between FLs, where object
+// addresses differ. A renumbering then reads as an edit and is sent again, which changes nothing there.)
+static uint64_t pl_link_hash(uint64_t h, const char *r) {
+    int lt, lx;
+    pl_link_get(r, &lt, &lx);
+    h = fnv_add(h, &lt, 4);
+    return fnv_add(h, &lx, 4);
+}
 static int meta_valid(int type, int i) {
     switch (type) {
     case M_MIX: case M_ROUTE: return i >= 0 && i < mix_count();
@@ -2866,6 +2912,7 @@ static uint64_t meta_hash(int type, int i) {
             if (!r) return 0;
             h = fnv_add(h, r + PL_TRK_COLOR, 4);
             h = fnv_ustr(h, *(wchar_t **)(r + PL_TRK_NAME));
+            h = pl_link_hash(h, r);
             break; }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return 1; }
@@ -2933,6 +2980,7 @@ static void meta_absorb(void) {
     for (t = 0; t < M_NTYPES; t++)
         for (i = 0; i < meta_cap(t); i++) {
             if (g_mAt[t][i] || g_mSeen[t][i] != g_mHash[t][i] || (h = meta_hash(t, i)) == g_mPre[t][i]) continue;
+            if (h != g_mHash[t][i]) logmsg("META %s %d changed along with the apply: taken as known", M_TAG[t], i);
             g_mSeen[t][i] = g_mHash[t][i] = h;
         }
 }
@@ -3213,11 +3261,14 @@ static char *meta_json(int t, int i) {
             r = pat_rec(i); color = *(uint32_t *)(r + PAT_COLOR); name = *(wchar_t **)(r + PAT_NAME);
             o += sprintf_s(m + o, cap - o, ",\"l\":%d", *(int32_t *)(r + PAT_LENGTH));
             break;
-        case M_PLT:
+        case M_PLT: {
+            int lt, lx;
             r = pl_track(i);
             if (!r) { free(m); return NULL; }
             color = *(uint32_t *)(r + PL_TRK_COLOR); name = *(wchar_t **)(r + PL_TRK_NAME);
-            break;
+            pl_link_get(r, &lt, &lx);
+            o += sprintf_s(m + o, cap - o, ",\"lk\":[%d,%d]", lt, lx);
+            break; }
         case M_ROUTE: {
             int d, k = 0, nm = mix_count();
             r = mix_rec(i);
@@ -3270,6 +3321,12 @@ static void do_metasnap(const QItem *it) {
         // renumbered since it was queued (meta_remap moved the edit's baseline along): the index is stale, so
         // every unsent edit of this kind goes back to scan_meta, which queues it again under its new number
         for (j = 0; j < meta_cap(t); j++) if (g_mSeen[t][j] != g_mHash[t][j] && !g_mAt[t][j]) g_mAt[t][j] = 1;
+        return;
+    }
+    if (chan_list_changed() || mix_layout_changed()) {
+        // a channel / track insert or delete not sent yet: the index is already in its new numbering, which
+        // the others (and the op's "sc") don't have until it goes out. Back to scan_meta until it has.
+        if (!g_mAt[t][i]) g_mAt[t][i] = 1;
         return;
     }
     h = meta_hash(t, i);
@@ -3524,11 +3581,38 @@ static void do_meta(const QItem *it) {
             break; }
         case M_PLT: {
             char *r = pl_track(i);
+            const char *lk = strstr(m, "\"lk\":[");
             if (!r) break;
-            if ((name && !ustr_eq(*(wchar_t **)(r + PL_TRK_NAME), name)) || (hasC && *(uint32_t *)(r + PL_TRK_COLOR) != color))
+            // FL's setter also recolors the track's linked channel. Not from here: the link may be one this op
+            // replaces (tracks moved), and a channel recolored at the sender comes as its own edit anyway. So
+            // the track is unlinked around it, and its link written after.
+            if ((name && !ustr_eq(*(wchar_t **)(r + PL_TRK_NAME), name)) || (hasC && *(uint32_t *)(r + PL_TRK_COLOR) != color)) {
+                int32_t lt0 = *(int32_t *)(r + PL_TRK_LTYPE);
+                *(int32_t *)(r + PL_TRK_LTYPE) = 0;
                 ((pltrack_t)(g_flBase + (PLTRACK_VA - IMG_BASE)))(arr_obj(i / 512), i % 512,
                     name ? meta_name_arg(name) : *(wchar_t **)(r + PL_TRK_NAME),
                     hasC ? color : *(uint32_t *)(r + PL_TRK_COLOR));
+                *(int32_t *)(r + PL_TRK_LTYPE) = lt0;
+            }
+            if (lk) {                                   // its link: written as FL's own setters leave it (they also
+                int lt = 0, lx = -1, cur, cx;           // rename the track; the name comes with this op anyway)
+                char *e;
+                lt = (int)strtol(lk + 6, &e, 10);
+                if (*e == ',') lx = (int)strtol(e + 1, NULL, 10);
+                pl_link_get(r, &cur, &cx);
+                if (lt != cur || lx != cx) {
+                    void **items; int n = chan_list(&items);
+                    if (lt == 1 && lx >= 0 && lx < mix_count()) {
+                        *(int32_t *)(r + PL_TRK_LTYPE) = 1; *(int32_t *)(r + PL_TRK_LMIX) = lx; *(int32_t *)(r + PL_TRK_LCHAN) = -1;
+                    } else if (lt == 3 && items && lx >= 0 && lx < n) {
+                        *(int32_t *)(r + PL_TRK_LTYPE) = 3; *(int32_t *)(r + PL_TRK_LMIX) = -1;
+                        *(int32_t *)(r + PL_TRK_LCHAN) = *(int32_t *)((char *)items[lx] + CH_ID);
+                    } else {
+                        *(int32_t *)(r + PL_TRK_LTYPE) = 0; *(int32_t *)(r + PL_TRK_LMIX) = -1; *(int32_t *)(r + PL_TRK_LCHAN) = -1;
+                    }
+                    playlist_refresh();
+                }
+            }
             break; }
         case M_MARK: case M_PMARK:
             marks_apply(t, i, m);
@@ -3845,7 +3929,8 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
         g_plugLockMs = flimcfg_lock_s() * 1000;
         backup_setting();
         g_logDetailed = flimcfg_log_detailed();
-        logmsg("settings: plugin lock %ld s, project backup every %ld min (0 = off), detailed log %s", g_plugLockMs / 1000, g_backupMin,
+        InterlockedExchange(&g_showCursors, flimcfg_show_cursors());
+        logmsg("settings: others' cursors %s; plugin lock %ld s, project backup every %ld min (0 = off), detailed log %s", g_showCursors ? "shown" : "hidden", g_plugLockMs / 1000, g_backupMin,
                g_logDetailed ? "on" : "off");
         if (g_isLeader && g_netState == NET_ON) leader_name_project();   // a song name typed in mid-session
         break;
@@ -3868,10 +3953,18 @@ static volatile DWORD g_projAskedAt = 0;       // member: asked for it (state.re
 #define PROJ_ASK_MAX_MS 15000                  // (no answer by then: let the user work again)
 // Member: the leader's project is on its way or loading. What the user does meanwhile would be lost to the
 // load (it replaces the song), so input is held off then, as while the host saves (input_held).
+// It lasts until the ops held during the load have run too (g_replaying): replayed, they only wait in the queue,
+// and a change made here before they ran went out ahead of ops the leader had made earlier (they all crossed).
+static volatile LONG g_replaying = 0;
+static volatile DWORD g_replayAt = 0;
+#define REPLAY_MAX_MS 5000                     // (a busy session keeps the queue from ever being empty: not longer)
 static int member_reloading(void) {
     DWORD a = g_projAskedAt;
     if (g_isLeader) return 0;
-    return (g_projBusy && g_projRemote) || (a && GetTickCount() - a < PROJ_ASK_MAX_MS);
+    if (g_replaying && !g_projBusy && (g_peerQueued <= 0 || GetTickCount() - g_replayAt > REPLAY_MAX_MS) &&
+        InterlockedExchange(&g_replaying, 0))
+        logmsg("PROJECT caught up with the changes made during the load");
+    return (g_projBusy && g_projRemote) || g_replaying || (a && (LONG)(GetTickCount() - a) < PROJ_ASK_MAX_MS);   // (signed: a is now | 1)
 }
 static volatile LONG  g_projDoneQueued = 0;
 static volatile DWORD g_projSince = 0;
@@ -4150,7 +4243,7 @@ static void do_projdone(void) {
     }
     if (closing_now()) { logmsg("PROJECT settled while FL is closing: nothing sent"); proj_end(); return; }
     logmsg("PROJECT settled after %lu ms (%d channels, %ld params)", GetTickCount() - g_projSince, g_nChKnown, g_nslot);
-    if (remote) { proj_end(); replay_held(); return; }
+    if (remote) { g_replayAt = GetTickCount(); InterlockedExchange(&g_replaying, 1); proj_end(); replay_held(); member_reloading(); return; }
     proj_end();
     if (g_isLeader) leader_project_loaded();
     else {
@@ -4240,7 +4333,13 @@ static void resync_tick(DWORD now) {
 static void do_projsnap(void) {
     wchar_t cur[MAX_PATH];
     size_t n = 0;
-    unsigned char *d = project_snapshot(&n);
+    unsigned char *d;
+    // A structure change of ours not sent yet goes out first, as ops ahead of the project: sent after it, the
+    // members (who have it from the project) did it a second time.
+    // (directly: do_struct may put it off while peer ops wait)
+    if (chan_list_changed()) { void **items; int nc = chan_list(&items); if (items) chan_struct_local(items, nc, GetTickCount()); }
+    if (mix_layout_changed()) mix_struct();
+    d = project_snapshot(&n);
     if (!d) return;
     fl_ustr(PROJNAME_VA, cur, MAX_PATH);
     send_project(d, n, cur[0] ? base_name(cur) : NULL);
@@ -4517,7 +4616,14 @@ static uint64_t patop_common(int k, void *self, uint64_t a, uint64_t b, uint64_t
         char m[8192];
         int o = sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"pat.op\",\"s\":%d,\"p\":[", PATOP_SLOT[k]);
         for (i = 0; i < np; i++) o += sprintf_s(m + o, sizeof(m) - o, "%s%d", i ? "," : "", pl[i]);
-        sprintf_s(m + o, sizeof(m) - o, "],\"a\":%d,\"b\":%d,\"c\":%u}}", (int)c, (int)d, (unsigned)(uint16_t)e);
+        o += sprintf_s(m + o, sizeof(m) - o, "],\"a\":%d,\"b\":%d,\"c\":%u", (int)c, (int)d, (unsigned)(uint16_t)e);
+        if (k == 5) {                                // split: each source's notes, as a hash (do_patop)
+            o += sprintf_s(m + o, sizeof(m) - o, ",\"chh\":[");
+            for (i = 0; i < np && o < (int)sizeof(m) - 16; i++)
+                o += sprintf_s(m + o, sizeof(m) - o, "%s%u", i ? "," : "", pl[i] >= 1 && pl[i] < MAX_PAT ? g_patPreH[pl[i]] : 0);
+            o += sprintf_s(m + o, sizeof(m) - o, "]");
+        }
+        sprintf_s(m + o, sizeof(m) - o, "}}");
         ws_send(m);
         logmsg("PATTERN op sent: %.200s", m);
     }
@@ -4605,6 +4711,22 @@ static void do_patop(const QItem *it) {
     int_after(m, NULL, "\"b\":", &b);
     int_after(m, NULL, "\"c\":", &c);
     pat_sigs_take(k, pats, n);                               // (sc_done_patop checks the map against what FL did)
+    if (k == 5 && (q = strstr(m, "\"chh\":[")) != NULL) {
+        // a split moves a source's notes into new patterns: if a source here has other notes than the sender's
+        // had (a note edit still on its way), the same split would come out different. Not that: re-sync.
+        int x = 0;
+        for (q += 7; x < n && *q && *q != ']'; x++) {
+            char *e;
+            uint32_t want = (uint32_t)strtoul(q, &e, 10);
+            if (e == q) break;
+            q = *e == ',' ? e + 1 : e;
+            if (pats[x] >= 1 && pats[x] < MAX_PAT && want != g_patPreH[pats[x]]) {
+                logmsg("PATTERN split of %d: its notes here aren't the sender's; re-syncing instead", pats[x]);
+                resync("a pattern split crossed a note edit");
+                return;
+            }
+        }
+    }
     InterlockedExchange(&g_patRemote, 1);
     InterlockedExchange(&g_mbAuto, 1);
     InterlockedIncrement(&g_patDepth);
@@ -5289,12 +5411,14 @@ static void focus_summary(char *out, int cap, const char *sep) {
 #define PR_KEYH       0x520
 #define TRK_TOP       0xb4         // playlist track (arrangement + t * 0x114): top y and height, pixels
 #define TRK_H         0xb8
-#define CUR_SEND_MS   80
+#define CUR_SEND_MS   50
+#define CUR_LEAVE_MS  350          // the mouse off the grid this long before the others hear it left
+#define CUR_HIDE_MS   350          // an arrow stays put this long before a passing reason hides it
 #define CUR_STALE_MS  30000        // nothing from them for this long: hide (they walked away)
 #define CUR_KEY       RGB(255, 0, 254)   // transparent colour of the arrow windows
 
 typedef struct { HWND h; int L, T, W, H, hs, vs, topkey, keyh; double tpp; char *arr; } EdGeom;
-typedef struct { char id[64]; char w[4]; int p, x, y, why; DWORD at; HWND ov; char name[64]; } PeerCursor;
+typedef struct { char id[64]; char w[4]; int p, x, y, why; DWORD at; HWND ov; char name[64]; int sx, sy; DWORD hideSince; } PeerCursor;
 static PeerCursor g_cur[FOCUS_MAX];
 static int g_curNoCover = 0;               // FLIM_CURSOR_NOCOVER=1 (tests): show arrows even where FL is covered
 static int g_ncur = 0;                     // guarded by g_netTextLock
@@ -5333,13 +5457,29 @@ static int trk_rows(char *arr, int t, int *top, int *h) {
     return 1;
 }
 
+// A window at a grid point that doesn't really cover it: another arrow, or one of FL's small pop-ups (its hints,
+// tooltips and drag images open right under the mouse). Taken as covering, they flipped the sender between "over
+// the grid" and "not", and the receiver's arrow between shown and hidden: it flickered.
+#define CUR_POPUP_W   520
+#define CUR_POPUP_H   240
+static int cur_passthrough(HWND hw) {
+    HWND root = hw ? GetAncestor(hw, GA_ROOT) : NULL;
+    DWORD pid = 0;
+    RECT r;
+    if (!root) return 0;
+    if (wnd_class_is(root, "FlimCursor")) return 1;
+    GetWindowThreadProcessId(root, &pid);
+    if (pid != GetCurrentProcessId() || root == g_mainForm || !(GetWindowLongW(root, GWL_STYLE) & WS_POPUP)) return 0;
+    return GetWindowRect(root, &r) && r.right - r.left < CUR_POPUP_W && r.bottom - r.top < CUR_POPUP_H;
+}
+
 // Screen point -> song position on editor pl: x = tick, y = key * 100 (piano roll) or
 // track * 100 + percent into the track (playlist). 0 = not over that grid.
 static int cur_from_screen(int pl, POINT s, int *ctx, int *x, int *y) {
     EdGeom g;
     HWND hw = WindowFromPoint(s);
     int t, top, h, yy;
-    if (!ed_geom(pl, &g) || (hw != g.h && !IsChild(g.h, hw))) return 0;
+    if (!ed_geom(pl, &g) || (hw != g.h && !IsChild(g.h, hw) && !cur_passthrough(hw))) return 0;
     ScreenToClient(g.h, &s);
     s.x -= g.L; s.y -= g.T;
     if (s.x < 0 || s.y < 0 || s.x >= g.W || s.y >= g.H) return 0;
@@ -5371,7 +5511,7 @@ static int cur_to_screen(int pl, int x, int y, POINT *s) {
     if (s->x < g.L || s->y < g.T || s->x >= g.L + g.W || s->y >= g.T + g.H) return 0;
     ClientToScreen(g.h, s);
     hw = WindowFromPoint(*s);          // a plugin or another app on top? (our arrows let the point through)
-    return g_curNoCover || hw == g.h || IsChild(g.h, hw) || wnd_class_is(hw, "FlimCursor") ? 1 : -1;
+    return g_curNoCover || hw == g.h || IsChild(g.h, hw) || cur_passthrough(hw) ? 1 : -1;
 }
 
 // Poll thread: tell the others where our mouse is (only while it is over a grid and moving).
@@ -5379,6 +5519,7 @@ static void cursor_poll(DWORD now) {
     static DWORD last = 0;
     static char sent[96] = "";
     char cur[96], m[192];
+    static DWORD onAt = 0;
     POINT s;
     int pl, ctx = 0, x = 0, y = 0, on = 0;
     if (now - last < CUR_SEND_MS || !g_ws) return;
@@ -5389,6 +5530,8 @@ static void cursor_poll(DWORD now) {
                 on = 1;
                 sprintf_s(cur, sizeof(cur), "\"w\":\"%s\",\"p\":%d,\"x\":%d,\"y\":%d", pl ? "pl" : "pr", ctx, x, y);
             }
+    if (on) onAt = now;
+    else if (onAt && now - onAt < CUR_LEAVE_MS) return;      // (passing over something: not "left" yet)
     if (!on) strcpy_s(cur, sizeof(cur), "\"w\":\"\"");
     if (strcmp(cur, sent) == 0) return;
     strcpy_s(sent, sizeof(sent), cur);
@@ -5494,7 +5637,9 @@ static HWND cursor_window(const char *id, const char *name) {
     return h;
 }
 
-// Main thread (net bar timer): place, show or hide every peer's arrow.
+// Main thread (net bar timer): place, show or hide every peer's arrow. A passing reason to hide it (the mouse
+// briefly off the grid, a pop-up over it, a scroll) keeps it where it was for CUR_HIDE_MS first; and the window
+// is only moved when its spot changes (moving it every tick re-raised it and could repaint it each time).
 static void cursor_update(void) {
     DWORD now = GetTickCount();
     int i, live = g_netState == NET_ON && g_mainForm && !IsIconic(g_mainForm);
@@ -5504,28 +5649,34 @@ static void cursor_update(void) {
         POINT s;
         char pat[96], name[64];
         const char *p = NULL, *q;
-        int pl = c->w[1] == 'l', why;
+        int pl = c->w[1] == 'l', why, shown = c->ov && IsWindowVisible(c->ov);
         static const char *const WHY[] = { "shown", "not connected / FL minimized", "not over a grid", "idle",
-                                           "left", "other pattern / arrangement", "not in view", "covered" };
+                                           "left", "other pattern / arrangement", "not in view", "covered", "cursors turned off" };
         sprintf_s(pat, sizeof(pat), "\"id\":\"%s\",\"name\":\"", c->id);
-        why = !live ? 1 : !c->w[0] ? 2 : now - c->at >= CUR_STALE_MS ? 3 : !(p = strstr(g_peersJson, pat)) ? 4 :
+        why = !g_showCursors ? 8 : !live ? 1 : !c->w[0] ? 2 : now - c->at >= CUR_STALE_MS ? 3 : !(p = strstr(g_peersJson, pat)) ? 4 :
               c->p != (pl ? cur_arr() : cur_pat()) ? 5 : 0;
         if (!why) { int r = cur_to_screen(pl, c->x, c->y, &s); why = r > 0 ? 0 : r == 0 ? 6 : 7; }
         if (why != c->why) { c->why = why; logmsg("CURSOR %s: %s", c->id, WHY[why]); }
         if (why) {
-            if (c->ov && IsWindowVisible(c->ov)) ShowWindow(c->ov, SW_HIDE);
+            int passing = why == 2 || why == 6 || why == 7;
+            if (!c->hideSince) c->hideSince = now | 1;
+            if (shown && passing && (LONG)(now - c->hideSince) < CUR_HIDE_MS) continue;   // (stays where it was, for now;
+            if (shown) ShowWindow(c->ov, SW_HIDE);                                          //  signed: hideSince is now | 1)
             continue;
         }
+        c->hideSince = 0;
         p += strlen(pat);
         q = strchr(p, '"');
         if (!q || q - p >= (int)sizeof(name)) continue;
         memcpy(name, p, q - p); name[q - p] = 0;
-        if (c->ov && strcmp(name, c->name) != 0) { DestroyWindow(c->ov); c->ov = NULL; }   // renamed: new label size
+        if (c->ov && strcmp(name, c->name) != 0) { DestroyWindow(c->ov); c->ov = NULL; shown = 0; }   // renamed: new label size
         if (!c->ov) {
             strcpy_s(c->name, sizeof(c->name), name);
             if (!(c->ov = cursor_window(c->id, name))) continue;
         }
-        SetWindowPos(c->ov, HWND_TOP, s.x, s.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (shown && s.x == c->sx && s.y == c->sy) continue;
+        c->sx = s.x; c->sy = s.y;
+        SetWindowPos(c->ov, HWND_TOP, s.x, s.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | (shown ? SWP_NOZORDER : SWP_SHOWWINDOW));
     }
     LeaveCriticalSection(&g_netTextLock);
 }
@@ -5944,7 +6095,6 @@ static void pat_rebase(const int *from) {
 // source has notes in.
 typedef struct { uint64_t notes; void *name, *marks; } PatSig;
 static PatSig g_patPre[MAX_PAT];
-static unsigned char g_patPreCh[MAX_PAT];
 static PatSig pat_sig_of(int p) {
     PatSig g;
     char *r = pat_rec(p);
@@ -5962,10 +6112,11 @@ static void pat_sigs_take(int k, const int *pats, int n) {
             if (pats[i] < 1 || pats[i] >= MAX_PAT) continue;
             d = notes_copy(pats[i], &cnt);
             memset(seen, 0, sizeof(seen));
-            g_patPreCh[pats[i]] = 0;
+            g_patPreCh[pats[i]] = 0; g_patPreH[pats[i]] = 0;
             for (j = 0; d && j < cnt; j++) {
                 uint16_t c = *(uint16_t *)(d + (size_t)j * NOTE_SIZE + NOTE_CH_OFS);
                 if (c < MAX_CH && !seen[c]) { seen[c] = 1; g_patPreCh[pats[i]]++; }
+                g_patPreH[pats[i]] += (uint32_t)notes_fnv(d + (size_t)j * NOTE_SIZE, 1);
             }
             free(d);
         }
@@ -6048,8 +6199,15 @@ static int patop_map_ok(int k, const int *pats, int n, const int *from) {
 // carried through its map, or re-taken when FL didn't do what the map says.
 static void sc_done_patop(int k, const int *pats, int n, int delta, int target) {
     static int from[MAX_PAT];
-    if (!patop_map(k, pats, n, delta, target, from) || !patop_map_ok(k, pats, n, from)) {
+    if (!patop_map(k, pats, n, delta, target, from)) {
         sc_done(SC_PAT, NULL, 0); notes_rebaseline(); ulock_release_moved("pat:", NULL, NULL, 0);
+        return;
+    }
+    if (!patop_map_ok(k, pats, n, from)) {
+        // FL did something else here (it skips a move by its own state, which can differ between FLs): the
+        // other FLs did what the op says, or this one's version. Out of step either way: the leader's song.
+        sc_done(SC_PAT, NULL, 0); notes_rebaseline(); ulock_release_moved("pat:", NULL, NULL, 0);
+        resync("FL did a pattern op differently here");
         return;
     }
     sc_done(SC_PAT, from, MAX_PAT);
@@ -6098,6 +6256,10 @@ static int meta_kind(const char *m) {
     int t;
     if (!e) return -1;
     for (t = 0; t < M_NTYPES && strncmp(e + 5, M_TAG[t], 2) != 0; t++) {}
+    if (t == M_PLT) {                           // a playlist track's link names a mixer track or a channel
+        const char *lk = strstr(m, "\"lk\":[");
+        return !lk ? -1 : lk[6] == '1' ? SC_MIX : lk[6] == '3' ? SC_CH : -1;
+    }
     return t == M_CHAN ? SC_CH : t == M_MIX || t == M_ROUTE ? SC_MIX : t == M_PAT || t == M_PMARK ? SC_PAT : -1;
 }
 
@@ -6130,6 +6292,21 @@ static int meta_path_remap(QItem *it, int cap, const int *toNew) {
     size_t sz = strlen(m) + 32 + 4 * MAX_MIX;                  // (renumbered targets can be a digit longer)
     char *out, *o;
     if (!e || !pi) return 1;
+    if (strncmp(e + 5, M_TAG[M_PLT], 2) == 0) {                // the link's target only (its own number stays)
+        const char *lk = strstr(m, "\"lk\":["), *x;
+        int lt, lx;
+        if (!lk || !(x = strchr(lk + 6, ','))) return 1;
+        lt = atoi(lk + 6); lx = atoi(x + 1);
+        lx = lx >= 0 && lx < cap && toNew[lx] >= 0 ? toNew[lx] : -1;
+        out = (char *)malloc(sz);
+        memcpy(out, m, (size_t)(lk - m));
+        o = out + (lk - m);
+        o += sprintf_s(o, sz - (size_t)(o - out), "\"lk\":[%d,%d]", lx < 0 ? 0 : lt, lx);
+        strcpy_s(o, sz - (size_t)(o - out), strchr(x, ']') ? strchr(x, ']') + 1 : "");
+        free(it->path);
+        it->path = out;
+        return 1;                                              // (a gone target: unlinked, as FL does)
+    }
     route = strncmp(e + 5, M_TAG[M_ROUTE], 2) == 0;
     i = atoi(pi + 4);
     if (i < 0 || i >= cap || (ni = toNew[i]) < 0) return 0;
@@ -6332,6 +6509,11 @@ static void run_task_inner(const QItem *it) {
     case T_PROJLOAD:                          // the leader's project: its structure count from here on
         if (it->peer) {
             int k;
+            // the edits our locks were for are gone with the load: the locks go back (kept, they made the
+            // leader revert its own edits to them, and the two differed until the safety net)
+            ulock_release_moved("", NULL, NULL, 0);
+            for (k = 0; k < g_nslot; k++)
+                if (g_slots[k].lockedByMe) { send_lock("lock_release", g_slots[k].id); g_slots[k].lockedByMe = 0; g_slots[k].hasUndo = 0; }
             for (k = 0; k < SC_N; k++) InterlockedExchange(&g_sc[k], it->sc[k]);
             logmsg("STRUCT counts %d / %d / %d (the leader's project)", it->sc[0], it->sc[1], it->sc[2]);
         }
@@ -7534,7 +7716,7 @@ static void digest_tick(DWORD now) {
         return;
     }
     if (!at) return;
-    if (now - at > 4000) { g_leaderDgAt = 0; return; }        // not quiet here while it was fresh: skipped
+    if ((LONG)(now - at) > 4000) { g_leaderDgAt = 0; return; }   // (signed: at is now | 1)        // not quiet here while it was fresh: skipped
     // (the leader was quiet for QUIET_MS before it sent, so everything it sent before is here already)
     if (g_netState != NET_ON || g_projBusy || g_qh != g_qt || now - g_lastOpAt < 3000) return;
     g_leaderDgAt = 0;
@@ -10889,6 +11071,7 @@ static DWORD WINAPI engineMain(LPVOID p) {
         g_plugLockMs = flimcfg_lock_s() * 1000;
         backup_setting();
         g_logDetailed = flimcfg_log_detailed();
+        g_showCursors = flimcfg_show_cursors();
         logmsg("I am %s (%s); not connected until flim's window connects%s", g_myName, g_myId, g_logDetailed ? " (detailed log)" : "");
 
         // flim.exe's Join / Host (and tests): connect right away. UTF-8, like the Connect dialog.
