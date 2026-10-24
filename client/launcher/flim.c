@@ -19,7 +19,11 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "comctl32.lib")
 #include <uxtheme.h>
+#include <dwmapi.h>
+#include <commctrl.h>
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' " \
                         "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -92,6 +96,7 @@ static void show_fl_info(HWND dlg) {
 
 static void theme_init(HWND dlg);
 static void theme_button(const DRAWITEMSTRUCT *di);
+static void theme_listitem(const DRAWITEMSTRUCT *di);
 static INT_PTR theme_color(HWND dlg, UINT m, HDC dc, HWND c);
 static INT_PTR CALLBACK setup_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) { theme_button((const DRAWITEMSTRUCT *)lp); return TRUE; }
@@ -331,6 +336,16 @@ static DWORD g_pickPid[PICK_MAX];
 static int g_pickN, g_pickSel;
 static INT_PTR CALLBACK pick_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) { theme_button((const DRAWITEMSTRUCT *)lp); return TRUE; }
+    if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { theme_listitem((const DRAWITEMSTRUCT *)lp); return TRUE; }
+    if (m == WM_MEASUREITEM && ((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) {   // a row: the font's height, padded
+        HDC dc = GetDC(dlg);
+        HFONT of = (HFONT)SelectObject(dc, (HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0));
+        TEXTMETRICW tm;
+        GetTextMetricsW(dc, &tm);
+        SelectObject(dc, of); ReleaseDC(dlg, dc);
+        ((MEASUREITEMSTRUCT *)lp)->itemHeight = (UINT)(tm.tmHeight + tm.tmHeight / 2);
+        return TRUE;
+    }
     if (m >= WM_CTLCOLORMSGBOX && m <= WM_CTLCOLORSTATIC) return theme_color(dlg, m, (HDC)wp, (HWND)lp);
     if (m == WM_INITDIALOG) {
         HWND w = NULL, list = GetDlgItem(dlg, IDC_P_LIST);
@@ -962,34 +977,104 @@ static void main_copy(HWND dlg) {
 
 static int wnd_is_edit(HWND h) { wchar_t c[16]; return GetClassNameW(h, c, 16) && !_wcsicmp(c, L"Edit"); }
 static int wnd_is_button(HWND h) { wchar_t c[16]; return GetClassNameW(h, c, 16) && !_wcsicmp(c, L"Button"); }
-// ---- the window's look: the bean's pink on blush, plum text, white fields ----
-// The accent is only on the main actions (Join, Start hosting, OK). Its fill is the bean's pink (#FF4D99)
-// deepened: white text on the bean itself is 3.1:1, on this 4.8:1. Text colors here are all 4.5:1+ on C_BG.
-#define C_BG        RGB(0xFF, 0xF4, 0xF8)
-#define C_TEXT      RGB(0x3B, 0x1E, 0x2D)
-#define C_MUTED     RGB(0x7A, 0x5C, 0x6B)
-#define C_ACCENT    RGB(0xD6, 0x24, 0x6E)
-#define C_ACCENT_DN RGB(0xB8, 0x1C, 0x5E)
-#define C_LINE      RGB(0xDC, 0xC8, 0xD1)
-#define C_PRESSED   RGB(0xF6, 0xE6, 0xED)
-#define C_OFF       RGB(0xF3, 0xE3, 0xEA)
-#define C_OFFTEXT   RGB(0xB8, 0x9A, 0xA8)
+// ---- the window's look: dark plum, light text, the bean's pink on the main actions ----
+// The accent (the bean itself, #FF4D99) is only on the main actions (Join, Start hosting, OK), with dark text
+// on it (5.9:1). Text is 4.5:1+ on its background; control edges (buttons, checkboxes) 3:1+.
+#define C_BG        RGB(0x1A, 0x12, 0x16)
+#define C_FIELD     RGB(0x26, 0x1A, 0x20)      // text boxes, lists, the log; white buttons' fill
+#define C_TEXT      RGB(0xF6, 0xE9, 0xEF)
+#define C_MUTED     RGB(0xB3, 0x9A, 0xA7)
+#define C_ACCENT    RGB(0xFF, 0x4D, 0x99)      // the bean
+#define C_ACCENT_DN RGB(0xE8, 0x45, 0x8A)
+#define C_ONACCENT  RGB(0x1A, 0x12, 0x16)
+#define C_EDGE      RGB(0x84, 0x6A, 0x79)      // a control's outline
+#define C_FRAME     RGB(0x4A, 0x35, 0x40)      // a section's frame (decoration)
+#define C_PRESSED   RGB(0x33, 0x23, 0x2B)
+#define C_OFF       RGB(0x2A, 0x20, 0x26)
+#define C_OFFTEXT   RGB(0x7A, 0x65, 0x70)
 static HBRUSH g_brBg, g_brField;
 static HFONT g_fontHead;
-// Push buttons draw themselves (theme_button): the main actions in the bean's pink, the rest white with a pink edge.
+static void round_rect(HDC dc, const RECT *r, COLORREF fill, COLORREF edge, int rad) {
+    HBRUSH b = CreateSolidBrush(fill), ob = (HBRUSH)SelectObject(dc, b);
+    HPEN p = CreatePen(PS_SOLID, 1, edge), op = (HPEN)SelectObject(dc, p);
+    RoundRect(dc, r->left, r->top, r->right, r->bottom, rad, rad);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(b); DeleteObject(p);
+}
+// A section frame (group box), painted here: the classic one's white etched line glares on dark. Its caption sits
+// on the frame's top edge; the inside is left to the controls in it.
+static LRESULT CALLBACK group_proc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
+    (void)id; (void)ref;
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT r, t;
+        wchar_t s[128];
+        SIZE ts;
+        HFONT of = (HFONT)SelectObject(dc, g_fontHead);
+        HPEN p = CreatePen(PS_SOLID, 1, C_FRAME), op = (HPEN)SelectObject(dc, p);
+        HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+        GetClientRect(h, &r);
+        GetWindowTextW(h, s, 128);
+        GetTextExtentPoint32W(dc, s, (int)wcslen(s), &ts);
+        RoundRect(dc, r.left, r.top + ts.cy / 2, r.right, r.bottom, 8, 8);
+        SetRect(&t, r.left + 6, r.top, r.left + 6 + ts.cx, r.top + ts.cy);
+        FillRect(dc, &t, g_brBg);
+        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, C_TEXT);
+        DrawTextW(dc, s, -1, &t, DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, ob); SelectObject(dc, op); SelectObject(dc, of);
+        DeleteObject(p);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_ERASEBKGND) return 1;
+    return DefSubclassProc(h, m, wp, lp);
+}
+// A scrolling text box / list (the log): Windows draws its border light; ours goes over it, in the dark edge color.
+static LRESULT CALLBACK frame_proc(HWND h, UINT m, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR ref) {
+    LRESULT r = DefSubclassProc(h, m, wp, lp);
+    (void)id; (void)ref;
+    if (m == WM_NCPAINT) {
+        HDC dc = GetWindowDC(h);
+        RECT w;
+        HBRUSH b = CreateSolidBrush(C_FRAME);
+        GetWindowRect(h, &w);
+        OffsetRect(&w, -w.left, -w.top);
+        FrameRect(dc, &w, b);
+        InflateRect(&w, -1, -1);
+        FrameRect(dc, &w, g_brField);
+        DeleteObject(b);
+        ReleaseDC(h, dc);
+    }
+    return r;
+}
+// Dark title bar, dark scrollbars (the log, lists), our own push buttons and section frames. Checkboxes keep their
+// state and are drawn in theme_check (NM_CUSTOMDRAW): themed, their text is black whatever color is asked for.
 static void theme_init(HWND dlg) {
     HWND c = NULL;
-    if (!g_brBg) { g_brBg = CreateSolidBrush(C_BG); g_brField = CreateSolidBrush(RGB(0xFF, 0xFF, 0xFF)); }
+    BOOL dark = TRUE;
+    if (!g_brBg) { g_brBg = CreateSolidBrush(C_BG); g_brField = CreateSolidBrush(C_FIELD); }
     if (!g_fontHead) {                                         // section captions: the dialog's font, bold
         LOGFONTW lf;
         GetObjectW((HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0), sizeof(lf), &lf);
         lf.lfWeight = FW_SEMIBOLD;
         g_fontHead = CreateFontIndirectW(&lf);
     }
-    while ((c = FindWindowExW(dlg, c, L"Button", NULL)) != NULL) {
+    DwmSetWindowAttribute(dlg, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &dark, sizeof(dark));
+    while ((c = FindWindowExW(dlg, c, NULL, NULL)) != NULL) {
         LONG_PTR st = GetWindowLongPtrW(c, GWL_STYLE), type = st & BS_TYPEMASK;
+        if (!wnd_is_button(c)) {                               // (the light theme's text-box outline glares on dark)
+            wchar_t cls[16];
+            if ((st & (WS_VSCROLL | WS_HSCROLL)) || (GetClassNameW(c, cls, 16) && !_wcsicmp(cls, L"ListBox"))) {   // dark scrollbars;
+                // its border repainted (frame_proc). (A short list drops WS_VSCROLL until it needs it.)
+                SetWindowTheme(c, L"DarkMode_Explorer", NULL);
+                SetWindowSubclass(c, frame_proc, 2, 0);
+                SetWindowPos(c, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            } else if (wnd_is_edit(c)) SetWindowTheme(c, L"DarkMode_CFD", NULL);
+            continue;
+        }
         if (type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON) SetWindowLongPtrW(c, GWL_STYLE, (st & ~(LONG_PTR)BS_TYPEMASK) | BS_OWNERDRAW);
-        else if (type == BS_GROUPBOX) { SetWindowTheme(c, L"", L""); SendMessageW(c, WM_SETFONT, (WPARAM)g_fontHead, FALSE); }   // (themed: its caption color can't change)
+        else if (type == BS_GROUPBOX) SetWindowSubclass(c, group_proc, 1, 0);
     }
 }
 static void theme_button(const DRAWITEMSTRUCT *di) {
@@ -998,39 +1083,90 @@ static void theme_button(const DRAWITEMSTRUCT *di) {
     wchar_t t[128];
     int prim = di->CtlID == IDC_J_JOIN || di->CtlID == IDC_H_START || di->CtlID == IDOK;
     int off = (di->itemState & ODS_DISABLED) != 0, down = (di->itemState & ODS_SELECTED) != 0, focus = (di->itemState & ODS_FOCUS) != 0;
-    COLORREF fill = off ? C_OFF : prim ? (down ? C_ACCENT_DN : C_ACCENT) : (down ? C_PRESSED : RGB(0xFF, 0xFF, 0xFF));
-    COLORREF edge = off ? C_OFF : prim ? fill : down ? C_MUTED : C_LINE;
-    HBRUSH b = CreateSolidBrush(fill), ob;
-    HPEN p = CreatePen(PS_SOLID, 1, edge), op;
+    COLORREF fill = off ? C_OFF : prim ? (down ? C_ACCENT_DN : C_ACCENT) : (down ? C_PRESSED : C_FIELD);
+    COLORREF ink = off ? C_OFFTEXT : prim ? C_ONACCENT : C_TEXT;
     HFONT of = (HFONT)SelectObject(dc, (HFONT)SendMessageW(di->hwndItem, WM_GETFONT, 0, 0));
     FillRect(dc, &r, g_brBg);                                  // (the corners)
-    ob = (HBRUSH)SelectObject(dc, b); op = (HPEN)SelectObject(dc, p);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, 10, 10);
-    SelectObject(dc, ob); SelectObject(dc, op);
-    DeleteObject(b); DeleteObject(p);
+    round_rect(dc, &r, fill, off ? C_OFF : prim ? fill : C_EDGE, 10);
     GetWindowTextW(di->hwndItem, t, 128);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, off ? C_OFFTEXT : prim ? RGB(0xFF, 0xFF, 0xFF) : C_TEXT);
+    SetTextColor(dc, ink);
     DrawTextW(dc, t, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     if (focus && !(di->itemState & ODS_NOFOCUSRECT)) {         // keyboard focus (Windows hides it for mouse users)
         RECT f = r;
         InflateRect(&f, -3, -3);
-        SetTextColor(dc, prim ? RGB(0xFF, 0xFF, 0xFF) : C_TEXT);
+        SetBkColor(dc, fill);
         DrawFocusRect(dc, &f);
     }
     SelectObject(dc, of);
 }
-// WM_CTLCOLOR*: blush behind everything, white text fields (the read-only log and address too). 0: not ours.
+// An owner-drawn list's row: the selected one in the accent (dark text on it), the rest on the field color.
+static void theme_listitem(const DRAWITEMSTRUCT *di) {
+    wchar_t s[400];
+    RECT r = di->rcItem;
+    int sel = (di->itemState & ODS_SELECTED) != 0;
+    HBRUSH b;
+    if (di->itemID == (UINT)-1) return;
+    b = CreateSolidBrush(sel ? C_ACCENT : C_FIELD);
+    FillRect(di->hDC, &r, b);
+    DeleteObject(b);
+    SendMessageW(di->hwndItem, LB_GETTEXT, di->itemID, (LPARAM)s);
+    SetBkMode(di->hDC, TRANSPARENT);
+    SetTextColor(di->hDC, sel ? C_ONACCENT : C_TEXT);
+    r.left += 4;
+    DrawTextW(di->hDC, s, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+    if (di->itemState & ODS_FOCUS) { SetBkColor(di->hDC, sel ? C_ACCENT : C_FIELD); DrawFocusRect(di->hDC, &di->rcItem); }
+}
+// NM_CUSTOMDRAW from a checkbox: box, tick and label in our colors (the control keeps its own checked state).
+// Returns the dialog result, or -1 for anything that isn't a checkbox's prepaint.
+static LRESULT theme_check(const NMCUSTOMDRAW *cd) {
+    HWND h = cd->hdr.hwndFrom;
+    LONG_PTR type = GetWindowLongPtrW(h, GWL_STYLE) & BS_TYPEMASK;
+    HDC dc = cd->hdc;
+    RECT r = cd->rc, box, txt;
+    wchar_t s[160];
+    int on = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED, off = !IsWindowEnabled(h);
+    int sz, mid;
+    HFONT of;
+    TEXTMETRICW tm;
+    if (cd->hdr.code != NM_CUSTOMDRAW || !wnd_is_button(h) || (type != BS_AUTOCHECKBOX && type != BS_CHECKBOX)) return -1;
+    if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
+    of = (HFONT)SelectObject(dc, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+    GetTextMetricsW(dc, &tm);
+    sz = tm.tmAscent; mid = (r.top + r.bottom) / 2;
+    FillRect(dc, &r, g_brBg);
+    SetRect(&box, r.left, mid - sz / 2, r.left + sz, mid - sz / 2 + sz);
+    round_rect(dc, &box, off ? C_OFF : on ? C_ACCENT : C_FIELD, off ? C_OFFTEXT : on ? C_ACCENT : C_EDGE, 5);
+    if (on) {                                                  // the tick
+        POINT pt[3] = { { box.left + sz * 2 / 9, mid }, { box.left + sz * 4 / 9, box.bottom - sz * 3 / 11 }, { box.right - sz * 2 / 9, box.top + sz * 3 / 11 } };
+        HPEN p = CreatePen(PS_SOLID, sz / 7 > 1 ? sz / 7 : 2, off ? C_OFFTEXT : C_ONACCENT), op = (HPEN)SelectObject(dc, p);
+        Polyline(dc, pt, 3);
+        SelectObject(dc, op); DeleteObject(p);
+    }
+    GetWindowTextW(h, s, 160);
+    SetRect(&txt, box.right + sz / 2, r.top, r.right, r.bottom);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, off ? C_OFFTEXT : C_TEXT);
+    DrawTextW(dc, s, -1, &txt, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+    if ((cd->uItemState & CDIS_FOCUS) && !(SendMessageW(h, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
+        RECT f = txt;
+        DrawTextW(dc, s, -1, &f, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_CALCRECT);
+        f.top = r.top; f.bottom = r.bottom; InflateRect(&f, 2, 0);
+        SetBkColor(dc, C_BG); SetTextColor(dc, C_TEXT);
+        DrawFocusRect(dc, &f);
+    }
+    SelectObject(dc, of);
+    return CDRF_SKIPDEFAULT;
+}
+// WM_CTLCOLOR*: dark behind everything, darker-raised text fields (the read-only log and address too). 0: not ours.
 static INT_PTR theme_color(HWND dlg, UINT m, HDC dc, HWND c) {
     (void)dlg;
     if (m == WM_CTLCOLORDLG) return (INT_PTR)g_brBg;
     if (m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX || (m == WM_CTLCOLORSTATIC && wnd_is_edit(c))) {
-        SetTextColor(dc, C_TEXT); SetBkColor(dc, RGB(0xFF, 0xFF, 0xFF));
+        SetTextColor(dc, C_TEXT); SetBkColor(dc, C_FIELD);
         return (INT_PTR)g_brField;
     }
     if (m == WM_CTLCOLORSTATIC || m == WM_CTLCOLORBTN) {
-        int group = (GetWindowLongPtrW(c, GWL_STYLE) & BS_TYPEMASK) == BS_GROUPBOX && wnd_is_button(c);
-        SetTextColor(dc, IsWindowEnabled(c) || group ? C_TEXT : C_OFFTEXT); SetBkColor(dc, C_BG); SetBkMode(dc, group ? OPAQUE : TRANSPARENT);
+        SetTextColor(dc, IsWindowEnabled(c) ? C_TEXT : C_OFFTEXT); SetBkColor(dc, C_BG); SetBkMode(dc, TRANSPARENT);
         return (INT_PTR)g_brBg;
     }
     return 0;
@@ -1043,6 +1179,11 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         break;
     case WM_CTLCOLORDLG: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: case WM_CTLCOLORBTN:
         return theme_color(dlg, m, (HDC)wp, (HWND)lp);
+    case WM_NOTIFY: {
+        LRESULT r = theme_check((const NMCUSTOMDRAW *)lp);
+        if (r == -1) break;
+        SetWindowLongPtrW(dlg, DWLP_MSGRESULT, r);
+        return TRUE; }
     case WM_INITDIALOG: {
         wchar_t v[512];
         HICON ic = LoadIconW(g_inst, L"IDI_FLIM");
@@ -1053,7 +1194,7 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         SendDlgItemMessageW(dlg, IDC_M_NAME, EM_LIMITTEXT, 64, 0);
         flimcfg_get(L"song_name", v, 512); SetDlgItemTextW(dlg, IDC_M_SONG, v);
         SendDlgItemMessageW(dlg, IDC_M_SONG, EM_LIMITTEXT, 80, 0);
-        SendDlgItemMessageW(dlg, IDC_M_SONG, EM_SETCUEBANNER, TRUE, (LPARAM)L"optional: names a new song");
+        // (no cue banner: Windows draws it in a fixed grey that is too faint on the dark theme; the label says it)
         main_flinfo(dlg);
         flimcfg_get(L"server_url", v, 512); SetDlgItemTextW(dlg, IDC_J_URL, v);
         secret_get_w(L"server_pw", v, 512); SetDlgItemTextW(dlg, IDC_J_PW, v);
@@ -1127,8 +1268,8 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     case WM_CTLCOLORSTATIC:              // the status in the color of the connection; the rest: theme_color
         if ((HWND)lp == GetDlgItem(dlg, IDC_S_STATUS)) {
             HDC dc = (HDC)wp;
-            SetTextColor(dc, g_netState == NET_ON ? RGB(0x17, 0x70, 0x3a) : g_netState == NET_CONNECTING ? RGB(0x8a, 0x53, 0x00)
-                           : g_netState == NET_ERR ? RGB(0xc0, 0x39, 0x2b) : C_MUTED);
+            SetTextColor(dc, g_netState == NET_ON ? RGB(0x5f, 0xd3, 0x8d) : g_netState == NET_CONNECTING ? RGB(0xf0, 0xb3, 0x5a)
+                           : g_netState == NET_ERR ? RGB(0xff, 0x7a, 0x70) : C_MUTED);
             SetBkMode(dc, TRANSPARENT);
             return (INT_PTR)g_brBg;
         }
