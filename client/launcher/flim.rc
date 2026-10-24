@@ -33,7 +33,7 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 360, 108, 50, 15
 END
 
-IDD_MAIN DIALOGEX 0, 0, 560, 300
+IDD_MAIN DIALOGEX 0, 0, 560, 320
 STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
 CAPTION "flim"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -46,7 +46,7 @@ BEGIN
     AUTOCHECKBOX    "Attach to FL automatically", IDC_M_AUTOATTACH, 172, 26, 102, 10
     PUSHBUTTON      "FL folder...", IDC_M_CHANGEFL, 278, 24, 54, 14
 
-    GROUPBOX        "Join a session", -1, 6, 43, 328, 62
+    GROUPBOX        " Join a session ", -1, 6, 43, 328, 62
     LTEXT           "Server address (from whoever hosts, e.g. ws://203.0.113.7:8080):", -1, 14, 54, 312, 10
     EDITTEXT        IDC_J_URL, 14, 65, 312, 13, ES_AUTOHSCROLL
     LTEXT           "Password:", -1, 14, 86, 38, 10
@@ -54,7 +54,7 @@ BEGIN
     AUTOCHECKBOX    "Remember", IDC_J_REMEMBER, 172, 86, 60, 10
     DEFPUSHBUTTON   "Join", IDC_J_JOIN, 270, 83, 56, 15
 
-    GROUPBOX        "Host a session on this PC (nothing else to install)", -1, 6, 111, 328, 160
+    GROUPBOX        " Host a session on this PC (nothing else to install) ", -1, 6, 111, 328, 160
     LTEXT           "Port:", -1, 14, 125, 20, 10
     EDITTEXT        IDC_H_PORT, 36, 123, 34, 13, ES_NUMBER
     LTEXT           "Password:", -1, 80, 125, 36, 10
@@ -68,7 +68,7 @@ BEGIN
     PUSHBUTTON      "Copy", IDC_H_COPY, 274, 219, 52, 15
     LTEXT           "", IDC_H_PEOPLE, 14, 239, 312, 26
 
-    GROUPBOX        "Session", -1, 340, 6, 214, 265
+    GROUPBOX        " Session ", -1, 340, 6, 214, 265
     LTEXT           "FL isn't running.", IDC_S_STATUS, 348, 18, 198, 50
     EDITTEXT        IDC_S_LOG, 348, 72, 198, 140, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_NOHIDESEL | WS_VSCROLL | WS_HSCROLL
     PUSHBUTTON      "Resync from host...", IDC_S_RESYNC, 348, 215, 80, 14
@@ -79,15 +79,16 @@ BEGIN
     EDITTEXT        IDC_S_LOCK, 478, 251, 20, 13, ES_NUMBER
     LTEXT           "s (1-10)", -1, 502, 253, 44, 10
 
-    PUSHBUTTON      "Open FL without connecting", IDC_M_OPENFL, 6, 279, 110, 14
-    AUTOCHECKBOX    "Back up the project every", IDC_M_BACKUP, 124, 281, 94, 10
-    EDITTEXT        IDC_M_BACKUPMIN, 219, 279, 22, 13, ES_NUMBER
-    LTEXT           "min", -1, 244, 281, 14, 10
-    PUSHBUTTON      "Projects folder", IDC_M_PROJECTS, 262, 279, 62, 14
-    PUSHBUTTON      "Change...", IDC_M_PROJDIR, 326, 279, 40, 14
-    PUSHBUTTON      "Crash reports", IDC_M_CRASHES, 370, 279, 58, 14
-    PUSHBUTTON      "Shared folder", IDC_M_SHARED, 432, 279, 58, 14
-    PUSHBUTTON      "Close", IDCANCEL, 500, 279, 54, 14
+    PUSHBUTTON      "Open FL without connecting", IDC_M_OPENFL, 6, 279, 110, 15
+    AUTOCHECKBOX    "Back up the project every", IDC_M_BACKUP, 124, 282, 94, 10
+    EDITTEXT        IDC_M_BACKUPMIN, 219, 280, 22, 13, ES_NUMBER
+    LTEXT           "min", -1, 244, 282, 14, 10
+    PUSHBUTTON      "Close", IDCANCEL, 500, 279, 54, 15
+    PUSHBUTTON      "Projects folder", IDC_M_PROJECTS, 6, 298, 66, 15
+    PUSHBUTTON      "Change...", IDC_M_PROJDIR, 76, 298, 46, 15
+    PUSHBUTTON      "Shared folder", IDC_M_SHARED, 126, 298, 62, 15
+    PUSHBUTTON      "Crash reports", IDC_M_CRASHES, 192, 298, 62, 15
+    PUSHBUTTON      "Clear cache...", IDC_M_CLEARCACHE, 258, 298, 62, 15
 END
 
 VS_VERSION_INFO VERSIONINFO

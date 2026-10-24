@@ -298,6 +298,11 @@ projects folder are set there too and apply right away.
 | Crash and hang reports | `Documents\flim\Crash reports\` |
 | The shared folder, its backups, and what flim knows about its files (versions, deletions) | `C:\Users\Public\Documents\flim\Shared\`, `...\flim\Shared backups\`, `%APPDATA%\flim\shared-*.tsv` |
 | The built-in host's sample store (a cache, safe to delete when not hosting) | `%LOCALAPPDATA%\flim\host-samples\` |
+| flim's scratch files (plugin states on their way) | `%TEMP%\flim\` |
+
+**Clear cache...** (bottom of flim's window) deletes the three caches above (`samples`, `host-samples`,
+`%TEMP%\flim`) after showing their size and asking. It won't run while FL Studio is open or you're
+hosting, and never touches songs, backups, the shared folder or settings.
 
 ---
 

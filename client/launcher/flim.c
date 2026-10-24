@@ -18,6 +18,8 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "uxtheme.lib")
+#include <uxtheme.h>
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' " \
                         "version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
@@ -88,12 +90,17 @@ static void show_fl_info(HWND dlg) {
     SetDlgItemTextW(dlg, IDC_FLINFO, line);
 }
 
+static void theme_init(HWND dlg);
+static void theme_button(const DRAWITEMSTRUCT *di);
+static INT_PTR theme_color(HWND dlg, UINT m, HDC dc, HWND c);
 static INT_PTR CALLBACK setup_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
-    (void)lp;
+    if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) { theme_button((const DRAWITEMSTRUCT *)lp); return TRUE; }
+    if (m >= WM_CTLCOLORMSGBOX && m <= WM_CTLCOLORSTATIC) return theme_color(dlg, m, (HDC)wp, (HWND)lp);
     switch (m) {
     case WM_INITDIALOG: {
         wchar_t v[MAX_PATH * 2];
         HICON ic = LoadIconW(GetModuleHandleW(NULL), L"IDI_FLIM");
+        theme_init(dlg);
         if (ic) { SendMessageW(dlg, WM_SETICON, ICON_BIG, (LPARAM)ic); SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)ic); }
         flimcfg_get(L"fl_dir", v, MAX_PATH * 2);
         if (!v[0]) wcscpy_s(v, MAX_PATH * 2, DEFAULT_FL_DIR);
@@ -323,9 +330,11 @@ static void adopt_running_fl(HWND dlg) { adopt_engine(dlg, FindWindowExW(HWND_ME
 static DWORD g_pickPid[PICK_MAX];
 static int g_pickN, g_pickSel;
 static INT_PTR CALLBACK pick_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
-    (void)lp;
+    if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) { theme_button((const DRAWITEMSTRUCT *)lp); return TRUE; }
+    if (m >= WM_CTLCOLORMSGBOX && m <= WM_CTLCOLORSTATIC) return theme_color(dlg, m, (HDC)wp, (HWND)lp);
     if (m == WM_INITDIALOG) {
         HWND w = NULL, list = GetDlgItem(dlg, IDC_P_LIST);
+        theme_init(dlg);
         g_pickN = 0;
         while (g_pickN < PICK_MAX && (w = FindWindowExW(NULL, w, L"TFruityLoopsMainForm", NULL)) != NULL) {
             DWORD pid = 0;
@@ -468,6 +477,57 @@ static void crash_dir(wchar_t *out, int cap) { flimcfg_flim_dir(out, cap); wcsca
 static void open_folder(const wchar_t *d) {
     SHCreateDirectoryExW(NULL, d, NULL);
     ShellExecuteW(NULL, L"open", d, NULL, NULL, SW_SHOWNORMAL);
+}
+
+// ---- "Clear cache...": what flim can make again (README "Where flim keeps things") ----
+// The plugin sample links (Documents\flim\samples), the built-in host's sample store and the engines'
+// scratch files (%TEMP%\flim). Never songs, backups, the shared folder or settings.
+static void cache_dirs(wchar_t d[3][MAX_PATH]) {
+    wchar_t *la = NULL;
+    flimcfg_flim_dir(d[0], MAX_PATH); wcscat_s(d[0], MAX_PATH, L"\\samples");
+    d[1][0] = 0;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &la))) swprintf_s(d[1], MAX_PATH, L"%s\\flim\\host-samples", la);
+    CoTaskMemFree(la);
+    GetTempPathW(MAX_PATH, d[2]); wcscat_s(d[2], MAX_PATH, L"flim");
+}
+// Bytes under dir; with del, its contents are deleted too (dir itself stays). Files in use are left.
+static unsigned long long tree_walk(const wchar_t *dir, int del) {
+    wchar_t pat[MAX_PATH], p[MAX_PATH];
+    WIN32_FIND_DATAW f;
+    HANDLE h;
+    unsigned long long n = 0;
+    swprintf_s(pat, MAX_PATH, L"%s\\*", dir);
+    if ((h = FindFirstFileW(pat, &f)) == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (!wcscmp(f.cFileName, L".") || !wcscmp(f.cFileName, L"..")) continue;
+        swprintf_s(p, MAX_PATH, L"%s\\%s", dir, f.cFileName);
+        if (f.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) { if (del) RemoveDirectoryW(p); continue; }   // (never follow a link)
+        if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { n += tree_walk(p, del); if (del) RemoveDirectoryW(p); }
+        else {
+            n += ((unsigned long long)f.nFileSizeHigh << 32) | f.nFileSizeLow;
+            if (del) { SetFileAttributesW(p, FILE_ATTRIBUTE_NORMAL); DeleteFileW(p); }
+        }
+    } while (FindNextFileW(h, &f));
+    FindClose(h);
+    return n;
+}
+static void clear_cache(HWND dlg) {
+    wchar_t d[3][MAX_PATH], msg[256];
+    unsigned long long n = 0, left = 0;
+    int i;
+    if (FindWindowExW(NULL, NULL, L"TFruityLoopsMainForm", NULL) || host_running()) {
+        fail_box(dlg, L"Close FL Studio%s first: a session may still be using the cache.", host_running() ? L" and stop hosting" : L"");
+        return;
+    }
+    cache_dirs(d);
+    for (i = 0; i < 3; i++) if (d[i][0]) n += tree_walk(d[i], 0);
+    if (!n) { main_log(dlg, L"Clear cache: the cache is already empty."); return; }
+    swprintf_s(msg, 256, L"Delete flim's cache (%.1f MB)?\n\nflim makes it again when it needs it. Your songs, backups, the shared "
+                         L"folder and your settings aren't touched.", n / 1048576.0);
+    if (MessageBoxW(dlg, msg, L"Clear cache", MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2) != IDOK) return;
+    for (i = 0; i < 3; i++) if (d[i][0]) { tree_walk(d[i], 1); left += tree_walk(d[i], 0); }
+    swprintf_s(msg, 256, L"Clear cache: freed %.1f MB%s.", (n - left) / 1048576.0, left ? L" (some files were in use and stay)" : L"");
+    main_log(dlg, msg);
 }
 // "Change...": another projects folder (song folders made from now on go there; old ones stay).
 static void pick_projects_dir(HWND dlg) {
@@ -900,11 +960,93 @@ static void main_copy(HWND dlg) {
     CloseClipboard();
 }
 
+static int wnd_is_edit(HWND h) { wchar_t c[16]; return GetClassNameW(h, c, 16) && !_wcsicmp(c, L"Edit"); }
+static int wnd_is_button(HWND h) { wchar_t c[16]; return GetClassNameW(h, c, 16) && !_wcsicmp(c, L"Button"); }
+// ---- the window's look: the bean's pink on blush, plum text, white fields ----
+// The accent is only on the main actions (Join, Start hosting, OK). Its fill is the bean's pink (#FF4D99)
+// deepened: white text on the bean itself is 3.1:1, on this 4.8:1. Text colors here are all 4.5:1+ on C_BG.
+#define C_BG        RGB(0xFF, 0xF4, 0xF8)
+#define C_TEXT      RGB(0x3B, 0x1E, 0x2D)
+#define C_MUTED     RGB(0x7A, 0x5C, 0x6B)
+#define C_ACCENT    RGB(0xD6, 0x24, 0x6E)
+#define C_ACCENT_DN RGB(0xB8, 0x1C, 0x5E)
+#define C_LINE      RGB(0xDC, 0xC8, 0xD1)
+#define C_PRESSED   RGB(0xF6, 0xE6, 0xED)
+#define C_OFF       RGB(0xF3, 0xE3, 0xEA)
+#define C_OFFTEXT   RGB(0xB8, 0x9A, 0xA8)
+static HBRUSH g_brBg, g_brField;
+static HFONT g_fontHead;
+// Push buttons draw themselves (theme_button): the main actions in the bean's pink, the rest white with a pink edge.
+static void theme_init(HWND dlg) {
+    HWND c = NULL;
+    if (!g_brBg) { g_brBg = CreateSolidBrush(C_BG); g_brField = CreateSolidBrush(RGB(0xFF, 0xFF, 0xFF)); }
+    if (!g_fontHead) {                                         // section captions: the dialog's font, bold
+        LOGFONTW lf;
+        GetObjectW((HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0), sizeof(lf), &lf);
+        lf.lfWeight = FW_SEMIBOLD;
+        g_fontHead = CreateFontIndirectW(&lf);
+    }
+    while ((c = FindWindowExW(dlg, c, L"Button", NULL)) != NULL) {
+        LONG_PTR st = GetWindowLongPtrW(c, GWL_STYLE), type = st & BS_TYPEMASK;
+        if (type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON) SetWindowLongPtrW(c, GWL_STYLE, (st & ~(LONG_PTR)BS_TYPEMASK) | BS_OWNERDRAW);
+        else if (type == BS_GROUPBOX) { SetWindowTheme(c, L"", L""); SendMessageW(c, WM_SETFONT, (WPARAM)g_fontHead, FALSE); }   // (themed: its caption color can't change)
+    }
+}
+static void theme_button(const DRAWITEMSTRUCT *di) {
+    HDC dc = di->hDC;
+    RECT r = di->rcItem;
+    wchar_t t[128];
+    int prim = di->CtlID == IDC_J_JOIN || di->CtlID == IDC_H_START || di->CtlID == IDOK;
+    int off = (di->itemState & ODS_DISABLED) != 0, down = (di->itemState & ODS_SELECTED) != 0, focus = (di->itemState & ODS_FOCUS) != 0;
+    COLORREF fill = off ? C_OFF : prim ? (down ? C_ACCENT_DN : C_ACCENT) : (down ? C_PRESSED : RGB(0xFF, 0xFF, 0xFF));
+    COLORREF edge = off ? C_OFF : prim ? fill : down ? C_MUTED : C_LINE;
+    HBRUSH b = CreateSolidBrush(fill), ob;
+    HPEN p = CreatePen(PS_SOLID, 1, edge), op;
+    HFONT of = (HFONT)SelectObject(dc, (HFONT)SendMessageW(di->hwndItem, WM_GETFONT, 0, 0));
+    FillRect(dc, &r, g_brBg);                                  // (the corners)
+    ob = (HBRUSH)SelectObject(dc, b); op = (HPEN)SelectObject(dc, p);
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, 10, 10);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(b); DeleteObject(p);
+    GetWindowTextW(di->hwndItem, t, 128);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, off ? C_OFFTEXT : prim ? RGB(0xFF, 0xFF, 0xFF) : C_TEXT);
+    DrawTextW(dc, t, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if (focus && !(di->itemState & ODS_NOFOCUSRECT)) {         // keyboard focus (Windows hides it for mouse users)
+        RECT f = r;
+        InflateRect(&f, -3, -3);
+        SetTextColor(dc, prim ? RGB(0xFF, 0xFF, 0xFF) : C_TEXT);
+        DrawFocusRect(dc, &f);
+    }
+    SelectObject(dc, of);
+}
+// WM_CTLCOLOR*: blush behind everything, white text fields (the read-only log and address too). 0: not ours.
+static INT_PTR theme_color(HWND dlg, UINT m, HDC dc, HWND c) {
+    (void)dlg;
+    if (m == WM_CTLCOLORDLG) return (INT_PTR)g_brBg;
+    if (m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX || (m == WM_CTLCOLORSTATIC && wnd_is_edit(c))) {
+        SetTextColor(dc, C_TEXT); SetBkColor(dc, RGB(0xFF, 0xFF, 0xFF));
+        return (INT_PTR)g_brField;
+    }
+    if (m == WM_CTLCOLORSTATIC || m == WM_CTLCOLORBTN) {
+        int group = (GetWindowLongPtrW(c, GWL_STYLE) & BS_TYPEMASK) == BS_GROUPBOX && wnd_is_button(c);
+        SetTextColor(dc, IsWindowEnabled(c) || group ? C_TEXT : C_OFFTEXT); SetBkColor(dc, C_BG); SetBkMode(dc, group ? OPAQUE : TRANSPARENT);
+        return (INT_PTR)g_brBg;
+    }
+    return 0;
+}
+
 static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
+    case WM_DRAWITEM:
+        if (((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) { theme_button((const DRAWITEMSTRUCT *)lp); return TRUE; }
+        break;
+    case WM_CTLCOLORDLG: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: case WM_CTLCOLORBTN:
+        return theme_color(dlg, m, (HDC)wp, (HWND)lp);
     case WM_INITDIALOG: {
         wchar_t v[512];
         HICON ic = LoadIconW(g_inst, L"IDI_FLIM");
+        theme_init(dlg);
         if (ic) { SendMessageW(dlg, WM_SETICON, ICON_BIG, (LPARAM)ic); SendMessageW(dlg, WM_SETICON, ICON_SMALL, (LPARAM)ic); }
         SetWindowTextW(dlg, L"flim v." FLIM_VERSION_W);
         flimcfg_get(L"name", v, 512); SetDlgItemTextW(dlg, IDC_M_NAME, v);
@@ -982,19 +1124,15 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         main_log(dlg, L"FL closed.");
         session_buttons(dlg);
         return TRUE;
-    case WM_CTLCOLORSTATIC:              // the status in the color of the connection
-        if ((HWND)lp == GetDlgItem(dlg, IDC_S_LOG)) {            // the log reads as a text box, not as greyed out
-            SetBkColor((HDC)wp, GetSysColor(COLOR_WINDOW));
-            return (INT_PTR)GetSysColorBrush(COLOR_WINDOW);
-        }
+    case WM_CTLCOLORSTATIC:              // the status in the color of the connection; the rest: theme_color
         if ((HWND)lp == GetDlgItem(dlg, IDC_S_STATUS)) {
             HDC dc = (HDC)wp;
-            SetTextColor(dc, g_netState == NET_ON ? RGB(0x1e, 0x8e, 0x3e) : g_netState == NET_CONNECTING ? RGB(0xb0, 0x6d, 0x00)
-                           : g_netState == NET_ERR ? RGB(0xc0, 0x39, 0x2b) : GetSysColor(COLOR_GRAYTEXT));
+            SetTextColor(dc, g_netState == NET_ON ? RGB(0x17, 0x70, 0x3a) : g_netState == NET_CONNECTING ? RGB(0x8a, 0x53, 0x00)
+                           : g_netState == NET_ERR ? RGB(0xc0, 0x39, 0x2b) : C_MUTED);
             SetBkMode(dc, TRANSPARENT);
-            return (INT_PTR)GetSysColorBrush(COLOR_BTNFACE);
+            return (INT_PTR)g_brBg;
         }
-        break;
+        return theme_color(dlg, m, (HDC)wp, (HWND)lp);   // (the log and the address are read-only edits: white)
     case WM_HOST_LOG:
         main_log(dlg, (const wchar_t *)lp);
         free((void *)lp);
@@ -1093,6 +1231,7 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
             return TRUE;
         case IDC_M_PROJECTS: { wchar_t d[MAX_PATH * 2]; flimcfg_projects_dir(d, MAX_PATH * 2); open_folder(d); return TRUE; }
         case IDC_M_PROJDIR: pick_projects_dir(dlg); return TRUE;
+        case IDC_M_CLEARCACHE: clear_cache(dlg); return TRUE;
         case IDC_M_CRASHES: { wchar_t d[MAX_PATH * 2]; crash_dir(d, MAX_PATH * 2); open_folder(d); return TRUE; }
         case IDC_M_SHARED: { wchar_t d[MAX_PATH * 2]; flimcfg_shared_dir(d, MAX_PATH * 2); open_folder(d); return TRUE; }
         case IDC_M_CHANGEFL:
