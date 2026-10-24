@@ -307,10 +307,14 @@ How flim keeps it local (engine `solo_*`, `mute_*`):
 - A mute that arrives meanwhile is written to `+0x1c` and heard after the unsolo. `SetTrackEnabled`
   would end the solo and leave the other tracks muted, and those mutes would then go out.
 - When the solo ends, every track gets the mute state everyone shares back, whatever FL did (all
-  enabled, or what a mute click left).
+  enabled, or what a mute click left). It waits `SOLO_RESTORE_MS` (0.8 s) for that: while audio runs,
+  FL fades the tracks back, so done at once it read tracks mid-fade, and its applies landed inside FL's
+  fades (an unmute during a fade does nothing). Tracks ended up muted, the next click sent that to the
+  others ("soloing and muting act weird after a while, and sometimes sync", a tester's session
+  2026-10-23: two tracks unmuted in the same millisecond a second after an unsolo went out as edits).
 - FL changes the tracks one at a time around flagging the soloed one, so a poll pass can land
-  half-way. A mute change counts only once two passes in a row read it, and not for 1 s after the
-  solo state changed.
+  half-way. A mute change counts only once two passes in a row read it, and not for `SOLO_HOLD_MS`
+  (1.5 s, was 1 s) after the solo state changed.
 - A project snapshot (join, re-sync, backup) has none of the leader's solo: `project_snapshot` puts
   each track's `+0x1c` into bit 8 of event 236 and clears `0x1000`. Checked by restarting B while A
   had a track soloed: B came in with the shared mutes and no solo.
@@ -534,6 +538,19 @@ Now:
   wherever the focus is). Before, a typed value that moves no watched param (the sampler's time stretch)
   only went out with the next click in that plugin: the check after the right-click ran while the box
   was still open and found nothing (`live_test` `typein`).
+- A clip edit can change its channel too: stretching an audio clip by its edge in the playlist (stretch
+  mode) sets the sample's stretch in the channel, a state-only setting, while the clip's record changes
+  as well. Only the clips went out (the playlist isn't the channel's window), the leader had a longer
+  clip of an unstretched sample, and the safety net reloaded the member ("clips differ", a tester's
+  session 2026-10-23). Now `do_clipsnap` counts each channel whose clip records changed here as worked
+  in (`unit_worked`, as `do_plugfocus` does), so its state is checked and goes out if it differs.
+  (Pattern clips have no channel and are skipped.) With the channels apart, each FL recomputed a stretched
+  clip from its own channel after the other's clips were applied, and flim sent that back as an edit: the
+  two ping-ponged one track's clips every few hundred ms with nobody touching them. Clip changes now need
+  local input like params (`scan_clips`: `input_recent` while the change came in); one FL makes by itself
+  is taken as the agreed state (`do_clipsnap` mode 1, "taken as known, not sent").
+  The clip record itself is 0x58 bytes, all of it saved
+  (FLP event 233 holds them back to back) and synced: `+0x34` float is the clip's own stretch factor.
 - Working in a kHs plugin's window used to send it at each check (and the other FL reloaded it: a
   glitch): the hash couldn't tell its zip times from an edit, and the first open of its editor after a
   load moved its size in the plugin record by a pixel. Both are left out now ("Window state" and "Zip
@@ -627,6 +644,12 @@ the structure op:
   - a new channel's / track's values aren't watched until `rescan` adds them (`RESCAN_MS`), and `rescan`
     takes what they are then as their start: an edit made on a just-inserted track was never sent.
     `chan_rebase` / `mix_rebaseline` now ask for a rescan on the next tick (`g_rescanNow`).
+  - the same for a track's name: routing a channel to a new mixer track ("route to free track") inserts
+    the track already named after the channel. `meta_remap` took a new track's name and color as known,
+    so the name never went out and the others kept FL's default: "mixer names differ" and a reload after
+    every such insert (a tester's session 2026-10-23, three times in a few minutes). Now a track inserted
+    here (`mix_struct`) gets a baseline that differs from what it shows, so `scan_meta` sends its name
+    and color right after the insert.
 - A plain param edit whose lock the server refused (someone else held that knob) was dropped by the
   server but stayed in the editor's FL. The first edit of a lock now keeps its old value (`Slot.undo`,
   `hasUndo`, as plugin params already did), and a refusal applies it back ("lock denied ...: local edit

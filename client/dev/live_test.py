@@ -13,9 +13,11 @@ ok = fail = 0
 # flim only syncs what someone does: a param that moves with nobody at the keyboard is FL's own
 # (automation, modulation). The probe makes no input, so a background "user" keeps tapping an
 # unused key (F24, key up) in both FLs while the tests run.
+quiet = {'on': False}                                           # True: the background user pauses (nobody at the keyboard)
 def _user():
     import ctypes
     while True:
+        if quiet['on']: time.sleep(0.2); continue
         for w in fl.windows((A, B)):
             if w[2] == 'TFruityLoopsMainForm': ctypes.windll.user32.PostMessageW(w[1], 0x0101, 0x87, 0xC0000001)
         time.sleep(0.5)
@@ -153,6 +155,21 @@ def t_clip():
         a.call(va(a, a.q(vmt + 8)), ca, rec)
     a.call(0xe39560, a.q(a.g(PLFORM)))
     check('playlist clips', lambda: sorted(r[:16] for r in clips(a)[1]), lambda: sorted(r[:16] for r in clips(b)[1]), wait=4)
+
+# A clip FL changes by itself (nobody at the keyboard: FL recomputing a stretched audio clip after the other's
+# clips were applied) is taken as known, not sent: sent, the two FLs ping-ponged it.
+def t_clip_self():
+    ca = a.q(arr(a) + 0x14); n = a.d(ca + 0x14); d = a.q(ca + 8)
+    if not n: print('   (no clips: skipped)'); return
+    rec = d + (n - 1) * 0x58
+    quiet['on'] = True; time.sleep(2)                           # (input_recent: 1.5 s)
+    pos = os.path.getsize(LOG)
+    a.w(rec + 0x34, struct.pack('<f', 0.625))
+    time.sleep(3)
+    quiet['on'] = False
+    check("clip changed by FL itself: taken as known on A", lambda: any('taken as known, not sent' in l for l in log_since(pos, A)), lambda: True, wait=0)
+    check("...not sent to B", lambda: any('CLIPS sent' in l for l in log_since(pos, A)), lambda: False, wait=0)
+    a.w(rec + 0x34, struct.pack('<f', 1.0)); time.sleep(3)      # (and back, as FL would: also not sent)
 
 def plug_state(p, t, s, tag):                                   # the slot's .fst minus the wrapper header
     path = os.path.join(TMP, 'flim_live_%s.fst' % tag)          # (the header holds each person's editor window)
@@ -534,6 +551,14 @@ def t_mix_append():
     check('mixer: A appends 3 tracks', lambda: mix_state(a), lambda: mix_state(b), wait=8)
     mix_delete(a, [n - 1, n, n + 1])
     check('mixer: A deletes them again', lambda: mix_state(a), lambda: mix_state(b), wait=8)
+
+# Routing a channel to a new mixer track inserts it already named after the channel: the name was taken as
+# known with the insert and never went out ("mixer names differ", a reload after each one).
+def t_mix_named_insert():
+    pos = 5
+    mix_insert(a, pos); a.call(MIXNAME, pos, a.mkstr('Routed here'), 1)   # (in one go: before flim's scan sees the insert)
+    check('mixer: a new track named at once: B has the name', lambda: mix_name(b, pos), lambda: 'Routed here', wait=8)
+    check('mixer: names equal', lambda: [mix_name(a, t) for t in range(mix_count(a))], lambda: [mix_name(b, t) for t in range(mix_count(b))], wait=4)
 
 def t_mix_move():
     mix_move(a, 3, 1)

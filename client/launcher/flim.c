@@ -305,16 +305,64 @@ static int engine_send(HWND dlg, int kind, const char *text) {
     return g_engine && SendMessageTimeoutW(g_engine, WM_COPYDATA, (WPARAM)dlg, (LPARAM)&cd, SMTO_ABORTIFHUNG, 3000, &r) != 0;
 }
 // A flim FL that already runs (this window was closed and opened again) reports here from now on.
-static void adopt_running_fl(HWND dlg) {
-    HWND eng = FindWindowExW(HWND_MESSAGE, NULL, L"FlimTasks", NULL);
+static int adopt_engine(HWND dlg, HWND eng) {
     DWORD pid = 0;
     HANDLE p;
-    if (!eng) return;
+    if (!eng) return 0;
     GetWindowThreadProcessId(eng, &pid);
-    if (!(p = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, FALSE, pid))) return;
+    if (!(p = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, FALSE, pid))) return 0;
     fl_track(dlg, p);
     g_engine = eng;
     engine_send(dlg, GUI_HELLO, NULL);
+    return 1;
+}
+static void adopt_running_fl(HWND dlg) { adopt_engine(dlg, FindWindowExW(HWND_MESSAGE, NULL, L"FlimTasks", NULL)); }
+
+// ---- which FL (flim.ini auto_attach=0): Join lists the running FLs instead of taking the first one ----
+#define PICK_MAX 16
+static DWORD g_pickPid[PICK_MAX];
+static int g_pickN, g_pickSel;
+static INT_PTR CALLBACK pick_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
+    (void)lp;
+    if (m == WM_INITDIALOG) {
+        HWND w = NULL, list = GetDlgItem(dlg, IDC_P_LIST);
+        g_pickN = 0;
+        while (g_pickN < PICK_MAX && (w = FindWindowExW(NULL, w, L"TFruityLoopsMainForm", NULL)) != NULL) {
+            DWORD pid = 0;
+            int k, hh = -1, mm = 0;
+            wchar_t t[160], line[320];
+            FILETIME c, x, kt, ut, lc;
+            SYSTEMTIME st;
+            HANDLE p;
+            GetWindowThreadProcessId(w, &pid);
+            for (k = 0; k < g_pickN && g_pickPid[k] != pid; k++) {}
+            if (k < g_pickN) continue;
+            if (!GetWindowTextW(w, t, 160)) wcscpy_s(t, 160, L"FL Studio");
+            if ((p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) != NULL) {
+                if (GetProcessTimes(p, &c, &x, &kt, &ut) && FileTimeToLocalFileTime(&c, &lc) && FileTimeToSystemTime(&lc, &st)) { hh = st.wHour; mm = st.wMinute; }
+                CloseHandle(p);
+            }
+            if (hh >= 0) swprintf_s(line, 320, L"%s  (process %lu, started %02d:%02d)%s", t, pid, hh, mm, engine_window_of(pid) ? L"  - flim is in it" : L"");
+            else swprintf_s(line, 320, L"%s  (process %lu)%s", t, pid, engine_window_of(pid) ? L"  - flim is in it" : L"");
+            SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)line);
+            g_pickPid[g_pickN++] = pid;
+        }
+        SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)L"Open a new FL Studio");
+        SendMessageW(list, LB_SETCURSEL, 0, 0);
+        return TRUE;
+    }
+    if (m == WM_COMMAND) {
+        int id = LOWORD(wp);
+        if (id == IDC_P_LIST && HIWORD(wp) == LBN_DBLCLK) id = IDOK;
+        if (id == IDOK) { g_pickSel = (int)SendDlgItemMessageW(dlg, IDC_P_LIST, LB_GETCURSEL, 0, 0); EndDialog(dlg, IDOK); return TRUE; }
+        if (id == IDCANCEL) { EndDialog(dlg, IDCANCEL); return TRUE; }
+    }
+    return FALSE;
+}
+// The FL process to use: its id, 0 = open a new FL, -1 = cancelled.
+static long pick_fl(HWND dlg) {
+    if (DialogBoxW(g_inst, MAKEINTRESOURCEW(IDD_PICKFL), dlg, pick_proc) != IDOK || g_pickSel < 0) return -1;
+    return g_pickSel < g_pickN ? (long)g_pickPid[g_pickSel] : 0;
 }
 static void session_buttons(HWND dlg) {
     int on = g_netState == NET_ON || g_netState == NET_CONNECTING, fl = fl_running();
@@ -746,8 +794,20 @@ static void attach_tick(HWND dlg) {
 // without flim gets the engine first.
 static void main_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {
     if (!fl_running()) {
-        DWORD pid = plain_fl_pid();
+        DWORD pid;
         HANDLE p;
+        if (flimcfg_auto_attach()) pid = plain_fl_pid();
+        else {
+            long r = pick_fl(dlg);
+            if (r < 0) return;
+            pid = (DWORD)r;
+            if (pid && engine_window_of(pid)) {           // flim is in it already: it reports here from now on
+                if (adopt_engine(dlg, engine_window_of(pid)))
+                    main_log(dlg, L"Using that FL: flim was already in it. Click Connect if it isn't connected.");
+                session_buttons(dlg);
+                return;
+            }
+        }
         if (pid && (p = attach_engine(pid, dlg)) != NULL) {
             fl_track(dlg, p);
             g_engine = NULL;
@@ -875,7 +935,9 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
             SendDlgItemMessageW(dlg, IDC_M_BACKUPMIN, EM_LIMITTEXT, 3, 0);
         }
         SetDlgItemTextW(dlg, IDC_S_STATUS, L"FL isn't running.");
-        adopt_running_fl(dlg);
+        CheckDlgButton(dlg, IDC_M_AUTOATTACH, flimcfg_auto_attach() ? BST_CHECKED : BST_UNCHECKED);
+        if (flimcfg_auto_attach()) adopt_running_fl(dlg);
+        else main_log(dlg, L"Attach to FL automatically is off: Join asks which FL Studio to use.");
         session_buttons(dlg);
         return TRUE;
     }
@@ -1014,6 +1076,13 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
                              : L"Detailed log off.");
             return TRUE; }
         case IDC_S_EXPORT: export_log(dlg); return TRUE;
+        case IDC_M_AUTOATTACH: {
+            int on = IsDlgButtonChecked(dlg, IDC_M_AUTOATTACH) == BST_CHECKED;
+            flimcfg_set(L"auto_attach", on ? NULL : L"0");
+            if (on && !fl_running()) { adopt_running_fl(dlg); session_buttons(dlg); }
+            main_log(dlg, on ? L"Attach to FL automatically: flim uses the FL that's running (or starts one)."
+                             : L"Attach to FL automatically off: Join asks which FL Studio to use.");
+            return TRUE; }
         case IDC_S_RESYNC:
             if (MessageBoxW(dlg, L"Load the session leader's project again, so this FL matches the host?\n\n"
                                  L"Changes you made that haven't reached the others yet may be lost.\n\n"

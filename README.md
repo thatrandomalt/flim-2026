@@ -143,7 +143,9 @@ untick **Show cursors** in flim's window.
    others yet may be lost. Clicked by the leader, it sends everyone the leader's project.
 5. Make music together. While FL runs, the **Join** button is **Disconnect** / **Connect**. You can close
    flim's window (FL keeps going) and open it again later: it finds your FL. *Open FL without
-   connecting* starts FL offline.
+   connecting* starts FL offline. With **Attach to FL automatically** unticked (top of the window),
+   flim doesn't take a running FL by itself: **Join** lists the FL Studio processes that are running
+   (and whether flim is in them already) plus *Open a new FL Studio*, and uses the one you pick.
 6. When you're done using flim, restart FL Studio before working on your own: flim stays loaded in it
    until then, and some strange behavior can be left over. flim reminds you when you close its window
    while FL is still open.

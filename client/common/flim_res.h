@@ -18,6 +18,9 @@
 #define IDC_M_PROJDIR    1109      // pick another projects folder
 #define IDC_M_SHARED     1116      // open the shared folder
 #define IDC_M_SONG       1115      // song name for an untitled project (optional)
+#define IDC_M_AUTOATTACH 1117      // attach to a running FL by itself / let me pick the FL process
+#define IDD_PICKFL       103       // pick the FL process (auto-attach off)
+#define IDC_P_LIST       1140
 #define IDC_J_URL        1110
 #define IDC_J_PW         1111
 #define IDC_J_REMEMBER   1112

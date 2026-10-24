@@ -148,6 +148,8 @@ static void clips_capture(int arr);
 static void pat_capture(int p);
 static int  pat_matches_base(int p);
 static void unit_revert(const char *key);
+static void unit_worked(int unit, int a, int b);
+static int  input_recent(DWORD now);
 static void units_capture_all(void);
 static int  closing_now(void);
 static int b64val(char c);
@@ -2594,8 +2596,11 @@ static void do_clipsnap(const QItem *it) {
     if (it->a != g_clipArr) { free(d); return; }
     for (i = 0; i < n; i++) d[(size_t)i * CLIP_SIZE + CLIP_SEL_OFS] &= (unsigned char)~CLIP_SEL_BIT;
     if (!unit_base(0, it->a, &b, &bn)) { unit_agreed(0, it->a, d, n, -1); g_clipHash = hv; free(d); return; }
+    if (it->mode == 1) {                         // FL's own change (scan_clips): what it shows now is the agreed state
+        if (group_diff(0, d, n, b, bn, gs, GROUP_MAX) > 0) logmsg("CLIPS changed with nobody at the keyboard here (FL's own): taken as known, not sent");
+        unit_agreed(0, it->a, d, n, -1); g_clipHash = hv; free(b); free(d); return;
+    }
     ng = group_diff(0, d, n, b, bn, gs, GROUP_MAX);
-    free(b);
     for (k = 0; k < ng; k++) {
         char key[32];
         unsigned gn;
@@ -2610,9 +2615,26 @@ static void do_clipsnap(const QItem *it) {
         b64enc(gd ? gd : (const unsigned char *)"", (int)(gn * CLIP_SIZE), m + o);
         strcat_s(m, cap, "\"}}");
         ws_send(m);
-        free(m); free(gd);
+        free(m);
         logmsg("CLIPS sent arrangement %d track %d (%u clips)", it->a, gs[k], gn);
+        {   // a clip edit can change its channel too (an audio clip stretched in the playlist sets the sample's stretch,
+            // a state-only setting): each channel whose clips changed here counts as worked in, so its state is checked
+            unsigned bg = 0, x, y;
+            unsigned char *bd = recs_group(0, b, bn, gs[k], &bg);
+            for (x = 0; x < gn; x++) {
+                const unsigned char *r = gd + (size_t)x * CLIP_SIZE;
+                uint32_t item = *(const uint32_t *)(r + 4);
+                for (y = 0; y < bg; y++) {
+                    const unsigned char *o = bd + (size_t)y * CLIP_SIZE;
+                    if (memcmp(r, o, CLIP_ID_OFS) == 0 && memcmp(r + CLIP_ID_OFS + 4, o + CLIP_ID_OFS + 4, CLIP_SIZE - CLIP_ID_OFS - 4) == 0) break;
+                }
+                if (y == bg && (item & 0xFFFFu) == 0x5000u && (item >> 16) < 0x5000u) unit_worked(U_CH, (int)(item >> 16), 0);
+            }
+            free(bd);
+        }
+        free(gd);
     }
+    free(b);
     g_clipHash = hv;
     free(d);
 }
@@ -2627,6 +2649,7 @@ static void do_clips(const QItem *it) {
 // Poll thread: the current arrangement's clips changed locally and settled?
 static void scan_clips(DWORD now) {
     static DWORD last = 0;
+    static int byUser = 0;                       // local input while the current change came in
     int arr;
     uint64_t h;
     if (now - last < NOTES_SCAN_MS || g_patDepth) return;
@@ -2634,12 +2657,19 @@ static void scan_clips(DWORD now) {
     arr = cur_arr();
     if (arr != g_clipArr) { clips_rebaseline(); return; }       // switched arrangement: new baseline
     h = clips_hash(arr);
-    if (h != g_clipSeen) { g_clipSeen = h; g_clipChangedAt = now; }
+    if (h != g_clipSeen) {
+        if (!g_clipChangedAt) byUser = 0;
+        g_clipSeen = h; g_clipChangedAt = now;
+        if (input_recent(now)) byUser = 1;
+    }
     if (g_clipChangedAt && now - g_clipChangedAt >= NOTES_SETTLE_MS) {
         // a new automation clip / audio clip channel: its chan.add must go out first
         if (chan_list_changed()) return;
         g_clipChangedAt = 0;
-        if (g_clipSeen != g_clipHash) enqueue_unit(T_CLIPSNAP, 0, arr, 0, 0, NULL);
+        // nobody here at the keyboard: FL changed clips by itself (it recomputes a stretched audio clip from its
+        // channel after a peer's clips are applied). Sent, the other FL recomputed its own and sent that back: the
+        // two ping-ponged. Taken as known instead (mode 1), like a param that moves by itself.
+        if (g_clipSeen != g_clipHash) enqueue_unit(T_CLIPSNAP, 0, arr, 0, byUser ? 0 : 1, NULL);
     }
 }
 
@@ -3139,6 +3169,16 @@ static void mix_struct(void) {
     logmsg("MIX tracks changed locally: %d deleted, %d inserted%s, %d -> %d tracks (sent)", nd, ni, moved ? ", moved" : "", n0, n);
     sc_done(SC_MIX, from, n);
     mix_rebaseline(from, n);
+    {   // a track inserted here may have a name already (routing a channel to a new track names it after the channel):
+        // taken as known, it never went out and the others kept FL's default ("mixer names differ", reloads). Its name
+        // and color go out after the insert (the others' FL made the track with its defaults)
+        int t;
+        for (t = 0; t < n && t < META_MAX; t++)
+            if (from[t] < 0) {
+                uint64_t h = meta_hash(M_MIX, t);
+                g_mSeen[M_MIX][t] = h; g_mHash[M_MIX][t] = h != 1 ? h ^ 1 : 2; g_mAt[M_MIX][t] = 1;
+            }
+    }
 }
 
 // Remote: the tracks into the sender's order, position j getting the track now at perm[j] (j = 1..n-2),
@@ -5916,7 +5956,6 @@ static void do_plugfocus(const QItem *it) {
     Vote V[VOTE_MAX];
     void **items;
     int nr = 0, nv = 0, i, t, s, nc = chan_list(&items), r, best = -1, second = 0;
-    Unit *u;
     if (!IsWindow(it->wnd)) return;
     EnumPropsExW(it->wnd, vcl_prop, (LPARAM)&vf);
     if (!vf.obj) { logmsg("PLUGFOCUS: no form object behind window %p", (void *)it->wnd); return; }
@@ -5954,10 +5993,14 @@ static void do_plugfocus(const QItem *it) {
     hit.unit = V[best].unit; hit.a = V[best].a; hit.b = V[best].b;
     logmsg("PLUGFOCUS: window %p is %s %d/%d (%d votes vs %d): checking its state", (void *)it->wnd,
            hit.unit == U_CH ? "ch" : "fx", hit.a, hit.b, V[best].votes, second);
-    u = unit_ptr(hit.unit, hit.a, hit.b);
-    if (u) u->userAt = GetTickCount();          // worked in: what its state shows now or at the sweep's next look goes out
+    unit_worked(hit.unit, hit.a, hit.b);
+}
+// Someone here worked in this unit (its window, its clips): what its state shows now or at the sweep's next look goes out.
+static void unit_worked(int unit, int a, int b) {
+    Unit *u = unit_ptr(unit, a, b);
+    if (u) u->userAt = GetTickCount();
     if (!u || u->lastAct || u->identAt || u->baselineAt || GetTickCount() < u->suppressUntil) return;   // handled elsewhere
-    enqueue_unit(T_SNAP, hit.unit, hit.a, hit.b, u->hash ? SNAP_IF_DIFF : SNAP_BASELINE, NULL);
+    enqueue_unit(T_SNAP, unit, a, b, u->hash ? SNAP_IF_DIFF : SNAP_BASELINE, NULL);
 }
 static volatile HWND g_plugForm = NULL;    // plugin window the last input into one went to
 static volatile DWORD g_plugInputAt = 0;   //   when (stored after it)
@@ -7166,7 +7209,8 @@ static void schedule_units(DWORD now) {
 // mid-way: a mute change counts once two passes in a row read it, and not while solo is changing.
 // On unsolo the tracks go back to the mute states everyone shares (FL may unmute them all instead,
 // or leave the rest muted when a mute click ended the solo).
-#define SOLO_HOLD_MS 1000
+#define SOLO_HOLD_MS    1500
+#define SOLO_RESTORE_MS 800                // after an unsolo: FL's own fades back are over by then (MUTE_FADE_MS)
 // While audio runs, FL mutes a track with a short fade: the track still reads enabled until the fade
 // ends, and an unmute meanwhile changes nothing, so the fade finishes muted (FL's sub_12C1810). A
 // mute that ends up against flim's last apply this soon after it is put back, not taken for an edit.
@@ -7176,15 +7220,22 @@ static unsigned char g_mutePend[MAX_MIX];  // a track's new mute reading + 1, un
 static DWORD g_soloChangedAt;              // when solo last went on or off here
 static void solo_poll(DWORD now) {
     static int was = -1;
+    static DWORD restoreAt;                // an unsolo's put-back is due (0 = none)
     int on = solo_scan(), i, n = g_nslot;
+    if (restoreAt && (LONG)(now - restoreAt) >= 0) {
+        // put back once FL's fades from the unsolo are over: done at once, it read tracks mid-fade and its applies
+        // landed inside FL's fades (an unmute then does nothing), leaving tracks muted; the next click sent that
+        restoreAt = 0;
+        if (!on)
+            for (i = 0; i < n; i++) {
+                Slot *s = &g_slots[i];
+                int t = (int)(s->id & 0xFFFFF);
+                if (IS_MUTE_ID(s->id) && t < mix_count() && s->last != REC_NONE && mute_get(t, 0) != s->last) enqueue_apply(s->id, s->last, 0);
+            }
+    }
     if (on == was) return;
     if (was >= 0) logmsg("SOLO %s here (each person's own: not synced)", on ? "on" : "off");
-    if (was == 1)
-        for (i = 0; i < n; i++) {
-            Slot *s = &g_slots[i];
-            int t = (int)(s->id & 0xFFFFF);
-            if (IS_MUTE_ID(s->id) && t < mix_count() && s->last != REC_NONE && mute_get(t, 0) != s->last) enqueue_apply(s->id, s->last, 0);
-        }
+    restoreAt = was == 1 ? (now + SOLO_RESTORE_MS) | 1 : 0;   // (soloed again meanwhile: its own unsolo puts back)
     was = on;
     g_soloChangedAt = now;
 }

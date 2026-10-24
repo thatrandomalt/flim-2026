@@ -95,6 +95,12 @@ static int flimcfg_log_detailed(void) {
     flimcfg_get(L"log_detailed", v, 8);
     return v[0] && _wtoi(v) != 0;
 }
+// flim.exe attaches to a running FL by itself, unless turned off ("auto_attach=0": Join asks which FL)
+static int flimcfg_auto_attach(void) {
+    wchar_t v[8];
+    flimcfg_get(L"auto_attach", v, 8);
+    return !v[0] || _wtoi(v) != 0;
+}
 // the others' mouse arrows over the piano roll / playlist: on unless turned off ("show_cursors=0")
 static int flimcfg_show_cursors(void) {
     wchar_t v[8];
