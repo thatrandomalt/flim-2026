@@ -138,10 +138,15 @@ untick **Show cursors** in flim's window.
    people joining, the project arriving and being zipped, samples uploading and downloading. You can
    select and copy from the log. **Detailed log** adds every change sent and received, and every 30 s a
    summary of the song (two people's summaries differ where their songs do). **Export log...** saves
-   what a bug report needs as one zip.
+   what a bug report needs as one zip. **Resync from host...** (after a warning) loads the session
+   leader's project again if your song seems out of step; changes of yours that haven't reached the
+   others yet may be lost. Clicked by the leader, it sends everyone the leader's project.
 5. Make music together. While FL runs, the **Join** button is **Disconnect** / **Connect**. You can close
    flim's window (FL keeps going) and open it again later: it finds your FL. *Open FL without
    connecting* starts FL offline.
+6. When you're done using flim, restart FL Studio before working on your own: flim stays loaded in it
+   until then, and some strange behavior can be left over. flim reminds you when you close its window
+   while FL is still open.
 
 ### Hosting
 The host is built into `flim.exe`, nothing else to install. What to give the others:

@@ -320,6 +320,7 @@ static void session_buttons(HWND dlg) {
     int on = g_netState == NET_ON || g_netState == NET_CONNECTING, fl = fl_running();
     SetDlgItemTextW(dlg, IDC_J_JOIN, !fl ? L"Join" : on ? L"Disconnect" : L"Connect");
     EnableWindow(GetDlgItem(dlg, IDC_M_OPENFL), !fl);
+    EnableWindow(GetDlgItem(dlg, IDC_S_RESYNC), fl && g_netState == NET_ON);
 }
 
 static void wide_to_utf8(const wchar_t *w, char *out, int cap) {
@@ -1013,6 +1014,14 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
                              : L"Detailed log off.");
             return TRUE; }
         case IDC_S_EXPORT: export_log(dlg); return TRUE;
+        case IDC_S_RESYNC:
+            if (MessageBoxW(dlg, L"Load the session leader's project again, so this FL matches the host?\n\n"
+                                 L"Changes you made that haven't reached the others yet may be lost.\n\n"
+                                 L"(If you are the session leader, everyone else loads your project instead, and "
+                                 L"their changes that haven't reached you yet may be lost.)",
+                            L"Resync from host", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK)
+                engine_send(dlg, GUI_RESYNC, NULL);
+            return TRUE;
         case IDC_M_PROJECTS: { wchar_t d[MAX_PATH * 2]; flimcfg_projects_dir(d, MAX_PATH * 2); open_folder(d); return TRUE; }
         case IDC_M_PROJDIR: pick_projects_dir(dlg); return TRUE;
         case IDC_M_CRASHES: { wchar_t d[MAX_PATH * 2]; crash_dir(d, MAX_PATH * 2); open_folder(d); return TRUE; }
@@ -1034,6 +1043,11 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
                                 MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return TRUE;
                 main_host_stop();
             }
+            if (fl_running())                              // flim stays loaded in that FL until it restarts
+                MessageBoxW(dlg, L"FL Studio stays open, with flim still loaded in it.\n\n"
+                                 L"When you're done using flim, close FL Studio and open it again before working on "
+                                 L"your own: some strange behavior can be left over in FL until it restarts.",
+                            L"flim", MB_OK | MB_ICONINFORMATION);
             EndDialog(dlg, IDCANCEL);
             return TRUE;
         }

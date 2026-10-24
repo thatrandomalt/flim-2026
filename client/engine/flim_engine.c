@@ -173,6 +173,7 @@ static void mix_struct(void);
 static int  unit_params(int unit, int a, int b);
 static int  chan_list_changed(void);
 static void resync(const char *why);
+static void resync_asked(void);
 static void notes_send_channel(int c);
 static wchar_t *dstr_keep(const wchar_t *s);
 static int int_after(const char *p, const char *end, const char *key, int *out);
@@ -3766,7 +3767,8 @@ static void wguard_pass(void) {
 //                                                 GUI_ALERT "<text>" (a popup: the session leader left...)
 //   window -> engine (to our task window):       GUI_CONNECT "<url>\n<password>\n<name>",
 //                                                 GUI_DISCONNECT, GUI_HELLO,
-//                                                 GUI_SETTINGS (flim.ini changed: plugin_lock_s)
+//                                                 GUI_SETTINGS (flim.ini changed: plugin_lock_s),
+//                                                 GUI_RESYNC ("Resync from host": the leader's project now)
 // Ours go out from a thread of our own with a timeout, so a busy or closed window never holds FL up.
 // (GUI_* kinds and NET_* states: common/flim_config.h)
 static volatile LONG g_netState = NET_OFF;
@@ -3934,6 +3936,7 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
                g_logDetailed ? "on" : "off");
         if (g_isLeader && g_netState == NET_ON) leader_name_project();   // a song name typed in mid-session
         break;
+    case GUI_RESYNC: resync_asked(); break;
     }
     SecureZeroMemory(t, sizeof(t));
 }
@@ -4323,6 +4326,12 @@ static void resync(const char *why) {
            g_isLeader ? "sending everyone the leader's project" : "loading the leader's project again");
     if (!g_isLeader) ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");
     else enqueue_unit(T_PROJSNAP, 0, 0, 0, 0, NULL);
+}
+// "Resync from host" in the flim window (it asked first): now, not held to RESYNC_MS.
+static void resync_asked(void) {
+    if (g_netState != NET_ON) logmsg("SYNC resync asked for, but not connected");
+    else if (member_reloading() || (g_isLeader && g_projBusy)) logmsg("SYNC resync asked for: one is already under way");
+    else { g_resyncAt = 0; resync("asked for in the flim window"); }
 }
 // Poll thread.
 static void resync_tick(DWORD now) {

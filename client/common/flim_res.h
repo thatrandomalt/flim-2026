@@ -37,6 +37,7 @@
 #define IDC_S_DETAIL     1133      //          the detailed log on / off
 #define IDC_S_EXPORT     1134      //          save the logs as a zip to send
 #define IDC_S_CURSORS    1135      //          the others' mouse arrows shown / not
+#define IDC_S_RESYNC     1136      //          load the session leader's project again (asks first)
 
 // Engine: flim's startup splash (shown instead of FL's Title.png, only in flim's FL)
 #define IDR_SPLASH       301
