@@ -944,8 +944,9 @@ def t_arrangements():
     c0 = arr_cur(a); ca = a.q(arr(a, c0) + 0x14); nn = a.d(ca + 0x14)
     if nn:
         rec = a.q(ca + 8) + (nn - 1) * 0x58; a.w(rec, struct.pack('<I', a.d(rec) + 192)); a.call(0xe39560, a.q(a.g(PLFORM)))
+        trk = a.r(rec + 12, 2)                                  # (its track only: the others' lengths can differ a while, FL2026-internals.md)
         a.call(V(a, 'SETARR'), 0 if c0 else 1)
-        check('clip edit then a switch: it went out', lambda: sorted(r[:0x20] for r in clips(b, c0)[1]), lambda: sorted(r[:0x20] for r in clips(a, c0)[1]), wait=8)
+        check('clip edit then a switch: it went out', lambda: sorted(r[:0x20] for r in clips(b, c0)[1] if r[12:14] == trk), lambda: sorted(r[:0x20] for r in clips(a, c0)[1] if r[12:14] == trk), wait=8)
     # B reloads the leader's project: still on its own arrangement and pattern
     b.call(V(b, 'SETARR'), 0); b.call(V(b, 'PATSELECT'), 3); a.call(V(a, 'SETARR'), 1); a.call(V(a, 'PATSELECT'), 1); time.sleep(1)
     pos = os.path.getsize(LOG)

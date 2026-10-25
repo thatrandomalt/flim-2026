@@ -899,6 +899,12 @@ How flim keeps them in step:
 - **A clip edit right before switching arrangement** was dropped (the switch took a new baseline at once).
   `scan_clips` now sends the old arrangement's unsent change first (`T_CLIPSNAP` for it), but only while it is
   the same arrangement object (`g_clipArrObj`): after an add / delete its number is another's.
+- **Switching to an arrangement sizes its pattern clips to their pattern** (un-cut ones; also when deleting the
+  current one moves `ARRCUR`). FL's own and the same on every FL, so not sent, and the safety net compares
+  clips only when both are on the same arrangement. `live_test`'s `clip` writes 384-tick clips of pattern 1,
+  which is empty in a fresh test project (FL makes them 1 tick): after A switched, A's were 1 and B's 384 until
+  B switched too. That made `arrangements`' edit-then-switch check fail on a fresh pair; it compares only the
+  edited clip's track now.
 - FL renumbers clip ids on add (`+0x20`), so clip records with another FL's ids are safe to add.
 - `live_test` `arrangements` (both FLs make the second arrangement themselves with `ADDARR`): insert / rename /
   delete by A, add by B, a clone (insert + clips inside one main-thread call), an edit then a switch, and B
