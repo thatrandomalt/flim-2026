@@ -897,6 +897,62 @@ def slot_plugin(p, t, s, tag):                                  # the plugin's n
     for e, v in flp.events(open(path, 'rb').read()):
         if e in (201, 203): return v.decode('utf-16le', 'replace').rstrip('\0')
     return '?'
+# Arrangements (the playlist's Arrangements menu): add / rename / delete from either side reach the other, each person
+# stays on their own arrangement (also across a reload of the leader's project), a clone's content comes along, and a
+# clip edit right before switching arrangement still goes out.
+def arr_count(p): return p.q(p.g(V(p, 'ARRS')) - 8)
+def arr_names(p): return [ustr(p, p.q(arr(p, i) + 8)) for i in range(arr_count(p))]
+def arr_cur(p): return p.d(p.a(V(p, 'ARRCUR')))
+def t_arrangements():
+    if arr_count(a) < 2: a.call(V(a, 'ADDARR'), 0, 0)
+    check('arrangements: two on both', lambda: arr_names(a), lambda: arr_names(b), wait=8)
+    a.call(V(a, 'SETARR'), 1); b.call(V(b, 'SETARR'), 0); time.sleep(1)
+    bobj = arr(b, 0)
+    a.call(V(a, 'INSARR'), 1)
+    check('arrangement inserted by A: same list on B', lambda: arr_names(a), lambda: arr_names(b), wait=8)
+    check('...B still on its own arrangement', lambda: arr(b, arr_cur(b)), lambda: bobj, wait=0)
+    a.call(V(a, 'USTRASG'), arr(a, 1) + 8, a.mkstr('Renamed by A'))
+    check('arrangement renamed by A', lambda: arr_names(b)[1], lambda: 'Renamed by A', wait=8)
+    n = arr_count(b); b.call(V(b, 'ADDARR'), 0, 0)
+    check('arrangement added by B: A has it', lambda: arr_names(a), lambda: arr_names(b), wait=8)
+    check('...one more', lambda: arr_count(a), lambda: n + 1, wait=0)
+    a.call(V(a, 'DELARR'), 1, 1, 0)
+    check('arrangement deleted by A: same list on B', lambda: arr_names(a), lambda: arr_names(b), wait=8)
+    check('...B still on its own arrangement', lambda: arr(b, arr_cur(b)), lambda: bobj, wait=0)
+    # a clone: inserted at 1 and filled with clips inside one main-thread call
+    src = [r for r in clips(a, 0)[1]][:2] or []
+    if src:
+        import ctypes
+        src = [r[:0x20] + b'\0' * 4 + r[0x24:] for r in src]     # (no clip id: FL's ids are unique, a copy with one moved the original)
+        buf = a.alloc(0x58 * len(src)); a.w(buf, b''.join(src))
+        code = b'\x48\x83\xec\x28\xb9\x01\x00\x00\x00\x48\xb8' + struct.pack('<Q', a.a(V(a, 'INSARR'))) + b'\xff\xd0'
+        for i in range(len(src)):
+            code += b'\x48\xb8' + struct.pack('<Q', a.a(V(a, 'ARRS'))) + b'\x48\x8b\x00\x48\x8b\x48\x08\x48\x8b\x49\x14\x48\x8b\x01'
+            code += b'\x48\xba' + struct.pack('<Q', buf + i * 0x58) + b'\xff\x50\x08'
+        code += b'\x48\x83\xc4\x28\xc3'
+        k = ctypes.windll.kernel32
+        k.OpenProcess.restype = ctypes.c_void_p; k.VirtualAllocEx.restype = ctypes.c_void_p
+        k.VirtualAllocEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong]
+        k.WriteProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p]
+        h = k.OpenProcess(0x1F0FFF, False, A); mem = k.VirtualAllocEx(h, None, len(code), 0x3000, 0x40)
+        k.WriteProcessMemory(h, mem, code, len(code), None); k.CloseHandle(ctypes.c_void_p(h))
+        a.call(va(a, mem))
+        check('arrangement cloned by A: its clips on B', lambda: sorted(r[:0x20] for r in clips(b, 1)[1]), lambda: sorted(r[:0x20] for r in clips(a, 1)[1]), wait=8)
+    # a clip edit, then a switch away at once
+    c0 = arr_cur(a); ca = a.q(arr(a, c0) + 0x14); nn = a.d(ca + 0x14)
+    if nn:
+        rec = a.q(ca + 8) + (nn - 1) * 0x58; a.w(rec, struct.pack('<I', a.d(rec) + 192)); a.call(0xe39560, a.q(a.g(PLFORM)))
+        a.call(V(a, 'SETARR'), 0 if c0 else 1)
+        check('clip edit then a switch: it went out', lambda: sorted(r[:0x20] for r in clips(b, c0)[1]), lambda: sorted(r[:0x20] for r in clips(a, c0)[1]), wait=8)
+    # B reloads the leader's project: still on its own arrangement and pattern
+    b.call(V(b, 'SETARR'), 0); b.call(V(b, 'PATSELECT'), 3); a.call(V(a, 'SETARR'), 1); a.call(V(a, 'PATSELECT'), 1); time.sleep(1)
+    pos = os.path.getsize(LOG)
+    call_many(b, B, 0x1004a60, [(i, 0, 3) for i in range(len(chans(b)) - 1, 0, -1)]) if len(chans(b)) > 4 else None
+    if len(chans(a)) > 4:
+        check('reload: B loaded the project', lambda: any('PROJECT caught up' in l for l in log_since(pos, B)), lambda: True, wait=40)
+        check("reload: B kept its own arrangement and pattern", lambda: (arr_cur(b), b.d(b.g(V(b, 'CURPAT')))), lambda: (0, 3), wait=3)
+    a.call(V(a, 'SETARR'), 0); b.call(V(b, 'SETARR'), 0); a.call(V(a, 'PATSELECT'), 1); b.call(V(b, 'PATSELECT'), 1)   # (later tests compare the current one)
+
 def t_slot_move():
     t = 4
     if not (has_plug(a, t, 0) and has_plug(a, t, 1)): print('   (track %d needs effects in slots 0 and 1: skipped)' % t); return

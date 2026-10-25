@@ -149,6 +149,12 @@ static void pat_capture(int p);
 static int  pat_matches_base(int p);
 static void unit_revert(const char *key);
 static void unit_worked(int unit, int a, int b);
+static void view_save(void);
+static void view_restore(void);
+static void arr_known_take(void);
+static int  arr_count(void);
+static char *arr_obj(int arr);
+static int g_haveSong;
 static int  input_recent(DWORD now);
 static void units_capture_all(void);
 static int  closing_now(void);
@@ -326,7 +332,7 @@ static gridrefresh_t g_gridRefresh;
 enum { T_PARAM, T_SNAP, T_LOAD, T_ADDCH, T_DELCH, T_STRUCT, T_FULL, T_ORDER, T_FXCLEAR, T_FXSYNC,
        T_NOTESNAP, T_NOTES, T_NOTESYNC, T_PROJLOAD, T_PROJDONE, T_PROJSNAP,
        T_CLIPSNAP, T_CLIPS, T_UNITREVERT, T_HINT, T_METASNAP, T_META, T_PATOP, T_RELOADU, T_PLUGFOCUS,
-       T_MIXSTRUCT, T_NAMEPROJ, T_PCOUNT };
+       T_MIXSTRUCT, T_NAMEPROJ, T_PCOUNT, T_ARRSTRUCT, T_ARROP };
 enum { U_CH, U_FX };
 enum { SNAP_BASELINE, SNAP_IF_DIFF, SNAP_FORCE, SNAP_COLLECT, SNAP_RESEND };   // RESEND: FORCE, for links_resend_into
 #define QCAP 16384
@@ -2479,6 +2485,8 @@ static const char *parse_notes_item(const char *p, unsigned char *keep) {
 static uint64_t g_clipHash = 0, g_clipSeen = 0;
 static DWORD    g_clipChangedAt = 0;
 static int      g_clipArr = -1;                  // arrangement the baseline belongs to
+static void    *g_clipArrObj;                   //   that arrangement (its number is another's after an add / delete)
+static DWORD    g_clipFlushAt;                   // an unsent edit in it went out on a switch (scan_clips), when
 
 static int clip_cmp(const void *a, const void *b) { return memcmp(a, b, CLIP_SIZE); }
 
@@ -2526,6 +2534,8 @@ static uint64_t clips_hash(int arr) {
 
 static void clips_rebaseline(void) {
     g_clipArr = cur_arr();
+    g_clipArrObj = arr_obj(g_clipArr);
+    g_clipFlushAt = 0;
     g_clipSeen = g_clipHash = clips_hash(g_clipArr);
     g_clipChangedAt = 0;
     clips_capture(g_clipArr);
@@ -2680,7 +2690,21 @@ static void scan_clips(DWORD now) {
     if (now - last < NOTES_SCAN_MS || g_patDepth) return;
     last = now;
     arr = cur_arr();
-    if (arr != g_clipArr) { clips_rebaseline(); return; }       // switched arrangement: new baseline
+    if (arr != g_clipArr) {                                    // switched arrangement: new baseline,
+        // after an edit in the old one still unsent goes out (taking the new baseline at once dropped it: an edit, then
+        // a switch). Only while the old one is the same arrangement: after an add / delete its number is another's
+        // (do_arrstruct takes the baselines then).
+        if (g_clipArr >= 0 && g_clipArr < arr_count() && arr_obj(g_clipArr) == g_clipArrObj && clips_hash(g_clipArr) != g_clipHash) {
+            if (!g_clipFlushAt) {
+                g_clipFlushAt = now | 1;
+                enqueue_unit(T_CLIPSNAP, 0, g_clipArr, 0, byUser || input_recent(now) ? 0 : 1, NULL);
+                return;
+            }
+            if (now - g_clipFlushAt < 3000) return;
+        }
+        clips_rebaseline();
+        return;
+    }
     h = clips_hash(arr);
     if (h != g_clipSeen) {
         if (!g_clipChangedAt) byUser = 0;
@@ -4176,6 +4200,7 @@ static void set_project_file(const wchar_t *path) {
 // Re-take every baseline after a project change (main thread). Nothing is sent.
 static void proj_rebaseline(void) {
     void **items; int n = chan_list(&items), i, t, s;
+    arr_known_take();
     known_from_list();
     mix_known_take();
     memset(g_chU, 0, sizeof(g_chU));
@@ -4340,7 +4365,7 @@ static void do_projdone(void) {
         }
         return;
     }
-    if (remote) { g_projShortLoads = 0; g_replayAt = GetTickCount(); InterlockedExchange(&g_replaying, 1); proj_end(); replay_held(); member_reloading(); return; }
+    if (remote) { g_projShortLoads = 0; view_restore(); g_haveSong = 1; g_replayAt = GetTickCount(); InterlockedExchange(&g_replaying, 1); proj_end(); replay_held(); member_reloading(); return; }
     proj_end();
     if (g_isLeader) leader_project_loaded();
     else {
@@ -4392,6 +4417,7 @@ static void do_projload(const QItem *it) {
     char r = 0;
     DWORD t0 = GetTickCount();
     if (!form || !proj) { logmsg("PROJECT load: FL objects not found"); return; }
+    view_save();                                              // (do_projdone puts this FL's own view back)
     {   // how many channels it has: a load cancelled half-way ends with fewer (do_projdone)
         size_t n = 0;
         unsigned char *d = read_file_w(path, &n);
@@ -6150,6 +6176,246 @@ static void sel_restore(void) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     if (moved) logmsg("SELECT a peer's change moved our selection / pattern: put back (pattern %d)", best > 0 ? best : now);
 }
+// Which arrangement and pattern this person is on is their own view, but a project file carries the leader's: every
+// re-sync moved a member onto the leader's arrangement and pattern (and the playlist's clip source and its tool
+// buttons with it). Kept by number across a load of the leader's project, once this FL has the song (not on the
+// first join: what it showed before was another song).
+#define SETARR_VA FLVA(SETARR)     // SetCurrentArrangement(index) (sub_12FB5F0: writes ARRCUR, redraws the playlist)
+static int g_viewArr = -1, g_viewPat = -1;
+static int g_haveSong = 0;
+static void view_save(void) {
+    g_viewArr = g_haveSong ? cur_arr() : -1;
+    g_viewPat = g_haveSong ? cur_pat() : -1;
+}
+static void view_restore(void) {
+    int n = 0;
+    __try { n = (int)*(int64_t *)(*(char **)(g_flBase + (ARRS_VA - IMG_BASE)) - 8); } __except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
+    __try {
+        if (g_viewArr >= 0 && g_viewArr < n && g_viewArr != cur_arr()) ((void (*)(int))(g_flBase + (SETARR_VA - IMG_BASE)))(g_viewArr);
+        if (g_viewPat >= 1 && g_viewPat < MAX_PAT && g_viewPat != cur_pat()) ((void (*)(int))(g_flBase + (PATSELECT_VA - IMG_BASE)))(g_viewPat);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("SELECT putting back the arrangement / pattern faulted"); }
+    if (g_viewArr >= 0) logmsg("SELECT kept this FL's own arrangement %d and pattern %d across the leader's project", g_viewArr, g_viewPat);
+    g_viewArr = g_viewPat = -1;
+}
+
+// ---------------- arrangements (the playlist's Arrangements menu) ----------------
+// Adding, cloning, deleting and renaming an arrangement weren't synced: a leader's new arrangement reached the members
+// only with the safety net's reload, and a member's was wiped by it. Now flim keeps the list of arrangement objects
+// (identity, like channels) and their names; one change at a time goes out as an op, replayed with FL's own functions:
+//   {"kind":"arr.ins","at":k,"n0":count before,"n":"<name>"}  InsertArrangement(k) (sub_12F9C20; a new last one:
+//                                                              AddArrangement(0, 0), sub_12F9930, without copying
+//                                                              the current arrangement's track links: each FL's differs)
+//   {"kind":"arr.del","at":k,"n0":count before}               DeleteArrangement(k, select a neighbour, no undo)
+//   {"kind":"arr.name","i":k,"n":"<name>"}                    the name (arrangement +8, a UnicodeString)
+// A new (or cloned) arrangement's content follows as the usual ops: its clips per playlist track, its playlist tracks
+// that aren't FL's default and its markers. Everything keyed by arrangement number (track names / links, markers, the
+// clip baseline, each person's current arrangement) follows the renumbering. Several changes in one look, or a count
+// that isn't the sender's (two people at once): re-sync. ponytail: clips / meta ops already on their way during an
+// arrangement insert / delete land on the old numbers; arrangements aren't in the structure counts.
+#define INSARR_VA  FLVA(INSARR)
+#define ADDARR_VA  FLVA(ADDARR)
+#define DELARR_VA  FLVA(DELARR)
+#define USTRASG_VA FLVA(USTRASG)
+#define ARR_MAX    64
+typedef void (*insarr_t)(int at);
+typedef int  (*addarr_t)(char a, char b);
+typedef void (*delarr_t)(int at, char selectNeighbour, char undo);
+typedef void (*ustrasg_t)(void *dst, const wchar_t *src);
+static void   *g_arrKnown[ARR_MAX];
+static uint64_t g_arrNameH[ARR_MAX];
+static int     g_nArrKnown = -1;
+static volatile LONG g_arrQueued = 0;
+static const wchar_t *arr_name(int i) { char *a = arr_obj(i); return a ? *(const wchar_t **)(a + 8) : NULL; }
+// Poll thread or main thread: the list as FL has it now. 0 = unreadable.
+static int arr_take(void **objs, uint64_t *names, int *n) {
+    int i, c = arr_count();
+    __try {
+        if (c < 1 || c > ARR_MAX) return 0;
+        for (i = 0; i < c; i++) { objs[i] = arr_obj(i); names[i] = fnv_ustr(1469598103934665603ull, arr_name(i)); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    *n = c;
+    return 1;
+}
+static void arr_known_take(void) { int n; if (arr_take(g_arrKnown, g_arrNameH, &n)) g_nArrKnown = n; }
+// Poll thread: the list or a name changed here: the main thread looks (do_arrstruct).
+static void arr_poll(DWORD now) {
+    static DWORD last;
+    static void *o[ARR_MAX];
+    static uint64_t h[ARR_MAX];
+    int n, i, diff;
+    if (now - last < 250 || g_projBusy) return;
+    if (g_nArrKnown < 0) { arr_known_take(); return; }
+    last = now;
+    if (!arr_take(o, h, &n)) return;
+    diff = n != g_nArrKnown;
+    for (i = 0; !diff && i < n; i++) diff = o[i] != g_arrKnown[i] || h[i] != g_arrNameH[i];
+    if (diff && !InterlockedExchange(&g_arrQueued, 1)) enqueue_unit(T_ARRSTRUCT, 0, 0, 0, 0, NULL);
+}
+// Everything keyed by arrangement number, through a change (from[new] = old, -1 = new).
+static void arr_renumber(const int *from, int n) {
+    static int fp[META_MAX];
+    int i;
+    for (i = 0; i < META_MAX; i++) {
+        int a = i / 512, f = a < n ? from[a] : -1;
+        fp[i] = f >= 0 && f < META_ARR_MAX ? f * 512 + i % 512 : -1;
+    }
+    meta_remap(M_PLT, fp, META_MAX);
+    meta_remap(M_MARK, from, n);
+    clips_rebaseline();
+}
+static void arr_name_json(int i, char *out, int cap) {
+    const wchar_t *s = arr_name(i);
+    int nl = ustr_len(s);
+    if (nl * 4 / 3 + 8 > cap) nl = 0;
+    b64enc(nl ? (const unsigned char *)s : (const unsigned char *)"", nl * 2, out);
+}
+// A new arrangement's content goes out as the usual ops (sender, main thread): clips per track, the playlist tracks that
+// aren't FL's default (the most common state among its 500), its markers.
+static void arr_send_content(int k) {
+    unsigned n, i, j, gn;
+    unsigned char *d = clips_copy(k, &n);
+    static int gs[512];
+    int ng = 0, t;
+    for (i = 0; i < n; i++) d[(size_t)i * CLIP_SIZE + CLIP_SEL_OFS] &= (unsigned char)~CLIP_SEL_BIT;
+    for (i = 0; i < n; i++) {
+        int g = (int)rec_group(0, d + (size_t)i * CLIP_SIZE);
+        for (j = 0; j < (unsigned)ng && gs[j] != g; j++) {}
+        if (j == (unsigned)ng && ng < 512) gs[ng++] = g;
+    }
+    for (j = 0; j < (unsigned)ng; j++) {
+        unsigned char *gd = recs_group(0, d, n, gs[j], &gn);
+        size_t cap = 160 + ((size_t)gn * CLIP_SIZE + 2) / 3 * 4;
+        char *m = (char *)malloc(cap);
+        int o = sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"clips.set\",\"key\":\"clips:%d:%d\",\"arr\":%d,\"trk\":%d,\"data\":\"", k, gs[j], k, gs[j]);
+        b64enc(gd ? gd : (const unsigned char *)"", (int)(gn * CLIP_SIZE), m + o);
+        strcat_s(m, cap, "\"}}");
+        ws_send(m);
+        free(m); free(gd);
+    }
+    free(d);
+    if (ng) logmsg("ARR sent arrangement %d's clips (%d playlist tracks)", k, ng);
+    if (k < META_ARR_MAX) {
+        static uint64_t hs[PL_TRK_MAX + 1];
+        uint64_t def = 0;
+        int best = 0, c, u, sent = 0;
+        for (t = 1; t <= PL_TRK_MAX; t++) hs[t] = meta_hash(M_PLT, k * 512 + t);
+        for (t = 1; t <= PL_TRK_MAX && best < PL_TRK_MAX / 2; t += 7) {   // (a sample is enough to find the default)
+            for (c = 0, u = 1; u <= PL_TRK_MAX; u++) c += hs[u] == hs[t];
+            if (c > best) { best = c; def = hs[t]; }
+        }
+        for (t = 1; t <= PL_TRK_MAX; t++)
+            if (hs[t] && hs[t] != def) { i = k * 512 + t; g_mSeen[M_PLT][i] = hs[t]; g_mHash[M_PLT][i] = hs[t] ^ 1; g_mAt[M_PLT][i] = 1; sent++; }
+        uint64_t mh = meta_hash(M_MARK, k);
+        g_mSeen[M_MARK][k] = mh; g_mHash[M_MARK][k] = mh != 1 ? mh ^ 1 : 2; g_mAt[M_MARK][k] = 1;
+        if (sent) logmsg("ARR arrangement %d: %d playlist tracks that aren't FL's default go out", k, sent);
+    }
+}
+// Main thread: what changed in the list here.
+static void do_arrstruct(void) {
+    static void *o[ARR_MAX];
+    static uint64_t h[ARR_MAX];
+    static int from[ARR_MAX];
+    int n, n0 = g_nArrKnown, i, j, k = -1;
+    char m[256], nm[160];
+    InterlockedExchange(&g_arrQueued, 0);
+    if (n0 < 0 || g_projBusy || !arr_take(o, h, &n)) return;
+    if (n == n0 + 1) {                                         // one new: the others in order around it
+        for (k = 0; k < n0 && o[k] == g_arrKnown[k]; k++) {}
+        for (i = k + 1; i < n && o[i] == g_arrKnown[i - 1]; i++) {}
+        if (i < n) k = -2;
+    } else if (n == n0 - 1) {
+        for (k = 0; k < n && o[k] == g_arrKnown[k]; k++) {}
+        for (i = k; i < n && o[i] == g_arrKnown[i + 1]; i++) {}
+        if (i < n) k = -2;
+    } else if (n == n0) {
+        for (i = 0; i < n && o[i] == g_arrKnown[i]; i++) {}
+        if (i < n) k = -2;
+    } else k = -2;
+    if (k == -2) {
+        logmsg("ARR the arrangement list changed in several ways at once (%d -> %d): re-syncing", n0, n);
+        arr_known_take();
+        resync("arrangements changed in several ways at once");
+        return;
+    }
+    if (n != n0) {
+        for (i = 0; i < n; i++) from[i] = n > n0 ? (i < k ? i : i == k ? -1 : i - 1) : (i < k ? i : i + 1);
+        if (n > n0) {
+            arr_name_json(k, nm, sizeof(nm));
+            sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"arr.ins\",\"at\":%d,\"n0\":%d,\"n\":\"%s\"}}", k, n0, nm);
+        } else sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"arr.del\",\"at\":%d,\"n0\":%d}}", k, n0);
+        ws_send(m);
+        logmsg("ARR arrangement %d %s locally (sent, %d -> %d)", k, n > n0 ? "added" : "deleted", n0, n);
+        arr_renumber(from, n);
+        arr_known_take();
+        if (n > n0) arr_send_content(k);
+        return;
+    }
+    for (i = 0; i < n; i++)                                    // same list: renames
+        if (h[i] != g_arrNameH[i]) {
+            arr_name_json(i, nm, sizeof(nm));
+            sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"arr.name\",\"i\":%d,\"n\":\"%s\"}}", i, nm);
+            ws_send(m);
+            logmsg("ARR arrangement %d renamed locally (sent)", i);
+        }
+    (void)j;
+    arr_known_take();
+}
+static void arr_set_name(int i, const char *b64) {
+    size_t n = 0;
+    unsigned char *w = b64dec(b64, strlen(b64), &n);
+    wchar_t buf[128], *s;
+    int len = (int)(n / 2) < 127 ? (int)(n / 2) : 127, j;
+    char *a = arr_obj(i);
+    if (!a) { free(w); return; }
+    if (w) memcpy(buf, w, (size_t)len * 2);
+    buf[len] = 0;
+    free(w);
+    s = dstr_keep(buf);
+    __try { ((ustrasg_t)(g_flBase + (USTRASG_VA - IMG_BASE)))(a + 8, s); } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("ARR setting a name faulted"); }
+    dstr_free(s);
+    (void)j;
+}
+// Main thread: a peer's arrangement op.
+static void do_arrop(const QItem *it) {
+    const char *m = it->path, *q;
+    static int from[ARR_MAX];
+    int at = -1, n0 = -1, i, cur = cur_arr(), n = arr_count();
+    char nm[192] = "";
+    if ((q = strstr(m, "\"n\":\"")) != NULL) { const char *e = strchr(q + 5, '"'); size_t l = e ? (size_t)(e - q - 5) : 0; if (l < sizeof(nm)) { memcpy(nm, q + 5, l); nm[l] = 0; } }
+    if (strstr(m, "\"kind\":\"arr.name\"")) {
+        if (int_after(m, NULL, "\"i\":", &at) && at >= 0 && at < n) { arr_set_name(at, nm); logmsg("ARR arrangement %d renamed (remote)", at); }
+        arr_known_take();
+        return;
+    }
+    int_after(m, NULL, "\"at\":", &at);
+    int_after(m, NULL, "\"n0\":", &n0);
+    if (n0 != n || at < 0 || n0 + 1 > ARR_MAX) {
+        logmsg("ARR %.40s for %d arrangements, this FL has %d: re-syncing", m, n0, n);
+        resync("an arrangement change for another arrangement list");
+        return;
+    }
+    __try {
+        if (strstr(m, "\"kind\":\"arr.ins\"")) {
+            if (at > n0) at = n0;
+            if (at < n0) ((insarr_t)(g_flBase + (INSARR_VA - IMG_BASE)))(at);
+            else ((addarr_t)(g_flBase + (ADDARR_VA - IMG_BASE)))(0, 0);
+            if (arr_count() != n0 + 1) { logmsg("ARR FL didn't add the arrangement: re-syncing"); resync("an arrangement FL didn't add"); return; }
+            if (nm[0]) arr_set_name(at, nm);
+            for (i = 0; i <= n0; i++) from[i] = i < at ? i : i == at ? -1 : i - 1;
+            arr_renumber(from, n0 + 1);
+            if (cur >= at) ((void (*)(int))(g_flBase + (SETARR_VA - IMG_BASE)))(cur + 1);   // (still on the same one)
+            logmsg("ARR arrangement %d added (remote)", at);
+        } else if (strstr(m, "\"kind\":\"arr.del\"") && at < n0 && n0 > 1) {
+            ((delarr_t)(g_flBase + (DELARR_VA - IMG_BASE)))(at, 1, 0);
+            if (arr_count() != n0 - 1) { logmsg("ARR FL didn't delete the arrangement: re-syncing"); resync("an arrangement FL didn't delete"); return; }
+            for (i = 0; i < n0 - 1; i++) from[i] = i < at ? i : i + 1;
+            arr_renumber(from, n0 - 1);
+            if (cur > at) ((void (*)(int))(g_flBase + (SETARR_VA - IMG_BASE)))(cur - 1);
+            logmsg("ARR arrangement %d deleted (remote)", at);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logmsg("ARR applying %.40s faulted", m); }
+    arr_known_take();
+}
 
 // ---- structure ops that cross ----
 // Two people changing channels or mixer tracks in the same instant each change their own list first and
@@ -6374,7 +6640,7 @@ static void sc_done_add(int k, int n0) {
 static void task_free(QItem *it) {
     switch (it->type) {
     case T_LOAD: case T_ADDCH: DeleteFileA(it->path); free(it->path); break;
-    case T_META: case T_MIXSTRUCT: case T_PATOP: free(it->path); break;
+    case T_META: case T_MIXSTRUCT: case T_PATOP: case T_ARROP: free(it->path); break;
     case T_ORDER: case T_NOTES: case T_CLIPS: free(it->order); break;
     }
 }
@@ -6680,6 +6946,8 @@ static void run_task_inner(const QItem *it) {
     case T_MIXSTRUCT: do_mixstruct(it); free(it->path); break;
     case T_NAMEPROJ: leader_name_project(); break;
     case T_PCOUNT: do_pcount(it); break;
+    case T_ARRSTRUCT: do_arrstruct(); break;
+    case T_ARROP: do_arrop(it); free(it->path); break;
     }
 }
 
@@ -7373,6 +7641,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
         plugfocus_poll(now);
         scan_notes(now);
         scan_clips(now);
+        arr_poll(now);
         scan_meta(now);
         state_digest(now);
         digest_tick(now);
@@ -8012,6 +8281,10 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         on_clips_set(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"meta.set\"")) {
         on_meta_set(m);
+    } else if (strstr(m, "\"t\":\"op\"") && (strstr(m, "\"kind\":\"arr.ins\"") || strstr(m, "\"kind\":\"arr.del\"") || strstr(m, "\"kind\":\"arr.name\""))) {
+        QItem q; memset(&q, 0, sizeof(q));
+        q.type = T_ARROP; q.path = _strdup(m);
+        enqueue(&q);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"pat.op\"")) {
         on_pat_op(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"focus\"")) {
@@ -10889,6 +11162,7 @@ static void net_disconnect(void) {
     net_reset();
     g_hostSavingUntil = 0;
     g_projAskedAt = 0;
+    g_haveSong = 0;                 // (a new connection: its first project is a join)
     g_leaderAliveAt = 0;
     net_status(NET_OFF, "Not connected");
 }

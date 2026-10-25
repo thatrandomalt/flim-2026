@@ -866,6 +866,46 @@ made before a structure change reached them still names channels / tracks by the
   clips, while B's FL and any project load size them to the pattern. No op carries that, and a reload
   doesn't fix it (the safety net stops reloading for it; see below).
 
+### Arrangements
+FL functions (signatures `SETARR`, `INSARR`, `ADDARR`, `DELARR`, `USTRASG` in `fl_addrs.h`):
+- `sub_12FB5F0(index)` SetCurrentArrangement: writes `ARRCUR`, redraws the playlist.
+- `sub_12F9C20(index)` InsertArrangement: grows `ARRS` by one, shifts the later ones up, builds a new
+  arrangement at `index` (ctor `0x12e3230`) with a default name; `index` must be an existing one (<= count-1).
+  It doesn't touch `ARRCUR` (the menu calls SetCurrentArrangement after it).
+- `sub_12F9930(a, copyLinks)` AddArrangement: appends one and returns its index; with `copyLinks` it copies the
+  current arrangement's channel-linked playlist tracks (link type 3), so a replay passes 0 (each FL's current one
+  differs). `sub_12F9F30(index, selectNeighbour, undo)` DeleteArrangement: frees it, shifts the later ones down,
+  and (selectNeighbour) moves `ARRCUR` to `index-1` / 0 if it was the current one; takes `SONGLOCK`.
+- An arrangement's name is a UnicodeString at `+8` (`USTRASG` = Delphi's `_UStrAsg`, `0x4133f0`). The menu
+  handler is around `sub_102A350` (New / Clone: insert or add, then select it).
+
+How flim keeps them in step:
+- **Each person's view is their own.** A project file carries the leader's current arrangement and pattern, so
+  every re-sync moved a member onto them (and the playlist's clip source and its tool buttons with it).
+  `do_projload` remembers the arrangement and pattern by number (`view_save`) and `do_projdone` puts them back
+  (`view_restore`, "SELECT kept this FL's own arrangement n and pattern m"), once this FL has the song
+  (`g_haveSong`: not on the first join, when what it showed was another song).
+- **The list is synced.** `arr_poll` (poll thread, every 250 ms) compares the arrangement objects and their name
+  hashes with what it knew; `do_arrstruct` (main thread) sends one change as `arr.ins` {at, n0, name},
+  `arr.del` {at, n0} or `arr.name` {i, name}; peers replay it with the functions above (`do_arrop`). Everything
+  keyed by arrangement number follows (`arr_renumber`: playlist track meta `arr*512+t`, markers, the clip
+  baseline) and each person's current arrangement is moved so it stays the same arrangement. Several changes in
+  one look, or an `n0` that isn't this FL's count (two people at once): re-sync. ponytail: clips / meta ops
+  already on their way during an insert / delete land on the old numbers (arrangements aren't in the structure
+  counts); meta covers the first `META_ARR_MAX` (8) arrangements.
+- **A new arrangement's content goes too** (a clone, or AddArrangement copying links): `arr_send_content` sends
+  its clips per playlist track, the playlist tracks that aren't FL's default (the most common state among its
+  500) and its markers.
+- **A clip edit right before switching arrangement** was dropped (the switch took a new baseline at once).
+  `scan_clips` now sends the old arrangement's unsent change first (`T_CLIPSNAP` for it), but only while it is
+  the same arrangement object (`g_clipArrObj`): after an add / delete its number is another's.
+- FL renumbers clip ids on add (`+0x20`), so clip records with another FL's ids are safe to add.
+- `live_test` `arrangements` (both FLs make the second arrangement themselves with `ADDARR`): insert / rename /
+  delete by A, add by B, a clone (insert + clips inside one main-thread call), an edit then a switch, and B
+  keeping its own arrangement and pattern across a reload.
+- Clip flags: `+0x12` (u16) `0x2000` is the clip's mute (FL's playlist item flags), `0x8000` its selection
+  (`CLIP_SEL_BIT`, local).
+
 ### An emptied project is not a series of deletes
 A tester's FL (26.1.7.5653) took 134 s to open the leader's project (stuck in plugins); the load was cancelled,
 which leaves FL with one channel (it kept channel 0 of 44) and the template's 18 mixer tracks. `do_struct` only
