@@ -126,7 +126,8 @@ untick **Show cursors** in flim's window.
    - your **FL Studio 2026 folder** (the one that contains `FL64.exe`, usually
      `C:\Program Files\Image-Line\FL Studio 2026`). It is checked right away.
    - a **name** that the others will see (letters, digits, spaces, `- _ .`, up to 24 characters).
-3. flim's window opens. Either:
+3. flim's window opens. (It can be resized: made smaller than its layout, e.g. by a tiling window manager
+   under Wine, it gets scrollbars, and the mouse wheel scrolls it.) Either:
    - **Join a session:** enter the address and password you got from whoever hosts and click **Join**.
      FL opens and joins by itself.
    - **Host a session on this PC:** pick a port (8080 is fine) and a password and click **Start hosting**.

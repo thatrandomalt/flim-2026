@@ -1172,6 +1172,56 @@ static INT_PTR theme_color(HWND dlg, UINT m, HDC dc, HWND c) {
     return 0;
 }
 
+// ---- a window smaller than its layout (a tiling window manager, Wine's wider font, a small screen) ----
+// The controls keep their places and scroll: scrollbars appear only while the window is smaller than the layout.
+static SIZE g_layout;                    // the client size the dialog was made with
+static int g_scrollX, g_scrollY;
+static void scroll_to(HWND dlg, int bar, int pos) {
+    int *cur = bar == SB_HORZ ? &g_scrollX : &g_scrollY, d;
+    SCROLLINFO si;
+    si.cbSize = sizeof(si); si.fMask = SIF_POS; si.nPos = pos;
+    SetScrollInfo(dlg, bar, &si, TRUE);                      // (clamps it to the range)
+    pos = GetScrollPos(dlg, bar);
+    if ((d = *cur - pos) == 0) return;
+    *cur = pos;
+    ScrollWindowEx(dlg, bar == SB_HORZ ? d : 0, bar == SB_VERT ? d : 0, NULL, NULL, NULL, NULL, SW_SCROLLCHILDREN);
+    RedrawWindow(dlg, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);   // (the section frames overlap their controls)
+}
+static void scroll_fit(HWND dlg) {
+    static int busy;                                         // (a bar appearing resizes the window: WM_SIZE again)
+    int i;
+    if (busy || !g_layout.cx) return;
+    busy = 1;
+    for (i = 0; i < 3; i++) {                                // a bar appearing takes room from the other direction
+        RECT r, r2;
+        SCROLLINFO si;
+        GetClientRect(dlg, &r);
+        si.cbSize = sizeof(si); si.fMask = SIF_RANGE | SIF_PAGE; si.nMin = 0;
+        si.nMax = g_layout.cx - 1; si.nPage = (UINT)r.right; SetScrollInfo(dlg, SB_HORZ, &si, TRUE);
+        si.nMax = g_layout.cy - 1; si.nPage = (UINT)r.bottom; SetScrollInfo(dlg, SB_VERT, &si, TRUE);
+        GetClientRect(dlg, &r2);
+        if (EqualRect(&r, &r2)) break;
+    }
+    scroll_to(dlg, SB_HORZ, GetScrollPos(dlg, SB_HORZ));
+    scroll_to(dlg, SB_VERT, GetScrollPos(dlg, SB_VERT));
+    busy = 0;
+}
+static void scroll_init(HWND dlg) {
+    RECT r;
+    MONITORINFO mi;
+    GetClientRect(dlg, &r);
+    g_layout.cx = r.right; g_layout.cy = r.bottom;
+    SetWindowTheme(dlg, L"DarkMode_Explorer", NULL);         // dark scrollbars
+    GetWindowRect(dlg, &r);
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(MonitorFromWindow(dlg, MONITOR_DEFAULTTONEAREST), &mi) &&
+        (r.right - r.left > mi.rcWork.right - mi.rcWork.left || r.bottom - r.top > mi.rcWork.bottom - mi.rcWork.top)) {   // bigger than the screen
+        int w = min(r.right - r.left, mi.rcWork.right - mi.rcWork.left), h = min(r.bottom - r.top, mi.rcWork.bottom - mi.rcWork.top);
+        SetWindowPos(dlg, NULL, mi.rcWork.left, mi.rcWork.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    scroll_fit(dlg);
+}
+
 static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_DRAWITEM:
@@ -1183,6 +1233,36 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         LRESULT r = theme_check((const NMCUSTOMDRAW *)lp);
         if (r == -1) break;
         SetWindowLongPtrW(dlg, DWLP_MSGRESULT, r);
+        return TRUE; }
+    case WM_GETMINMAXINFO:
+        ((MINMAXINFO *)lp)->ptMinTrackSize.x = 320;
+        ((MINMAXINFO *)lp)->ptMinTrackSize.y = 240;
+        return TRUE;
+    case WM_SIZE:
+        if (wp != SIZE_MINIMIZED) scroll_fit(dlg);
+        break;
+    case WM_HSCROLL: case WM_VSCROLL: {  // the window's own bars (the log's are its own)
+        int bar = m == WM_HSCROLL ? SB_HORZ : SB_VERT;
+        SCROLLINFO si;
+        if (lp) break;
+        si.cbSize = sizeof(si); si.fMask = SIF_ALL;
+        GetScrollInfo(dlg, bar, &si);
+        switch (LOWORD(wp)) {
+        case SB_LINEUP: si.nPos -= 24; break;
+        case SB_LINEDOWN: si.nPos += 24; break;
+        case SB_PAGEUP: si.nPos -= (int)si.nPage; break;
+        case SB_PAGEDOWN: si.nPos += (int)si.nPage; break;
+        case SB_THUMBTRACK: case SB_THUMBPOSITION: si.nPos = si.nTrackPos; break;
+        case SB_TOP: si.nPos = 0; break;
+        case SB_BOTTOM: si.nPos = si.nMax; break;
+        }
+        scroll_to(dlg, bar, si.nPos);
+        return TRUE; }
+    case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL: {   // (the log scrolls itself; a wheel elsewhere comes here) Shift+wheel: sideways
+        int d = GET_WHEEL_DELTA_WPARAM(wp) * 48 / WHEEL_DELTA;
+        if (m == WM_MOUSEHWHEEL) scroll_to(dlg, SB_HORZ, g_scrollX + d);
+        else if (GET_KEYSTATE_WPARAM(wp) & MK_SHIFT) scroll_to(dlg, SB_HORZ, g_scrollX - d);
+        else scroll_to(dlg, SB_VERT, g_scrollY - d);
         return TRUE; }
     case WM_INITDIALOG: {
         wchar_t v[512];
@@ -1221,7 +1301,13 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         CheckDlgButton(dlg, IDC_M_AUTOATTACH, flimcfg_auto_attach() ? BST_CHECKED : BST_UNCHECKED);
         if (flimcfg_auto_attach()) adopt_running_fl(dlg);
         else main_log(dlg, L"Attach to FL automatically is off: Join asks which FL Studio to use.");
+        {   // Wine (Linux, macOS): said in the log, so an exported log shows it
+            typedef const char *(CDECL *wine_ver_fn)(void);
+            wine_ver_fn wv = (wine_ver_fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version");
+            if (wv) { swprintf_s(v, 512, L"Running under Wine %hs. If this window is cut off, scroll it or make it bigger.", wv()); main_log(dlg, v); }
+        }
         session_buttons(dlg);
+        scroll_init(dlg);
         return TRUE;
     }
     case WM_COPYDATA: {                  // from our FL's engine: its status or a log line
