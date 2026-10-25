@@ -53,7 +53,15 @@ function fail(ws: WebSocket, code: string, msg: string): void {
   send(ws, { t: "error", code, msg });
 }
 
-wss.on("connection", (ws) => {
+// The address a connection comes from (IP bans). Behind fly.io's proxy, the one it reports (FLY_APP_NAME is set
+// there); elsewhere the header could be made up, so the socket's own.
+function clientIp(req: http.IncomingMessage): string {
+  const fly = process.env.FLY_APP_NAME ? req.headers["fly-client-ip"] : undefined;
+  return String((Array.isArray(fly) ? fly[0] : fly) ?? req.socket.remoteAddress ?? "").replace(/^::ffff:/, "");
+}
+
+wss.on("connection", (ws, req) => {
+  const ip = clientIp(req);
   conns.set(ws, {});
   (ws as any).isAlive = true;
   ws.on("pong", () => ((ws as any).isAlive = true));
@@ -77,7 +85,7 @@ wss.on("connection", (ws) => {
         return;
       }
       if (msg.t === "host") {
-        const client: Client = { ws, user: sanitizeUser(msg.user), role: "leader", alive: true };
+        const client: Client = { ws, user: sanitizeUser(msg.user), role: "leader", alive: true, ip };
         const code = makeCode();
         const session = new Session(code, client, () => sessions.delete(code));
         sessions.set(code, session);
@@ -88,7 +96,8 @@ wss.on("connection", (ws) => {
       if (msg.t === "join") {
         const session = sessions.get(msg.session?.toUpperCase?.() ?? "");
         if (!session) return fail(ws, "no_session", "Session not found.");
-        const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true };
+        const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true, ip };
+        if (session.isBanned(client.user, ip)) return fail(ws, "kicked", "You were removed from this session. The host can let you back in");
         conn.client = client;
         conn.session = session;
         session.add(client);
@@ -100,14 +109,20 @@ wss.on("connection", (ws) => {
         const code = (msg.room || "FLIM").toUpperCase().slice(0, 32);
         let session = sessions.get(code);
         if (!session) {
-          const client: Client = { ws, user: sanitizeUser(msg.user), role: "leader", alive: true };
+          const client: Client = { ws, user: sanitizeUser(msg.user), role: "leader", alive: true, ip };
           session = new Session(code, client, () => sessions.delete(code));
           sessions.set(code, session);
           conn.client = client;
           conn.session = session;
           console.log(`[room ${code}] created by ${client.user.name} (leader)`);
         } else {
-          const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true };
+          const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true, ip };
+          if (session.isBanned(client.user, ip)) {
+            console.log(`[room ${code}] ${client.user.name} was removed: not let in`);
+            fail(ws, "kicked", "You were removed from this session. The host can let you back in");
+            setTimeout(() => ws.close(4003, "kicked"), 200);
+            return;
+          }
           conn.client = client;
           conn.session = session;
           session.add(client);
@@ -120,6 +135,7 @@ wss.on("connection", (ws) => {
 
     // ---- in-session messages ----
     const { client, session } = conn as { client: Client; session: Session };
+    if (!session.has(client)) return; // removed (kick): nothing of theirs counts any more
     switch (msg.t) {
       case "snapshot":
         session.setSnapshot(client, msg.flp);
@@ -139,6 +155,11 @@ wss.on("connection", (ws) => {
       case "lock_release":
         session.release(client, msg.key);
         break;
+      case "admin": {
+        const why = session.admin(client, msg.action, String(msg.id ?? ""), msg.on === true);
+        if (why) fail(ws, session.leaderId === client.user.id ? "admin" : "not_allowed", why);
+        break;
+      }
       case "bye":
         ws.close(1000, "bye");
         break;

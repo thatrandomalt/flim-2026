@@ -1245,3 +1245,34 @@ the test copy has it removed.
   starts opening a project, and members allow it `LEADER_LOAD_MS` (5 min).
 - **Plugin parameter counts.** FL's VST wrapper reports 4240 params for every VST. See section 5;
   this project now watches 27,586 params instead of filling the 65,536-slot table.
+
+## 10. Host controls (give host, remove, IP ban, sync-only)
+
+Nothing of FL in this: the servers (`client/launcher/host.c`, `server/src/session.ts`) do it, the engine shows it
+and keeps a sync-only FL's edits to itself. Protocol: `server/README.md`, "Host controls".
+
+- **Who may.** The built-in host's own window (`host_admin`, people list from `host_people`), and the session
+  leader through its engine (`GUI_ADMIN` -> `{"t":"admin",...}`) when the server allows it: `presence`
+  carries `leaderControls` (host.c: flim.ini `host_leaderctl`, only when the hosting PC doesn't join; the
+  Node server: always). The engine forwards each `presence` / `welcome` to flim's window as `GUI_PEOPLE`
+  (`on_peers`) and the window decides what to enable; the server checks again.
+- **Give host** swaps the roles and sends `presence`, the same message as when a leader leaves. The engine's
+  presence handler already made `g_isLeader` follow the roles (the leave case); it now also notices a leader
+  that is still there but lost the role (`in_peers`: in `peers`, not in `banned`) and tells both sides. No
+  reload: the members' FLs have the leader's project (the safety net keeps it that way), so the new leader
+  just carries on as the authority (alive signals, digests, answering `state.req`). Its structure counts
+  (`g_sc`) and project number are the same as everyone's. Checked by `live_test give_host`: no
+  `PROJECT received` in either FL.
+- **Sync-only.** The server drops all of the person's ops but `state.req` / `hello` / `shared.need`, and
+  ignores their `lock_acquire`. The engine (`g_syncOnly`, from its own `"sync":true` in `presence`) keeps
+  edits and lock messages in `sync_only_keeps` (front of `ws_send` / `ws_send_samples`) and counts the kept
+  edits (`g_syncKept`). Its own re-syncs are held back (`resync`: a member's `state.req` makes the leader send
+  the project to EVERYONE, so a sync-only FL that drifted on purpose would make everybody reload every few
+  minutes); only one the user asks for (`GUI_RESYNC`, `g_userResync`) goes out. Switched back with kept
+  edits, it re-syncs once. Their locks are dropped on both sides (`locks_forget`).
+- **Remove / IP ban.** The server sends `error` `kicked` and closes. The engine takes the message for the
+  status and the popup (`g_kicked`: "you can't join again unless the host lets you back in"); there is no
+  auto-reconnect to stop. Bans match the id, or the name (case-insensitive: a restarted FL has a new
+  `fl-<pid>-<rand>` id), and for IP bans also the address (host.c: `getpeername`, `::ffff:` stripped;
+  Node: the socket's, or `Fly-Client-IP` on fly.io). Kicks belong to the session, IP bans to the server.
+  Addresses never go out in `presence`. On one PC every test FL has the same address: unban promptly.

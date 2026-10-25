@@ -213,7 +213,9 @@ static char  *g_flBase = NULL;
 static int    g_chanPlugN[MAX_CH];
 static int    g_fxN[MAX_MIX][MAX_FX_SLOTS];
 static volatile LONG g_isLeader = 0;
-static volatile LONG g_patDepth = 0;   // a pattern op is running (main thread; its dialogs pump messages): scans wait
+static volatile LONG g_syncOnly = 0;   // the host made us sync-only: we get everything, send nothing (host controls)
+static volatile LONG g_syncKept = 0;   //   edits of ours it kept here meanwhile (sync_only_keeps)
+static volatile LONG g_patDepth = 0;  // a pattern op is running (main thread; its dialogs pump messages): scans wait
 static rec_t  g_rec = NULL;
 static HINTERNET g_ws = NULL;    // the open WebSocket (NULL = not connected); guarded by g_sendLock
 static CRITICAL_SECTION g_sendLock, g_slotLock, g_qLock;
@@ -3859,11 +3861,15 @@ static void wguard_pass(void) {
 // hands its window over in FLIM_GUI when it starts FL, or introduces itself later (GUI_HELLO).
 // WM_COPYDATA, UTF-8 text:
 //   engine -> window (wParam = our task window): GUI_STATUS "<state>\t<text>", GUI_LOG "<line>",
-//                                                 GUI_ALERT "<text>" (a popup: the session leader left...)
+//                                                 GUI_ALERT "<text>" (a popup: the session leader left...),
+//                                                 GUI_PEOPLE "<leaderControls 0/1>\t<my id>\n" then a line per person,
+//                                                   "P\t<id>\t<name>\t<leader 0/1>\t<sync-only 0/1>\n" or, removed
+//                                                   from the session, "B\t<id>\t<name>\t<IP banned 0/1>\n" (on_peers)
 //   window -> engine (to our task window):       GUI_CONNECT "<url>\n<password>\n<name>",
 //                                                 GUI_DISCONNECT, GUI_HELLO,
 //                                                 GUI_SETTINGS (flim.ini changed: plugin_lock_s),
-//                                                 GUI_RESYNC ("Resync from host": the leader's project now)
+//                                                 GUI_RESYNC ("Resync from host": the leader's project now),
+//                                                 GUI_ADMIN "<action>\t<id>\t<on 0/1>" (host controls, as the leader)
 // Ours go out from a thread of our own with a timeout, so a busy or closed window never holds FL up.
 // (GUI_* kinds and NET_* states: common/flim_config.h)
 static volatile LONG g_netState = NET_OFF;
@@ -3880,6 +3886,8 @@ static char     g_netLine[320] = "0\tNot connected";   // the last status: for a
 
 static void net_connect(const char *url, const char *pw);
 static void net_disconnect(void);
+static void on_peers(const char *m);
+static char g_peersJson[4096];
 static void focus_summary(char *out, int cap, const char *sep);
 static void json_esc(const char *in, char *out, int cap);
 static void fl_hint(const char *msg);
@@ -3973,6 +3981,7 @@ static void net_status(int state, const char *fmt, ...) {
 
 static char g_netShown[300];       // the server as shown in the status ("host[:port]")
 static char g_netErr[160];         // why the server ended the current connection, if it said so
+static volatile LONG g_kicked;     // ...because the host removed us (host controls)
 
 // welcome / presence: "Connected to <server> · leader · 3 people"
 static void net_show_connected(const char *m) {
@@ -3981,7 +3990,7 @@ static void net_show_connected(const char *m) {
     while (p && (p = strstr(p + 1, "\"role\":\"")) != NULL) n++;
     char where[600];
     focus_summary(where, sizeof(where), " \xC2\xB7 ");
-    net_status(NET_ON, "Connected to %s \xC2\xB7 %s \xC2\xB7 %d %s%s%s", g_netShown, g_isLeader ? "leader" : "member",
+    net_status(NET_ON, "Connected to %s \xC2\xB7 %s \xC2\xB7 %d %s%s%s", g_netShown, g_isLeader ? "leader" : g_syncOnly ? "sync-only (your edits stay here)" : "member",
                n, n == 1 ? "person" : "people", where[0] ? " \xC2\xB7 " : "", where);
 }
 
@@ -4006,7 +4015,7 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
     t[n] = 0;
     if (from && IsWindow(from)) g_gui = from;
     switch ((int)cd->dwData) {
-    case GUI_HELLO: gui_status_again(); break;
+    case GUI_HELLO: gui_status_again(); if (g_peersJson[0]) on_peers(g_peersJson); break;
     case GUI_CONNECT:
         pw = strchr(t, '\n');
         if (pw) *pw++ = 0;
@@ -4032,6 +4041,15 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
         if (g_isLeader && g_netState == NET_ON) leader_name_project();   // a song name typed in mid-session
         break;
     case GUI_RESYNC: resync_asked(); break;
+    case GUI_ADMIN: {                  // a host control: "<action>\t<id>\t<on 0/1>" (the server decides if we may)
+        char *id = strchr(t, '\t'), *on = id ? strchr(id + 1, '\t') : NULL, m[400], ea[40], ei[160];
+        if (!on) break;
+        *id++ = 0; *on++ = 0;
+        json_esc(t, ea, sizeof(ea)); json_esc(id, ei, sizeof(ei));
+        sprintf_s(m, sizeof(m), "{\"t\":\"admin\",\"action\":\"%s\",\"id\":\"%s\",\"on\":%s}", ea, ei, *on == '1' ? "true" : "false");
+        logmsg("NET host control: %s %s%s", t, id, strcmp(t, "sync_only") ? "" : *on == '1' ? " on" : " off");
+        if (g_netState == NET_ON) ws_send(m);
+        break; }
     }
     SecureZeroMemory(t, sizeof(t));
 }
@@ -4446,8 +4464,13 @@ static void do_projload(const QItem *it) {
 // first (on_project_load), which covers it.
 static volatile LONG g_resyncPending = 0;
 static volatile DWORD g_resyncAt = 0;   // (declared with g_projRemote)
+static volatile LONG g_userResync = 0;  // a re-sync the user asked for: sync-only (host controls) doesn't hold it back
 static void resync(const char *why) {
     DWORD now = GetTickCount();
+    if (g_syncOnly && !g_userResync) {      // its own edits stay here: a reload would make everyone reload
+        logmsg("SYNC out of step with the others (%s): sync-only, so not reloading (\"Resync from host\" does)", why);
+        return;
+    }
     if ((g_resyncAt && now - g_resyncAt < RESYNC_MS) || (g_isLeader && g_projBusy)) {
         if (!InterlockedExchange(&g_resyncPending, 1)) logmsg("SYNC out of step with the others (%s): re-syncing when the last re-sync's turn is over", why);
         return;
@@ -4463,7 +4486,12 @@ static void resync(const char *why) {
 static void resync_asked(void) {
     if (g_netState != NET_ON) logmsg("SYNC resync asked for, but not connected");
     else if (member_reloading() || (g_isLeader && g_projBusy)) logmsg("SYNC resync asked for: one is already under way");
-    else { g_resyncAt = 0; resync("asked for in the flim window"); }
+    else {
+        g_resyncAt = 0;
+        InterlockedExchange(&g_userResync, 1);
+        resync("asked for in the flim window");
+        InterlockedExchange(&g_userResync, 0);
+    }
 }
 // Poll thread.
 static void resync_tick(DWORD now) {
@@ -8211,6 +8239,65 @@ static void on_hello(const char *m) {
     gui_push(GUI_ALERT, text);
 }
 
+// ---- host controls: sync-only, the people list (give host / kick: the presence / error handlers below) ----
+// The host (or the session leader, if the host allows it) can make someone the leader, remove them, or make them
+// sync-only. The server enforces it all; this side shows it, keeps a sync-only FL's edits here (sync_only_keeps),
+// and gives the flim window the people list (GUI_PEOPLE) its host controls work on (GUI_ADMIN).
+static void locks_forget(void);
+static int in_peers(const char *m, const char *id) {       // id is among the message's peers (not its removed people)
+    char pat[96];
+    const char *p = strstr(m, "\"peers\":["), *b = strstr(m, "\"banned\":["), *q;
+    sprintf_s(pat, sizeof(pat), "{\"id\":\"%s\"", id);
+    return p && (q = strstr(p, pat)) != NULL && (!b || q < b);
+}
+// welcome / presence: are we sync-only, and who is in the session (for the flim window).
+static void on_peers(const char *m) {
+    char me[96], id[72], name[72];
+    const char *p = strstr(m, "\"peers\":["), *b = strstr(m, "\"banned\":["), *q, *r;
+    int so = 0, o, cap = 16384, ctl = strstr(m, "\"leaderControls\":true") != NULL;
+    char *g;
+    sprintf_s(me, sizeof(me), "{\"id\":\"%s\"", g_myId);
+    if (p && (q = strstr(p, me)) != NULL && (!b || q < b) && (r = strstr(q, "\"role\":\"")) != NULL && (r = strchr(r + 8, '"')) != NULL)
+        so = strncmp(r + 1, ",\"sync\":true", 12) == 0;
+    if (so && !g_syncOnly) {
+        InterlockedExchange(&g_syncKept, 0);
+        InterlockedExchange(&g_syncOnly, 1);
+        locks_forget();                                    // (the server dropped ours)
+        logmsg("SYNC the host made this FL sync-only: everything from the session still comes in, but nothing done here goes out");
+        gui_push(GUI_ALERT, "The host made you sync-only.\n\nYou still get everything the others do, but nothing you do in FL "
+                            "reaches them until the host switches you back. Changes you make meanwhile stay in your FL only.");
+    } else if (!so && g_syncOnly) {
+        InterlockedExchange(&g_syncOnly, 0);
+        logmsg("SYNC the host switched this FL back from sync-only: your edits reach everyone again");
+        if (g_syncKept) {                                  // ours differ from the others': the leader's project again
+            InterlockedExchange(&g_userResync, 1); g_resyncAt = 0;
+            resync("edits made while sync-only stayed in this FL");
+            InterlockedExchange(&g_userResync, 0);
+        }
+    }
+    g = (char *)malloc(cap);
+    o = sprintf_s(g, cap, "%d\t%s\n", ctl, g_myId);
+    for (q = p; q && (q = strstr(q, "{\"id\":\"")) != NULL && (!b || q < b) && o < cap - 300; q++) {   // P id name leader sync
+        int lead = 0, sy = 0;
+        json_str(q, "{\"id\":\"", id, sizeof(id));
+        json_str(q, "\"name\":\"", name, sizeof(name));
+        if ((r = strstr(q, "\"role\":\"")) != NULL) {
+            lead = strncmp(r + 8, "leader", 6) == 0;
+            if ((r = strchr(r + 8, '"')) != NULL) sy = strncmp(r + 1, ",\"sync\":true", 12) == 0;
+        }
+        o += sprintf_s(g + o, cap - o, "P\t%s\t%s\t%d\t%d\n", id, name, lead, sy);
+    }
+    for (q = b; q && (q = strstr(q, "{\"id\":\"")) != NULL && o < cap - 300; q++) {     // B id name ipban: removed
+        const char *e = strchr(q, '}');
+        json_str(q, "{\"id\":\"", id, sizeof(id));
+        json_str(q, "\"name\":\"", name, sizeof(name));
+        r = strstr(q, "\"ip\":true");
+        o += sprintf_s(g + o, cap - o, "B\t%s\t%s\t%d\n", id, name, r && e && r < e);
+    }
+    gui_push(GUI_PEOPLE, g);
+    free(g);
+}
+
 static void handle_msg_body(const char *m);
 static void sh_inbox(const char *m);
 static void sh_joined(void);
@@ -8326,6 +8413,7 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         const char *r = strstr(m, "\"role\":\"");
         g_isLeader = r && strncmp(r + 8, "leader", 6) == 0;
         if (!g_isLeader) { int k; for (k = 0; k < SC_N; k++) InterlockedExchange(&g_sc[k], -1); }   // until the leader's project says
+        on_peers(m);
         net_show_connected(m);
         if (!g_isLeader) ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");
         else enqueue_unit(T_NAMEPROJ, 0, 0, 0, 0, NULL);  // an untitled project gets the song name, if one is set
@@ -8358,7 +8446,7 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
     } else if (strstr(m, "\"t\":\"presence\"")) {
         // someone came or went; if the leader left, the server made the longest-connected member leader
         char me[96];
-        const char *p = strstr(m, "\"peers\":["), *r;
+        const char *p = strstr(m, "\"peers\":["), *r, *q;
         sprintf_s(me, sizeof(me), "{\"id\":\"%s\"", g_myId);
         int lead = p && (p = strstr(p, me)) != NULL && (r = strstr(p, "\"role\":\"")) != NULL && strncmp(r + 8, "leader", 6) == 0;
         char oldLeader[64] = "", oldName[64] = "", newName[64] = "", a[400];
@@ -8376,9 +8464,32 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         strncpy_s(g_peersJson, sizeof(g_peersJson), m, _TRUNCATE);
         InterlockedExchange(&g_focusResend, 1);           // a newcomer: tell them where we are
         logmsg("server: %.300s", m);
+        if (oldLeader[0] && in_peers(m, oldLeader) && (q = strstr(m, "\"role\":\"leader\"")) != NULL) {
+            // the leader is still here: did the host give the session to someone else? (no reload: the new leader's
+            // FL has the same project; it just holds it from now on)
+            char nid[64];
+            const char *id = q;
+            int i;
+            while (id > m && strncmp(id, "{\"id\":\"", 7) != 0) id--;
+            for (i = 0; id[7 + i] && id[7 + i] != '"' && i < 63; i++) nid[i] = id[7 + i];
+            nid[i] = 0;
+            if (strcmp(nid, oldLeader) != 0) {
+                peer_name(nid, newName, sizeof(newName));
+                if (lead) strcpy_s(newName, sizeof(newName), "you");
+                if (strcmp(oldLeader, g_myId) == 0) strcpy_s(oldName, sizeof(oldName), "you");
+                logmsg("PROJECT the host made %s the session leader (instead of %s)", newName, oldName);
+                if (lead) gui_push(GUI_ALERT, "The host made you the session leader.\n\nYour FL holds the project now, and people "
+                                              "who join get it from you. Nobody had to reload.");
+                else if (strcmp(oldLeader, g_myId) == 0) {
+                    sprintf_s(a, sizeof(a), "The host made %s the session leader.\n\nYour FL keeps going as a member: nothing to reload.", newName);
+                    gui_push(GUI_ALERT, a);
+                }
+                if (g_leaderAliveAt) g_leaderAliveAt = GetTickCount() | 1;   // the new leader gets its own 30 s
+                InterlockedExchange(&g_leaderStuck, 0);
+            }
+        }
         if (oldLeader[0] && strcmp(oldLeader, g_myId) != 0) {
-            sprintf_s(me, sizeof(me), "{\"id\":\"%s\"", oldLeader);
-            if (!strstr(m, me)) {                         // the leader left; the server picked the next one
+            if (!in_peers(m, oldLeader)) {                // the leader left; the server picked the next one
                 const char *q = strstr(m, "\"role\":\"leader\""), *id = q;
                 while (id && id > m && strncmp(id, "{\"id\":\"", 7) != 0) id--;
                 if (lead) strcpy_s(newName, sizeof(newName), "you");
@@ -8400,10 +8511,20 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
             }
         }
         g_isLeader = lead;
+        on_peers(m);
         net_show_connected(m);
     } else if (strstr(m, "\"t\":\"error\"")) {
         logmsg("server: %.300s", m);
         if (strstr(m, "\"code\":\"bad_password\"")) strcpy_s(g_netErr, sizeof(g_netErr), "Wrong password");
+        if (strstr(m, "\"code\":\"kicked\"")) {             // removed by the host: the server hangs up next
+            json_str(m, "\"msg\":\"", g_netErr, sizeof(g_netErr));
+            InterlockedExchange(&g_kicked, 1);
+            logmsg("PROJECT %s", g_netErr);
+        } else if (strstr(m, "\"code\":\"admin\"") || strstr(m, "\"code\":\"not_allowed\"")) {   // a host control of ours refused
+            char why[200];
+            json_str(m, "\"msg\":\"", why, sizeof(why));
+            gui_push(GUI_ALERT, why);
+        }
     }
 }
 
@@ -9688,9 +9809,24 @@ static char *sc_stamp(const char *msg) {
     return out;
 }
 
+// Sync-only (host controls): what we may still send is asking for things; edits and locks stay here (the server
+// drops them too). An edit kept back means this FL differs from the others: switched back, it reloads.
+static int sync_only_keeps(const char *msg) {
+    static const char OP[] = "{\"t\":\"op\",\"op\":{\"kind\":\"";
+    const char *k = msg + sizeof(OP) - 1;
+    if (!g_syncOnly) return 0;
+    if (strncmp(msg, "{\"t\":\"lock_", 10) == 0) return 1;
+    if (strncmp(msg, OP, sizeof(OP) - 1) != 0) return 0;
+    if (!strncmp(k, "hello\"", 6) || !strncmp(k, "shared.need\"", 12)) return 0;
+    if (!strncmp(k, "state.req\"", 10)) return !g_userResync;   // only the user's (every member reloads with it)
+    if (op_changes_song(msg) && InterlockedIncrement(&g_syncKept) == 1) logmsg("SYNC sync-only: this edit stays in this FL (%.80s)", msg);
+    return 1;
+}
+
 static void ws_send(const char *msg) {
     static const char ALIVE[] = "{\"t\":\"op\",\"op\":{\"kind\":\"alive\"", CUR[] = "{\"t\":\"op\",\"op\":{\"kind\":\"cur\"";
     char *st;
+    if (sync_only_keeps(msg)) return;
     if (strncmp(msg, ALIVE, sizeof(ALIVE) - 1) == 0 || strncmp(msg, CUR, sizeof(CUR) - 1) == 0) { ws_send_now(msg); return; }
     if (member_reloading() && op_changes_song(msg)) {
         // the leader's project is on its way: an edit sent now reached the leader after its snapshot for us
@@ -9713,7 +9849,7 @@ static void ws_send(const char *msg) {
 static void ws_send_samples(char *msg, const unsigned char *blob, size_t n) {
     unsigned char *copy;
     char *st;
-    if (!g_ws) { free(msg); return; }
+    if (!g_ws || sync_only_keeps(msg)) { free(msg); return; }
     if (member_reloading()) { logmsg("SYNC an edit not sent: this FL is loading the leader's project (%.80s)", msg); free(msg); return; }   // (ws_send)
     if ((st = sc_stamp(msg)) != NULL) { free(msg); msg = st; }
     log_op("out", msg);
@@ -11038,18 +11174,25 @@ static void json_esc(const char *in, char *out, int cap) {
     out[o] = 0;
 }
 
-// Forget every lock: they belong to the connection (the server drops them on disconnect).
-static void net_reset(void) {
-    EnterCriticalSection(&g_netTextLock);
-    g_nfocus = 0;                                         // where the others were: belongs to the session
-    LeaveCriticalSection(&g_netTextLock);
+// Forget every lock: they belong to the connection (the server drops them on disconnect, or when it makes us sync-only).
+static void locks_forget(void) {
     int i;
-    InterlockedExchange(&g_isLeader, 0);
     EnterCriticalSection(&g_slotLock);
     for (i = 0; i < g_nslot; i++) { g_slots[i].lockedByMe = 0; g_slots[i].lockedByPeer = 0; }
     LeaveCriticalSection(&g_slotLock);
     EnterCriticalSection(&g_ulockLock);
     for (i = 0; i < g_nulocks; i++) { g_ulocks[i].mine = g_ulocks[i].granted = g_ulocks[i].peer = 0; g_ulocks[i].owner[0] = 0; }
+    LeaveCriticalSection(&g_ulockLock);
+}
+static void net_reset(void) {
+    EnterCriticalSection(&g_netTextLock);
+    g_nfocus = 0;                                         // where the others were: belongs to the session
+    LeaveCriticalSection(&g_netTextLock);
+    InterlockedExchange(&g_isLeader, 0);
+    InterlockedExchange(&g_syncOnly, 0);                  // (the server says again, if it still holds)
+    gui_push(GUI_PEOPLE, "0\t\n");
+    locks_forget();
+    EnterCriticalSection(&g_ulockLock);
     g_peersJson[0] = 0;
     LeaveCriticalSection(&g_ulockLock);
 }
@@ -11078,6 +11221,7 @@ static DWORD WINAPI netThread(LPVOID p) {
     g_ws = c.ws;
     strcpy_s(g_netShown, sizeof(g_netShown), u.shown);
     g_netErr[0] = 0;
+    InterlockedExchange(&g_kicked, 0);
     LeaveCriticalSection(&g_sendLock);
     samples_connected(&u, r->pw);
     net_status(NET_CONNECTING, "Joining %s...", u.shown);
@@ -11121,7 +11265,9 @@ static DWORD WINAPI netThread(LPVOID p) {
         g_leaderAliveAt = 0;
         if (g_netErr[0]) net_status(NET_ERR, "%s", g_netErr);
         else net_status(NET_ERR, "Connection to %s lost", u.shown);
-        sprintf_s(a, sizeof(a), "You're no longer in the session: %s.\n\nIf the PC hosting it stopped hosting (or went offline), "
+        if (g_kicked) sprintf_s(a, sizeof(a), "%s.\n\nYou can't join this session again unless the host lets you back in "
+                                "(or until it ends). Your FL keeps the project as it is.", g_netErr);
+        else sprintf_s(a, sizeof(a), "You're no longer in the session: %s.\n\nIf the PC hosting it stopped hosting (or went offline), "
                   "the session is over until it hosts again. Your FL keeps the project as it is; Connect joins again.",
                   g_netErr[0] ? g_netErr : "the connection to the server was lost");
         gui_push(GUI_ALERT, a);

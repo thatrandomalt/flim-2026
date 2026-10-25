@@ -1,6 +1,6 @@
 // flim's built-in server (see host.h): a C port of server/src (server.ts, session.ts, blobs.ts) with
-// what the engine uses: join_room, op, lock_acquire / lock_release, bye, the ping liveness check and
-// the sample store (POST /blobs/missing, HEAD / GET / PUT /blob/<sha256>), plus GET /health.
+// what the engine uses: join_room, op, lock_acquire / lock_release, admin (host controls), bye, the ping
+// liveness check and the sample store (POST /blobs/missing, HEAD / GET / PUT /blob/<sha256>), plus GET /health.
 // One thread reads each connection; WebSocket clients also get a writer thread draining their send
 // queue, so a slow connection never holds up the others. Session state is under one lock.
 #define WIN32_LEAN_AND_MEAN
@@ -32,13 +32,14 @@
 
 typedef struct Buf { volatile LONG refs; size_t n; unsigned char d[1]; } Buf;
 typedef struct QNode { Buf *b; struct QNode *next; } QNode;
-typedef struct Session { char code[40], leader[72]; unsigned seq; struct Lock *locks; struct Session *next; } Session;
+typedef struct Session { char code[40], leader[72]; unsigned seq; struct Lock *locks; struct Ban *bans, *syncs; struct Session *next; } Session;
 typedef struct Lock { char key[200], owner[72]; DWORD at; struct Lock *next; } Lock;
+typedef struct Ban { char id[72], name[40], ip[64]; struct Ban *next; } Ban;   // removed (kick / IP ban) until let back in; sync-only
 typedef struct Client {
     SOCKET s;
     Session *sess;
-    char id[72], name[40];
-    int leader;
+    char id[72], name[40], ip[64];                         // ip: the address it connects from (IP bans)
+    int leader, sync;                                      // sync: sync-only (gets everything, sends nothing)
     volatile LONG alive, closed, refs;
     CRITICAL_SECTION ql;
     HANDLE qev;
@@ -58,6 +59,8 @@ static int     g_hasPw;
 static char    g_keyHex[65];                       // sha256 hex of the password: the x-flim-key header
 static wchar_t g_blobDir[MAX_PATH];
 static HWND    g_notify;
+static Ban    *g_ipBans;                            // IP bans: every session on this server (admin_do)
+static volatile LONG g_leaderCtl;                  // the session leader may use the host controls too (host_leader_controls)
 
 // ---------------- log ----------------
 static void hlog(const char *fmt, ...) {
@@ -308,9 +311,27 @@ static void peers_json(Session *s, char *out, int cap) {
         char id[160], nm[100];
         if (c->sess != s || o > cap - 400) continue;
         js_esc(c->id, id, sizeof(id)); js_esc(c->name, nm, sizeof(nm));
-        o += sprintf_s(out + o, cap - o, "%s{\"id\":\"%s\",\"name\":\"%s\",\"role\":\"%s\"}", o > 1 ? "," : "", id, nm, c->leader ? "leader" : "member");
+        o += sprintf_s(out + o, cap - o, "%s{\"id\":\"%s\",\"name\":\"%s\",\"role\":\"%s\"%s}", o > 1 ? "," : "", id, nm, c->leader ? "leader" : "member",
+                       c->sync ? ",\"sync\":true" : "");
     }
     sprintf_s(out + o, cap - o, "]");
+}
+// {"t":"presence","peers":[...],"leaderControls":<bool>,"banned":[{"id","name"[,"ip":true]}...]}: who is in, who leads,
+// who is sync-only, who was removed (or IP banned), and whether the leader may use the host controls.
+static void presence_msg(Session *s, char *out, int cap) {
+    Ban *b;
+    int k;
+    int o = sprintf_s(out, cap, "{\"t\":\"presence\",\"peers\":");
+    peers_json(s, out + o, cap - o - 600);
+    o += (int)strlen(out + o);
+    o += sprintf_s(out + o, cap - o, ",\"leaderControls\":%s,\"banned\":[", g_leaderCtl ? "true" : "false");
+    for (k = 0; k < 2; k++)                                // removals, then IP bans (never the address itself)
+        for (b = k ? g_ipBans : s->bans; b && o < cap - 400; b = b->next) {
+            char id[160], nm[100];
+            js_esc(b->id, id, sizeof(id)); js_esc(b->name, nm, sizeof(nm));
+            o += sprintf_s(out + o, cap - o, "%s{\"id\":\"%s\",\"name\":\"%s\"%s}", out[o - 1] == '[' ? "" : ",", id, nm, k ? ",\"ip\":true" : "");
+        }
+    sprintf_s(out + o, cap - o, "]}");
 }
 static void broadcast(Session *s, const char *msg, Client *except) {
     Client *c;
@@ -356,27 +377,24 @@ static void session_add(Session *s, Client *c) {
     }
     sprintf_s(m + o, sizeof(m) - o, "]}");
     send_str(c, m);
-    sprintf_s(m, sizeof(m), "{\"t\":\"presence\",\"peers\":%s}", peers);
-    broadcast(s, m, c);
+    presence_msg(s, m, sizeof(m));
+    broadcast(s, m, NULL);                                // (the newcomer too: leaderControls, who was removed)
     peers_changed();
 }
 static void session_free(Session *s) {
     Session **pp;
     while (s->locks) { Lock *n = s->locks->next; free(s->locks); s->locks = n; }
+    while (s->bans) { Ban *n = s->bans->next; free(s->bans); s->bans = n; }
+    while (s->syncs) { Ban *n = s->syncs->next; free(s->syncs); s->syncs = n; }
     for (pp = &g_sessions; *pp; pp = &(*pp)->next) if (*pp == s) { *pp = s->next; break; }
     free(s);
 }
 // A client left (caller holds g_lk): its locks go; if it led, the longest-connected member leads now.
-static void session_remove(Client *c) {
-    static char peers[16384];
-    Session *s = c->sess;
-    Client *o, *heir = NULL;
+static void locks_drop(Session *s, const char *owner) {     // (caller holds g_lk)
     Lock **pl;
-    char m[16500];
-    if (!s) return;
-    c->sess = NULL;
+    char m[600];
     for (pl = &s->locks; *pl; ) {
-        if (strcmp((*pl)->owner, c->id) == 0) {
+        if (strcmp((*pl)->owner, owner) == 0) {
             Lock *d = *pl;
             *pl = d->next;
             released_msg(m, sizeof(m), d->key);
@@ -384,20 +402,113 @@ static void session_remove(Client *c) {
             free(d);
         } else pl = &(*pl)->next;
     }
+}
+static void presence_all(Session *s) {
+    static char m[20000];
+    presence_msg(s, m, sizeof(m));                         // the roles in it tell everyone who leads
+    broadcast(s, m, NULL);
+}
+static void session_remove(Client *c) {
+    Session *s = c->sess;
+    Client *o, *heir = NULL;
+    if (!s) return;
+    c->sess = NULL;
+    locks_drop(s, c->id);
     for (o = g_clients; o; o = o->next) if (o->sess == s) heir = o;     // newest first: the last is the oldest
     if (c->leader && heir) {
         c->leader = 0;
         heir->leader = 1;
+        heir->sync = 0;
         strcpy_s(s->leader, sizeof(s->leader), heir->id);
         hlog("%s (leader) left %s: %s leads now", c->name, s->code, heir->name);
     } else hlog("%s left %s", c->name, s->code);
-    if (heir) {
-        peers_json(s, peers, sizeof(peers));                   // the roles in it tell everyone who leads
-        sprintf_s(m, sizeof(m), "{\"t\":\"presence\",\"peers\":%s}", peers);
-        broadcast(s, m, NULL);
-    }
+    if (heir) presence_all(s);
     else session_free(s);
     peers_changed();
+}
+
+// ---------------- host controls ----------------
+// Give host (make someone the session leader: their FL holds the project from now on; nobody reloads), remove
+// someone (kick: they can't join this session again until let back in, or until it ends), ban their IP address
+// (ban_ip: removed, and nobody from that address, id or name joins any session on this server until let back in
+// or the host stops), sync-only (they get everything but nothing of theirs goes to the others; their locks go;
+// it sticks if they reconnect). From this PC's window (host_admin, by = NULL), or from the session leader ("admin"
+// message) when host_leader_controls allows it. Caller holds g_lk. Returns "" when done, else why not.
+static Ban *ban_find(Ban *l, const char *id, const char *name, const char *ip) {
+    for (; l; l = l->next)
+        if (strcmp(l->id, id) == 0 || _stricmp(l->name, name) == 0 || (ip && ip[0] && l->ip[0] && strcmp(l->ip, ip) == 0)) return l;
+    return NULL;
+}
+static void ban_add(Ban **l, const Client *t, int ip) {
+    Ban *b;
+    if (ban_find(*l, t->id, t->name, NULL)) return;
+    b = (Ban *)calloc(1, sizeof(Ban));
+    strcpy_s(b->id, sizeof(b->id), t->id); strcpy_s(b->name, sizeof(b->name), t->name);
+    if (ip) strcpy_s(b->ip, sizeof(b->ip), t->ip);
+    b->next = *l; *l = b;
+}
+static int ban_del(Ban **l, const char *id, char *name, int cap) {   // 1 = it was there
+    for (; *l; l = &(*l)->next)
+        if (strcmp((*l)->id, id) == 0) {
+            Ban *d = *l;
+            *l = d->next;
+            strcpy_s(name, cap, d->name);
+            free(d);
+            return 1;
+        }
+    return 0;
+}
+static int banned(Session *s, const Client *c) {
+    return ban_find(s->bans, c->id, c->name, NULL) || ban_find(g_ipBans, c->id, c->name, c->ip);
+}
+static const char *admin_do(Client *by, const char *action, const char *id, int on) {
+    Client *t = NULL, *c;
+    Session *s = NULL;
+    const char *who = by ? by->name : "The host";
+    char m[400], e[300];
+    if (strcmp(action, "unban") == 0) {                   // lifts a removal and an IP ban
+        char name[40] = "";
+        int got = ban_del(&g_ipBans, id, name, sizeof(name));
+        for (s = by ? by->sess : g_sessions; s; s = by ? NULL : s->next) got |= ban_del(&s->bans, id, name, sizeof(name));
+        if (!got) return "Nobody by that id was removed.";
+        hlog("%s let %s back in", who, name);
+        for (s = g_sessions; s; s = s->next) presence_all(s);
+        peers_changed();
+        return "";
+    }
+    for (c = g_clients; c && !t; c = c->next) if (c->sess && strcmp(c->id, id) == 0 && (!by || c->sess == by->sess)) t = c;
+    if (!t) return "That person isn't in the session (any more).";
+    s = t->sess;
+    if (strcmp(action, "give_host") == 0) {
+        if (t->leader) return "";
+        for (c = g_clients; c; c = c->next) if (c->sess == s) c->leader = 0;
+        t->leader = 1;
+        t->sync = 0;
+        ban_del(&s->syncs, t->id, m, 40);
+        strcpy_s(s->leader, sizeof(s->leader), t->id);
+        hlog("%s made %s the session leader", who, t->name);
+    } else if (strcmp(action, "kick") == 0 || strcmp(action, "ban_ip") == 0) {
+        int ip = action[0] == 'b';
+        if (t == by) return "You can't remove yourself.";
+        if (ip) ban_add(&g_ipBans, t, 1); else ban_add(&s->bans, t, 0);
+        hlog("%s %s %s (%s)", who, ip ? "banned the IP address of" : "removed", t->name, ip ? t->ip : s->code);
+        sprintf_s(e, sizeof(e), ip ? "%s banned you from this server" : "%s removed you from the session", who);
+        js_esc(e, m, 300);
+        sprintf_s(e, sizeof(e), "{\"t\":\"error\",\"code\":\"kicked\",\"msg\":\"%s\"}", m);
+        send_str(t, e);
+        InterlockedExchange(&t->closed, 1); SetEvent(t->qev);   // the writer sends it, then hangs up: session_remove
+    } else if (strcmp(action, "sync_only") == 0) {
+        char nm[40];
+        if (t->leader && on) return "The session leader can't be sync-only: make someone else the leader first.";
+        if (on) ban_add(&s->syncs, t, 0); else ban_del(&s->syncs, t->id, nm, sizeof(nm));   // (kept for a reconnect)
+        if (t->sync == on) return "";
+        t->sync = on;
+        if (on) locks_drop(s, t->id);
+        hlog("%s set %s to %s", who, t->name, on ? "sync-only" : "normal (edits reach everyone again)");
+    } else return "Unknown action.";
+    presence_all(s);
+    peers_changed();
+    return "";
 }
 
 static Lock *lock_find(Session *s, const char *key) {
@@ -412,6 +523,7 @@ static void on_message(Client *c, char *msg, size_t n) {
     (void)n;
     js_str(js_get(msg, "t"), t, sizeof(t));
     EnterCriticalSection(&g_lk);
+    if (c->closed) { LeaveCriticalSection(&g_lk); return; }   // removed (kick): nothing of theirs counts any more
     if (!c->sess) {
         const char *u = js_get(msg, "user");
         char room[80], pw[300], raw[200];
@@ -440,6 +552,14 @@ static void on_message(Client *c, char *msg, size_t n) {
             for (i = 0; room[i]; i++) room[i] = (char)toupper((unsigned char)room[i]);
         }
         for (s = g_sessions; s && strcmp(s->code, room) != 0; s = s->next) {}
+        if (s && banned(s, c)) {
+            hlog("%s was removed from %s: not let in", c->name, room);
+            send_error(c, "kicked", "You were removed from this session. The host can let you back in");
+            c->id[0] = 0;
+            InterlockedExchange(&c->closed, 1); SetEvent(c->qev);
+            LeaveCriticalSection(&g_lk);
+            return;
+        }
         if (!s) {
             s = (Session *)calloc(1, sizeof(Session));
             strcpy_s(s->code, sizeof(s->code), room);
@@ -447,7 +567,10 @@ static void on_message(Client *c, char *msg, size_t n) {
             s->next = g_sessions; g_sessions = s;
             c->leader = 1;
             hlog("%s started session %s (leader)", c->name, room);
-        } else hlog("%s joined %s", c->name, room);
+        } else {
+            c->sync = ban_find(s->syncs, c->id, c->name, NULL) != NULL;   // sync-only sticks across a reconnect
+            hlog("%s joined %s%s", c->name, room, c->sync ? " (sync-only)" : "");
+        }
         session_add(s, c);
         LeaveCriticalSection(&g_lk);
         return;
@@ -460,6 +583,10 @@ static void on_message(Client *c, char *msg, size_t n) {
         if (!end) { LeaveCriticalSection(&g_lk); return; }
         js_str(js_get(op, "kind"), kind, sizeof(kind));
         js_str(js_get(op, "key"), key, sizeof(key));
+        if (c->sync && strcmp(kind, "state.req") != 0 && strcmp(kind, "hello") != 0 && strcmp(kind, "shared.need") != 0) {
+            LeaveCriticalSection(&g_lk);                  // sync-only: only asking for things goes through
+            return;
+        }
         if (strcmp(kind, "cur") != 0 && strcmp(kind, "alive") != 0)   // editing keeps the user's locks fresh
             for (l = s->locks; l; l = l->next) if (strcmp(l->owner, c->id) == 0) l->at = GetTickCount();
         if (key[0] && (l = lock_find(s, key)) != NULL && strcmp(l->owner, c->id) != 0) {
@@ -483,7 +610,8 @@ static void on_message(Client *c, char *msg, size_t n) {
         Lock *l;
         js_str(js_get(msg, "key"), key, sizeof(key));
         l = lock_find(s, key);
-        if (t[5] == 'a') {
+        if (c->sync) {}                                    // sync-only: edits nothing, locks nothing
+        else if (t[5] == 'a') {
             DWORD now = GetTickCount();
             if (l && strcmp(l->owner, c->id) != 0 && now - l->at < LOCK_TTL_MS) {
                 lock_msg(m, sizeof(m), key, 0, l->owner);
@@ -503,6 +631,13 @@ static void on_message(Client *c, char *msg, size_t n) {
             released_msg(m, sizeof(m), key);
             broadcast(s, m, NULL);
         }
+    } else if (strcmp(t, "admin") == 0) {               // the session leader's host controls
+        char action[32], id[200];
+        const char *r, *on = js_get(msg, "on");
+        js_str(js_get(msg, "action"), action, sizeof(action));
+        js_str(js_get(msg, "id"), id, sizeof(id));
+        if (!c->leader || !g_leaderCtl) send_error(c, "not_allowed", "Only the PC hosting this session can do that.");
+        else if ((r = admin_do(c, action, id, on && strncmp(on, "true", 4) == 0))[0]) send_error(c, "admin", r);
     } else if (strcmp(t, "bye") == 0) {
         InterlockedExchange(&c->closed, 1);
         shutdown(c->s, SD_BOTH);
@@ -556,6 +691,15 @@ static void ws_client(SOCKET s, const char *key, const char *pre, size_t pren) {
     }
     c = (Client *)calloc(1, sizeof(Client));
     c->s = s; c->alive = 1; c->refs = 2;
+    {
+        struct sockaddr_storage pa;
+        int pl = sizeof(pa);
+        if (getpeername(s, (struct sockaddr *)&pa, &pl) == 0) {
+            if (pa.ss_family == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&pa)->sin6_addr, c->ip, sizeof(c->ip));
+            else inet_ntop(AF_INET, &((struct sockaddr_in *)&pa)->sin_addr, c->ip, sizeof(c->ip));
+            if (_strnicmp(c->ip, "::ffff:", 7) == 0) memmove(c->ip, c->ip + 7, strlen(c->ip + 7) + 1);   // IPv4 on the dual-stack socket
+        }
+    }
     InitializeCriticalSection(&c->ql);
     c->qev = CreateEventW(NULL, FALSE, FALSE, NULL);
     EnterCriticalSection(&g_lk);
@@ -940,6 +1084,7 @@ void host_stop(void) {
     g_ls = INVALID_SOCKET;
     EnterCriticalSection(&g_lk);
     for (c = g_clients; c; c = c->next) shutdown(c->s, SD_BOTH);
+    while (g_ipBans) { Ban *n = g_ipBans->next; free(g_ipBans); g_ipBans = n; }   // (they last as long as the server)
     LeaveCriticalSection(&g_lk);
     hlog("stopped hosting");
     peers_changed();
@@ -1003,21 +1148,51 @@ int host_upnp(int port, int add, wchar_t *ext, int extcap) {
     return ok;
 }
 
-int host_peers(wchar_t *out, int cap) {
+int host_people(HostPerson *out, int max) {
     Session *s;
     Client *c;
-    int o = 0, n = 0;
-    out[0] = 0;
+    Ban *b;
+    int n = 0;
     if (!g_lkInit) return 0;
     EnterCriticalSection(&g_lk);
-    for (s = g_sessions; s; s = s->next)
+    for (s = g_sessions; s; s = s->next) {
         for (c = g_clients; c; c = c->next) {
-            wchar_t nm[48];
-            if (c->sess != s || o > cap - 80) continue;
-            MultiByteToWideChar(CP_UTF8, 0, c->name, -1, nm, 48);
-            o += swprintf_s(out + o, cap - o, L"%s%s%s", n ? L", " : L"", nm, c->leader ? L" (leader)" : L"");
+            if (c->sess != s || c->closed || n >= max) continue;
+            strcpy_s(out[n].id, sizeof(out[n].id), c->id); strcpy_s(out[n].name, sizeof(out[n].name), c->name);
+            out[n].leader = c->leader; out[n].sync = c->sync; out[n].banned = 0;
             n++;
         }
+        for (b = s->bans; b && n < max; b = b->next, n++) {
+            strcpy_s(out[n].id, sizeof(out[n].id), b->id); strcpy_s(out[n].name, sizeof(out[n].name), b->name);
+            out[n].leader = out[n].sync = 0; out[n].banned = 1;
+        }
+    }
+    for (b = g_ipBans; b && n < max; b = b->next, n++) {
+        strcpy_s(out[n].id, sizeof(out[n].id), b->id); strcpy_s(out[n].name, sizeof(out[n].name), b->name);
+        out[n].leader = out[n].sync = 0; out[n].banned = 2;
+    }
     LeaveCriticalSection(&g_lk);
     return n;
+}
+
+int host_admin(const char *action, const char *id, int on, char *err, int errcap) {
+    const char *r = "Not hosting.";                       // (admin_do's answers are literals)
+    if (g_lkInit) {
+        EnterCriticalSection(&g_lk);
+        if (g_run) r = admin_do(NULL, action, id, on);
+        LeaveCriticalSection(&g_lk);
+    }
+    strcpy_s(err, errcap, r);
+    return !r[0];
+}
+
+void host_leader_controls(int on) {
+    Session *s;
+    if (!g_lkInit) { InitializeCriticalSection(&g_lk); g_lkInit = 1; }
+    EnterCriticalSection(&g_lk);
+    if (InterlockedExchange(&g_leaderCtl, on) != on) {
+        hlog(on ? "the session leader can use the host controls too" : "only this PC can use the host controls");
+        for (s = g_sessions; s; s = s->next) presence_all(s);
+    }
+    LeaveCriticalSection(&g_lk);
 }

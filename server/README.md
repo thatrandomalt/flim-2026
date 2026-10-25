@@ -72,3 +72,16 @@ silent placeholder file meanwhile. Two ops are signals rather than edits: the le
 3 s (members warn after 30 s without one) and `saving` `on:1` / `on:0` around FL saving the project
 (members hold their input meanwhile); like `cur` (mouse positions) they don't keep locks alive. A wrong password gets
 `{"t":"error","code":"bad_password"}` and the connection is closed with code 4001.
+
+**Host controls.** `presence` also carries `leaderControls` (whether the leader may use them: always here,
+since this server has no host window; flim's built-in host only when its host allows it) and `banned`
+(`[{"id","name","ip"?:true}]`, the people removed or IP banned; never the address). A peer that is
+sync-only has `"sync":true`. The leader sends `{"t":"admin","action":…,"id":<peer id>,"on":<bool>}`:
+- `give_host`: that peer leads now (a `presence` with the new roles; nobody reloads).
+- `sync_only` (`on`): the server drops every op of theirs except `state.req`, `hello` and `shared.need`, and
+  ignores their lock requests; their locks are released. Kept by id and name for a reconnect.
+- `kick`: they get `{"t":"error","code":"kicked","msg":…}` and are disconnected (close code 4003); the same
+  id or name can't join the session again. `ban_ip`: the same, and their address (or id or name) can't join
+  any session on this server.
+- `unban`: lifts a kick or an IP ban.
+Anyone else gets `error` `not_allowed`; a refused action (e.g. making the leader sync-only) `admin`.

@@ -34,7 +34,13 @@
 #define IDC_H_STATUS     1125
 #define IDC_H_SHARE      1126
 #define IDC_H_COPY       1127
-#define IDC_H_PEOPLE     1128
+#define IDC_H_LEADERCTL  1128      // the session leader may use the people controls too (hosting without FL here)
+#define IDC_PL_LIST      1150      // people in the session (host controls)
+#define IDC_PL_HOST      1151      //   make the selected person the session leader (asks first)
+#define IDC_PL_SYNC      1152      //   sync-only on / off
+#define IDC_PL_KICK      1153      //   remove them (asks first) / let a removed person back in
+#define IDC_PL_INFO      1154      //   who may use these
+#define IDC_PL_BANIP     1155      //   remove them and ban their IP address (asks first)
 #define IDC_S_STATUS     1130      // session: the status FL reports (connection, people, transfers)
 #define IDC_S_LOG        1131      //          the log (FL's and the host's)
 #define IDC_S_LOCK       1132      //          seconds a plugin stays ours after our last change

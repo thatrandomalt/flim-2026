@@ -2,6 +2,7 @@
 # 26.1.7.5654): make a change in A (or B) through FL's own functions via the probe, wait, compare.
 #   python live_test.py [test ...]            (no names: all, in order; e.g. "mix_insert mix_delete")
 # FLIM_TEST_VST=<.fst of a plugin to load into a mixer slot> (default: Xfer OTT from FL's plugin database).
+# FLIM_TEST_URL=<host:port of the server A and B are in> (default localhost:8080): reconnects, host controls' raw client.
 import sys, os, re, time, struct, math, threading
 import fl
 from mk import *
@@ -51,6 +52,7 @@ VST_FST = os.environ.get('FLIM_TEST_VST', os.path.join(os.environ['USERPROFILE']
           r'Documents\Image-Line\FL Studio\Presets\Plugin database\Installed\Effects\VST3\OTT.fst'))
 DELETE_FST = os.path.join(fl_dir(), r'Data\System\(delete) effect.fst')
 TMP = os.environ['TEMP']
+URL = os.environ.get('FLIM_TEST_URL', 'localhost:8080')         # the server A and B are in (reconnects, the raw client)
 
 def make_wav(path, hz):
     n = 44100
@@ -773,7 +775,7 @@ def t_shared():
     check('shared: an old-dated copy over it still wins', lambda: rd(fb2), lambda: rd(src), wait=20)
     os.remove(fa)                                               # deleted at A: B still has it and lists it again
     time.sleep(5)
-    engine_cmd(B, 4); time.sleep(2); engine_cmd(B, 3, 'localhost:8080\n\nB')   # B reconnects (Disconnect, Connect)
+    engine_cmd(B, 4); time.sleep(2); engine_cmd(B, 3, URL + '\n\nB')   # B reconnects (Disconnect, Connect)
     time.sleep(25)
     check('shared: a delete sticks when B lists its files again', lambda: (os.path.exists(fa), os.path.exists(fb)), lambda: (False, True))
     # a channel playing a file at B's shared path (between real PCs it's the same path for everyone; here only
@@ -1169,6 +1171,141 @@ def t_reload_lock():
     ctypes.windll.user32.PostMessageW(main_b, 0x0101, 0x87, 0xC0000001)
     time.sleep(1)
     check("reload lock: B's keys get through after", lambda: any('held off' in l for l in log_since(pos2, B)), lambda: False, wait=0)
+
+# Host controls (the leader's, through its engine as flim's window sends them: GUI_ADMIN; the server must allow the
+# leader: the Node server does, the built-in host with "Let the session leader use the people controls too").
+GUI_RESYNC, GUI_ADMIN = 8, 10
+def fl_id(pid):                                                 # its id in the session ("I am A (fl-...)")
+    for l in open(LOG, encoding='utf-8', errors='replace'):
+        m = re.search(r'\[%d\] I am \S+ \((\S+)\)' % pid, l)
+        if m: return m.group(1)
+def admin(pid, action, who, on=0): engine_cmd(pid, GUI_ADMIN, '%s\t%s\t%d' % (action, who, on))
+def logged(pos, pid, text, wait=0):
+    t0 = time.time()
+    while True:
+        if any(text in l for l in log_since(pos, pid)): return True
+        if time.time() - t0 >= wait: return False
+        time.sleep(0.25)
+
+class RawWs:                                                    # a bare WebSocket client, no FL: what the server lets through
+    def __init__(self, uid, name, room='FLIM'):
+        import socket, base64
+        host, port = URL.split('://')[-1].split(':')
+        self.s = socket.create_connection((host, int(port)), timeout=5)
+        self.s.sendall(('GET / HTTP/1.1\r\nHost: %s:%s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n'
+                        'Sec-WebSocket-Key: %s\r\n\r\n' % (host, port, base64.b64encode(os.urandom(16)).decode())).encode())
+        r = b''
+        while b'\r\n\r\n' not in r: r += self.s.recv(4096)
+        self.buf, self.got = r.split(b'\r\n\r\n', 1)[1], []
+        self.send({'t': 'join_room', 'room': room, 'password': '', 'user': {'id': uid, 'name': name}})
+    def send(self, obj):
+        import json
+        d, m = json.dumps(obj, separators=(',', ':')).encode(), os.urandom(4)   # (compact, as flim sends: host.c relays it as is)
+        h = bytes([0x81, 0x80 | len(d)]) if len(d) < 126 else bytes([0x81, 0xfe]) + struct.pack('>H', len(d))
+        self.s.sendall(h + m + bytes(c ^ m[i & 3] for i, c in enumerate(d)))
+    def _need(self, n):
+        while len(self.buf) < n:
+            k = self.s.recv(1 << 20)
+            if not k: raise EOFError
+            self.buf += k
+    def pump(self, secs=1.0):                                   # read what comes for secs; text messages go to self.got
+        import json, socket
+        self.s.settimeout(0.2); t0 = time.time()
+        while time.time() - t0 < secs:
+            try:
+                self._need(2); n = self.buf[1] & 127; o = 2
+                if n == 126: self._need(4); n = struct.unpack('>H', self.buf[2:4])[0]; o = 4
+                elif n == 127: self._need(10); n = struct.unpack('>Q', self.buf[2:10])[0]; o = 10
+                self._need(o + n); op, d = self.buf[0] & 15, self.buf[o:o + n]; self.buf = self.buf[o + n:]
+                if op == 1: self.got.append(json.loads(d))
+                elif op == 8: return False                      # closed by the server
+            except socket.timeout: pass
+            except (EOFError, OSError): return False
+        return True
+    def close(self): self.s.close()
+
+def t_give_host():
+    ida, idb = fl_id(A), fl_id(B)
+    pos = os.path.getsize(LOG)
+    admin(A, 'give_host', idb)
+    check('give host: B leads now', lambda: logged(pos, B, 'made you the session leader', 8), lambda: True, wait=0)
+    check('...A is told', lambda: logged(pos, A, 'the session leader (instead of you)', 3), lambda: True, wait=0)
+    t, v = 0x40000005, 0
+    v = (rec_get(b, t) + 10000) % 200000 + 100000
+    rec_set(b, t, v)
+    check('give host: the new leader\'s edit reaches A', lambda: rec_get(a, t), lambda: rec_get(b, t), wait=4)
+    i = mix_id(9, 0x1fc1); rec_set(a, i, (rec_get(a, i) + 1111) % 12800)
+    check('give host: a member\'s (A) edit reaches B', lambda: rec_get(b, i), lambda: rec_get(a, i), wait=4)
+    pos2 = os.path.getsize(LOG)
+    admin(A, 'sync_only', idb, 1)                               # A isn't the leader any more: refused
+    check('give host: the old leader can\'t use the controls', lambda: logged(pos2, A, 'not_allowed', 4), lambda: True, wait=0)
+    admin(B, 'give_host', ida)
+    check('give host: back to A', lambda: logged(pos2, A, 'made you the session leader', 8), lambda: True, wait=0)
+    time.sleep(2)
+    check('give host: nobody reloaded', lambda: any('PROJECT received' in l for l in log_since(pos, A) + log_since(pos, B)), lambda: False, wait=0)
+
+def t_sync_only():
+    idb = fl_id(B)
+    pos = os.path.getsize(LOG)
+    admin(A, 'sync_only', idb, 1)
+    check('sync-only: B is told', lambda: logged(pos, B, 'made this FL sync-only', 6), lambda: True, wait=0)
+    i = mix_id(10, 0x1fc1); before = rec_get(a, i)
+    rec_set(b, i, (before + 3333) % 12800); time.sleep(4)
+    check("sync-only: B's edit doesn't reach A", lambda: rec_get(a, i), lambda: before, wait=0)
+    check('...B kept it (log)', lambda: logged(pos, B, 'sync-only: this edit stays', 2), lambda: True, wait=0)
+    j = mix_id(11, 0x1fc1); rec_set(a, j, (rec_get(a, j) + 2222) % 12800)
+    check("sync-only: A's edit reaches B", lambda: rec_get(b, j), lambda: rec_get(a, j), wait=4)
+    # the server drops a sync-only member's ops (not only the engine): a raw client, normal first, then sync-only
+    xid = 'raw-x-%d' % os.getpid()
+    x = RawWs(xid, 'RawX%d' % (os.getpid() % 10000)); x.pump(1.5)          # (sync-only sticks to a name: one per run)
+    t = 0x40000001                                              # swing
+    v1 = (rec_get(a, t) + 1000) % 12800
+    x.send({'t': 'op', 'op': {'kind': 'param.set', 'id': t, 'v': v1}})
+    check('sync-only: a raw member\'s op reaches A (normal)', lambda: rec_get(a, t), lambda: v1, wait=4)
+    admin(A, 'sync_only', xid, 1); x.pump(1.5)
+    x.send({'t': 'op', 'op': {'kind': 'param.set', 'id': t, 'v': (v1 + 1000) % 12800}}); x.pump(3)
+    check('sync-only: the server drops its op', lambda: rec_get(a, t), lambda: v1, wait=0)
+    x.close(); time.sleep(1)
+    x = RawWs(xid, 'RawX%d' % (os.getpid() % 10000)); x.pump(1.5)
+    check('sync-only: it sticks when they reconnect', lambda: any(p.get('sync') for m in x.got if m.get('t') == 'presence'
+                                                                  for p in m['peers'] if p['id'] == xid), lambda: True, wait=0)
+    admin(A, 'sync_only', xid, 0); x.pump(1); x.close()
+    pos = os.path.getsize(LOG)
+    admin(A, 'sync_only', idb, 0)
+    check('sync-only off: B is told', lambda: logged(pos, B, 'switched this FL back from sync-only', 6), lambda: True, wait=0)
+    check('...B reloads the leader\'s project (its edit stayed local)', lambda: logged(pos, B, 'PROJECT settled', 40), lambda: True, wait=0)
+    check("...B matches A again", lambda: rec_get(b, i), lambda: rec_get(a, i), wait=4)
+    k = mix_id(12, 0x1fc1); rec_set(b, k, (rec_get(b, k) + 1234) % 12800)
+    check("...B's edits reach A again", lambda: rec_get(a, k), lambda: rec_get(b, k), wait=4)
+
+def t_kick():
+    ida, idb = fl_id(A), fl_id(B)
+    pos = os.path.getsize(LOG)
+    admin(A, 'kick', idb)
+    check('kick: B is told and disconnected', lambda: logged(pos, B, 'removed you from the session', 6), lambda: True, wait=0)
+    check('...A sees B removed', lambda: logged(pos, A, '"banned":[{"id":"%s"' % idb, 6), lambda: True, wait=0)
+    pos = os.path.getsize(LOG)
+    engine_cmd(B, 3, URL + '\n\nB')
+    check("kick: B can't join again", lambda: logged(pos, B, 'You were removed from this session', 8), lambda: True, wait=0)
+    admin(A, 'unban', idb); time.sleep(1)
+    pos = os.path.getsize(LOG)
+    engine_cmd(B, 3, URL + '\n\nB')
+    check('kick: let back in, B joins and loads the project', lambda: logged(pos, B, 'PROJECT settled', 40), lambda: True, wait=0)
+    i = mix_id(13, 0x1fc1); rec_set(a, i, (rec_get(a, i) + 777) % 12800)
+    check('...and gets edits again', lambda: rec_get(b, i), lambda: rec_get(a, i), wait=4)
+    # IP ban: B is out, and so is anyone else from its address (here: a raw client with another id and name, same PC)
+    pos = os.path.getsize(LOG)
+    admin(A, 'ban_ip', idb)
+    check('ban IP: B is told and disconnected', lambda: logged(pos, B, 'banned you from this server', 6), lambda: True, wait=0)
+    check('...A sees it', lambda: logged(pos, A, '"ip":true', 6), lambda: True, wait=0)
+    x = RawWs('raw-y-%d' % os.getpid(), 'RawY'); x.pump(1.5); x.close()
+    check('ban IP: another client from that address is refused', lambda: [m.get('code') for m in x.got if m.get('t') == 'error'], lambda: ['kicked'], wait=0)
+    admin(A, 'unban', idb); time.sleep(1)
+    pos = os.path.getsize(LOG)
+    engine_cmd(B, 3, URL + '\n\nB')
+    check('IP unban: B joins again', lambda: logged(pos, B, 'PROJECT settled', 40), lambda: True, wait=0)
+    x = RawWs('raw-y-%d' % os.getpid(), 'RawY'); x.pump(1.5); x.close()
+    check('...and so can others from that address', lambda: [m['t'] for m in x.got][:1], lambda: ['welcome'], wait=0)
 
 if __name__ == '__main__':
     T = {k[2:]: v for k, v in list(globals().items()) if k.startswith('t_')}

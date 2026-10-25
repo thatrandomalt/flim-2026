@@ -334,18 +334,18 @@ static void adopt_running_fl(HWND dlg) { adopt_engine(dlg, FindWindowExW(HWND_ME
 #define PICK_MAX 16
 static DWORD g_pickPid[PICK_MAX];
 static int g_pickN, g_pickSel;
+static void list_measure(HWND dlg, MEASUREITEMSTRUCT *mi) {   // an owner-drawn list's row: the font's height, padded
+    HDC dc = GetDC(dlg);
+    HFONT of = (HFONT)SelectObject(dc, (HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0));
+    TEXTMETRICW tm;
+    GetTextMetricsW(dc, &tm);
+    SelectObject(dc, of); ReleaseDC(dlg, dc);
+    mi->itemHeight = (UINT)(tm.tmHeight + tm.tmHeight / 2);
+}
 static INT_PTR CALLBACK pick_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) { theme_button((const DRAWITEMSTRUCT *)lp); return TRUE; }
     if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { theme_listitem((const DRAWITEMSTRUCT *)lp); return TRUE; }
-    if (m == WM_MEASUREITEM && ((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) {   // a row: the font's height, padded
-        HDC dc = GetDC(dlg);
-        HFONT of = (HFONT)SelectObject(dc, (HFONT)SendMessageW(dlg, WM_GETFONT, 0, 0));
-        TEXTMETRICW tm;
-        GetTextMetricsW(dc, &tm);
-        SelectObject(dc, of); ReleaseDC(dlg, dc);
-        ((MEASUREITEMSTRUCT *)lp)->itemHeight = (UINT)(tm.tmHeight + tm.tmHeight / 2);
-        return TRUE;
-    }
+    if (m == WM_MEASUREITEM && ((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { list_measure(dlg, (MEASUREITEMSTRUCT *)lp); return TRUE; }
     if (m >= WM_CTLCOLORMSGBOX && m <= WM_CTLCOLORSTATIC) return theme_color(dlg, m, (HDC)wp, (HWND)lp);
     if (m == WM_INITDIALOG) {
         HWND w = NULL, list = GetDlgItem(dlg, IDC_P_LIST);
@@ -799,13 +799,132 @@ static void export_log(HWND dlg) {
     ShellExecuteW(NULL, L"open", L"explorer.exe", msg, NULL, SW_SHOWNORMAL);
 }
 
+// ---- people in the session: host controls ----
+// Who is in the session, from the built-in host when this PC hosts (it may act on anyone), else from our FL's
+// engine (GUI_PEOPLE). Make leader / sync-only / remove (and let a removed person back in) go to the host
+// directly, or as the session leader through the engine to the server, which allows it only if the host does
+// (Node server: always; this PC hosting: "Let the session leader use the people controls too").
+#define PEOPLE_MAX 64
+typedef struct { char id[72]; wchar_t name[48]; int leader, sync, banned; } Person;   // banned: 1 removed, 2 IP banned
+static Person g_pl[PEOPLE_MAX], g_engPl[PEOPLE_MAX];
+static int g_plN, g_engPlN, g_engCtl;
+static char g_engMe[72];                  // our FL's id in the session (marks "you")
+static void people_from_engine(const wchar_t *t) {   // GUI_PEOPLE (engine on_peers)
+    const wchar_t *l = t;
+    g_engPlN = 0; g_engCtl = _wtoi(t); g_engMe[0] = 0;
+    for (; l && *l; l = wcschr(l, L'\n') ? wcschr(l, L'\n') + 1 : NULL) {
+        wchar_t f[5][80] = { 0 };
+        int k = 0, i = 0;
+        const wchar_t *c;
+        for (c = l; *c && *c != L'\n' && k < 5; c++) {
+            if (*c == L'\t') { f[k][i] = 0; k++; i = 0; } else if (i < 79) f[k][i++] = *c;
+        }
+        if (l == t) { WideCharToMultiByte(CP_UTF8, 0, f[1], -1, g_engMe, sizeof(g_engMe), NULL, NULL); continue; }
+        if ((f[0][0] != L'P' && f[0][0] != L'B') || g_engPlN >= PEOPLE_MAX) continue;
+        Person *p = &g_engPl[g_engPlN++];
+        WideCharToMultiByte(CP_UTF8, 0, f[1], -1, p->id, sizeof(p->id), NULL, NULL);
+        wcscpy_s(p->name, 48, f[2]);
+        if (f[0][0] == L'B') { p->banned = 1 + _wtoi(f[3]); p->leader = p->sync = 0; }
+        else { p->banned = 0; p->leader = _wtoi(f[3]); p->sync = _wtoi(f[4]); }
+    }
+}
+static int people_can_act(void) {         // this window may use the controls
+    int i;
+    if (host_running()) return 1;
+    if (!g_engCtl || !fl_running() || g_netState != NET_ON) return 0;
+    for (i = 0; i < g_engPlN; i++) if (g_engPl[i].leader && !strcmp(g_engPl[i].id, g_engMe)) return 1;
+    return 0;
+}
+static Person *people_sel(HWND dlg) {
+    int s = (int)SendDlgItemMessageW(dlg, IDC_PL_LIST, LB_GETCURSEL, 0, 0);
+    return s >= 0 && s < g_plN ? &g_pl[s] : NULL;
+}
+static void people_buttons(HWND dlg) {
+    Person *p = people_sel(dlg);
+    int can = people_can_act(), me = p && g_engMe[0] && !strcmp(p->id, g_engMe) && !host_running();
+    EnableWindow(GetDlgItem(dlg, IDC_PL_HOST), can && p && !p->banned && !p->leader);
+    EnableWindow(GetDlgItem(dlg, IDC_PL_SYNC), can && p && !p->banned && !p->leader);
+    EnableWindow(GetDlgItem(dlg, IDC_PL_KICK), can && p && !me);
+    EnableWindow(GetDlgItem(dlg, IDC_PL_BANIP), can && p && !me && !p->banned);
+    SetDlgItemTextW(dlg, IDC_PL_SYNC, p && p->sync ? L"Back to normal" : L"Sync-only");
+    SetDlgItemTextW(dlg, IDC_PL_KICK, p && p->banned ? L"Let back in" : L"Remove...");
+}
 static void main_people(HWND dlg) {
-    wchar_t p[1024], line[1100];
-    int n = host_peers(p, 1024);
-    if (!host_running()) line[0] = 0;
-    else if (!n) wcscpy_s(line, 1100, L"Nobody connected yet.");
-    else swprintf_s(line, 1100, L"Connected (%d): %s", n, p);
-    SetDlgItemTextW(dlg, IDC_H_PEOPLE, line);
+    HWND list = GetDlgItem(dlg, IDC_PL_LIST);
+    Person *sel = people_sel(dlg);
+    char keep[72];
+    int i, at = -1;
+    strcpy_s(keep, sizeof(keep), sel ? sel->id : "");
+    if (host_running()) {
+        HostPerson hp[PEOPLE_MAX];
+        g_plN = host_people(hp, PEOPLE_MAX);
+        for (i = 0; i < g_plN; i++) {
+            strcpy_s(g_pl[i].id, sizeof(g_pl[i].id), hp[i].id);
+            MultiByteToWideChar(CP_UTF8, 0, hp[i].name, -1, g_pl[i].name, 48);
+            g_pl[i].leader = hp[i].leader; g_pl[i].sync = hp[i].sync; g_pl[i].banned = hp[i].banned;
+        }
+    } else {
+        g_plN = fl_running() ? g_engPlN : 0;
+        memcpy(g_pl, g_engPl, sizeof(Person) * g_plN);
+    }
+    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+    for (i = 0; i < g_plN; i++) {
+        wchar_t row[160];
+        int me = g_engMe[0] && !strcmp(g_pl[i].id, g_engMe);
+        swprintf_s(row, 160, L"%s%s%s%s%s", g_pl[i].name, me ? L"  (you)" : L"", g_pl[i].leader ? L"  \x00B7 session leader" : L"",
+                   g_pl[i].sync ? L"  \x00B7 sync-only" : L"", g_pl[i].banned == 2 ? L"  \x00B7 IP banned" : g_pl[i].banned ? L"  \x00B7 removed" : L"");
+        SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)row);
+        if (!strcmp(g_pl[i].id, keep)) at = i;
+    }
+    SendMessageW(list, LB_SETCURSEL, at, 0);
+    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(list, NULL, TRUE);
+    SetDlgItemTextW(dlg, IDC_PL_INFO, host_running() ? (g_plN ? L"You host: these work on everyone." : L"Nobody connected yet.")
+                                      : people_can_act() ? L"You lead the session, and the host lets you use these."
+                                      : g_plN ? L"Only the PC hosting the session can use these." : L"");
+    people_buttons(dlg);
+}
+static void people_act(HWND dlg, int ctl) {
+    Person *p = people_sel(dlg);
+    const char *action;
+    wchar_t q[300];
+    int on = 0;
+    char err[200], cmd[200];
+    if (!p || !people_can_act()) return;
+    if (ctl == IDC_PL_HOST) {
+        swprintf_s(q, 300, L"Make %s the session leader?\n\nTheir FL holds the project from now on, and people who join get it "
+                           L"from them. Nobody has to reload.", p->name);
+        if (MessageBoxW(dlg, q, L"Make leader", MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2) != IDOK) return;
+        action = "give_host";
+    } else if (ctl == IDC_PL_SYNC) { action = "sync_only"; on = !p->sync; }
+    else if (ctl == IDC_PL_KICK && p->banned) action = "unban";
+    else if (ctl == IDC_PL_BANIP) {
+        swprintf_s(q, 300, L"Ban %s's IP address?\n\nThey are disconnected, and nobody from their address (or with their name) can "
+                           L"join a session on this server until you let them back in (\"Let back in\" here) or it stops. "
+                           L"People sharing their internet connection are shut out too.", p->name);
+        if (MessageBoxW(dlg, q, L"Ban IP", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) return;
+        action = "ban_ip";
+    } else {
+        swprintf_s(q, 300, L"Remove %s from the session?\n\nTheir FL is disconnected, and they can't join again unless you let them "
+                           L"back in (\"Let back in\" here) or the session ends.", p->name);
+        if (MessageBoxW(dlg, q, L"Remove", MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) return;
+        action = "kick";
+    }
+    if (host_running()) {
+        if (!host_admin(action, p->id, on, err, sizeof(err))) { wchar_t w[200]; MultiByteToWideChar(CP_UTF8, 0, err, -1, w, 200); fail_box(dlg, L"%s", w); }
+        main_people(dlg);
+    } else {
+        sprintf_s(cmd, sizeof(cmd), "%s\t%s\t%d", action, p->id, on);
+        if (!engine_send(dlg, GUI_ADMIN, cmd)) fail_box(dlg, L"FL didn't answer: is it busy (a dialog open)?");
+    }
+}
+// "Let the session leader use the people controls too": only when this PC hosts without joining (otherwise this
+// window has them, and the leader is someone else's FL... or ours).
+static void leader_ctl_apply(HWND dlg) {
+    int also = IsDlgButtonChecked(dlg, IDC_H_ALSOFL) == BST_CHECKED;
+    EnableWindow(GetDlgItem(dlg, IDC_H_LEADERCTL), !also);
+    host_leader_controls(!also && IsDlgButtonChecked(dlg, IDC_H_LEADERCTL) == BST_CHECKED);
 }
 static int private_ip(const wchar_t *ip) {        // where friends outside couldn't reach (or carrier-grade NAT)
     int a = 0, b = 0;
@@ -944,6 +1063,7 @@ static void main_host_start(HWND dlg) {
     secret_set_w(L"host_pw", pw);
     flimcfg_set(L"host_upnp", IsDlgButtonChecked(dlg, IDC_H_UPNP) ? L"1" : L"0");
     flimcfg_set(L"host_alsofl", IsDlgButtonChecked(dlg, IDC_H_ALSOFL) ? L"1" : L"0");
+    leader_ctl_apply(dlg);
     host_lan_ip(g_lan, 64);
     main_host_controls(dlg, 1);
     swprintf_s(share, 128, L"ws://%s:%d", g_lan[0] ? g_lan : L"localhost", port);
@@ -1226,6 +1346,10 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_DRAWITEM:
         if (((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) { theme_button((const DRAWITEMSTRUCT *)lp); return TRUE; }
+        if (((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { theme_listitem((const DRAWITEMSTRUCT *)lp); return TRUE; }
+        break;
+    case WM_MEASUREITEM:                 // (the people list; comes before WM_INITDIALOG)
+        if (((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { list_measure(dlg, (MEASUREITEMSTRUCT *)lp); return TRUE; }
         break;
     case WM_CTLCOLORDLG: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: case WM_CTLCOLORBTN:
         return theme_color(dlg, m, (HDC)wp, (HWND)lp);
@@ -1285,6 +1409,8 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         SecureZeroMemory(v, sizeof(v));
         flimcfg_get(L"host_upnp", v, 512); CheckDlgButton(dlg, IDC_H_UPNP, wcscmp(v, L"0") ? BST_CHECKED : BST_UNCHECKED);
         flimcfg_get(L"host_alsofl", v, 512); CheckDlgButton(dlg, IDC_H_ALSOFL, wcscmp(v, L"1") == 0 ? BST_CHECKED : BST_UNCHECKED);
+        flimcfg_get(L"host_leaderctl", v, 512); CheckDlgButton(dlg, IDC_H_LEADERCTL, wcscmp(v, L"1") == 0 ? BST_CHECKED : BST_UNCHECKED);
+        leader_ctl_apply(dlg);
         main_host_controls(dlg, 0);
         SetDlgItemInt(dlg, IDC_S_LOCK, flimcfg_lock_s(), FALSE);
         SendDlgItemMessageW(dlg, IDC_S_LOCK, EM_LIMITTEXT, 2, 0);
@@ -1312,17 +1438,19 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     }
     case WM_COPYDATA: {                  // from our FL's engine: its status or a log line
         const COPYDATASTRUCT *cd = (const COPYDATASTRUCT *)lp;
-        wchar_t w[2048];
+        static wchar_t w[16384];
         if (wp) g_engine = (HWND)wp;
         if (cd->lpData && cd->cbData) {
-            int n = MultiByteToWideChar(CP_UTF8, 0, (const char *)cd->lpData, (int)cd->cbData, w, 2047);
+            int n = MultiByteToWideChar(CP_UTF8, 0, (const char *)cd->lpData, (int)cd->cbData, w, 16383);
             w[n > 0 ? n : 0] = 0;
             if (cd->dwData == GUI_STATUS) {
                 wchar_t *tab = wcschr(w, L'\t');
                 g_netState = _wtoi(w);
                 SetDlgItemTextW(dlg, IDC_S_STATUS, tab ? tab + 1 : w);
                 session_buttons(dlg);
-            } else if (cd->dwData == GUI_LOG) main_log(dlg, w);
+                main_people(dlg);
+            } else if (cd->dwData == GUI_PEOPLE) { people_from_engine(w); main_people(dlg); }
+            else if (cd->dwData == GUI_LOG) main_log(dlg, w);
             else if (cd->dwData == GUI_ALERT) {    // shown after this message returns (FL's sender doesn't wait on it)
                 main_log(dlg, w);
                 PostMessageW(dlg, WM_ALERT, 0, (LPARAM)_wcsdup(w));
@@ -1346,10 +1474,11 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         if ((HANDLE)wp != g_flProc) return TRUE;   // an FL from before
         crash_collect(dlg, g_flProc);
         CloseHandle(g_flProc);
-        g_flProc = NULL; g_engine = NULL; g_netState = NET_OFF;
+        g_flProc = NULL; g_engine = NULL; g_netState = NET_OFF; g_engPlN = 0;
         SetDlgItemTextW(dlg, IDC_S_STATUS, L"FL isn't running.");
         main_log(dlg, L"FL closed.");
         session_buttons(dlg);
+        main_people(dlg);
         return TRUE;
     case WM_CTLCOLORSTATIC:              // the status in the color of the connection; the rest: theme_color
         if ((HWND)lp == GetDlgItem(dlg, IDC_S_STATUS)) {
@@ -1401,6 +1530,13 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
             } else main_host_start(dlg);
             return TRUE;
         case IDC_H_COPY: main_copy(dlg); return TRUE;
+        case IDC_H_ALSOFL: leader_ctl_apply(dlg); return TRUE;
+        case IDC_H_LEADERCTL:
+            flimcfg_set(L"host_leaderctl", IsDlgButtonChecked(dlg, IDC_H_LEADERCTL) == BST_CHECKED ? L"1" : NULL);
+            leader_ctl_apply(dlg);
+            return TRUE;
+        case IDC_PL_LIST: if (HIWORD(wp) == LBN_SELCHANGE) people_buttons(dlg); return TRUE;
+        case IDC_PL_HOST: case IDC_PL_SYNC: case IDC_PL_KICK: case IDC_PL_BANIP: people_act(dlg, LOWORD(wp)); return TRUE;
         case IDC_S_LOCK:                 // each valid value is saved and FL told; leaving the box shows the saved one
             if (HIWORD(wp) == EN_CHANGE) {
                 UINT s = GetDlgItemInt(dlg, IDC_S_LOCK, NULL, FALSE);

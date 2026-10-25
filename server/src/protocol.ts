@@ -12,7 +12,13 @@ export interface PeerInfo {
   id: string;
   name: string;
   role: Role;
+  sync?: true; // sync-only: gets everything, nothing of theirs is relayed
 }
+
+// Host controls (the session leader's; this server has no host window): give host, remove (banned from the
+// session until let back in), ban their IP address (every session on this server, until let back in or the
+// server restarts), sync-only on / off (sticks across a reconnect), let a removed / IP banned person back in.
+export type AdminAction = "give_host" | "kick" | "ban_ip" | "sync_only" | "unban";
 
 // A unit key identifies the lockable edit atom. Opaque to the server; the FL client uses:
 //  - parameter:        `param:<recEventId>`     (channel / mixer knobs, EQ, slot on/mix, tempo...)
@@ -43,6 +49,7 @@ export type ClientMsg =
   | { t: "op"; op: Op }
   | { t: "lock_acquire"; key: UnitKey }
   | { t: "lock_release"; key: UnitKey }
+  | { t: "admin"; action: AdminAction; id: string; on?: boolean } // session leader only
   | { t: "bye" };
 
 // ---- server -> client ----
@@ -54,8 +61,8 @@ export type ServerMsg =
   | { t: "lock_state"; locks: Array<{ key: UnitKey; owner: string }> }
   | { t: "lock_released"; key: UnitKey }
   | { t: "project_swap"; flp: string; epoch: number } // members: show resync notice, reload
-  | { t: "presence"; peers: PeerInfo[] }
-  | { t: "error"; code: string; msg: string };
+  | { t: "presence"; peers: PeerInfo[]; leaderControls: boolean; banned: Array<UserInfo & { ip?: true }> } // (never the address)
+  | { t: "error"; code: string; msg: string }; // code "kicked": removed by the host (the connection closes)
 
 export const LOCK_TTL_MS = 30_000; // safety auto-release if a client never releases
 export const PING_INTERVAL_MS = 15_000;

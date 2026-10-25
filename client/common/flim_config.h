@@ -9,6 +9,7 @@
 //   projects_dir   where the song folders go (default Documents\flim\Projects)
 //   song_name      name for an untitled project the session leader starts with (optional)
 //   log_detailed   1: the detailed log (every op, a structure digest; flim's window shows nearly every line)
+//   host_leaderctl 1: hosting without joining, the session leader may use the people controls too  - launcher
 // The file is created as UTF-16 so the profile API keeps non-ASCII paths and names.
 #pragma once
 #include <windows.h>
@@ -46,7 +47,7 @@ static int file_version(const wchar_t *file, WORD v[4]) {
 
 // flim.exe's window <-> the engine in FL: WM_COPYDATA, dwData = one of these, UTF-8 text
 // (the engine's "flim window link" section has the formats).
-enum { GUI_STATUS = 1, GUI_LOG, GUI_CONNECT, GUI_DISCONNECT, GUI_HELLO, GUI_SETTINGS, GUI_ALERT, GUI_RESYNC };
+enum { GUI_STATUS = 1, GUI_LOG, GUI_CONNECT, GUI_DISCONNECT, GUI_HELLO, GUI_SETTINGS, GUI_ALERT, GUI_RESYNC, GUI_PEOPLE, GUI_ADMIN };
 enum { NET_OFF, NET_CONNECTING, NET_ON, NET_ERR };   // the connection state in GUI_STATUS
 
 // %APPDATA%: from the environment first. The engine reads its settings while FL starts up, and

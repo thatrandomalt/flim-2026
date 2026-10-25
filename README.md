@@ -162,6 +162,9 @@ The host is built into `flim.exe`, nothing else to install. What to give the oth
   `ws://100.64.1.2:8080`. Nothing to forward, and it works from anywhere.
 - The first time you host, Windows Firewall asks whether flim may use the network: allow it, on public
   networks too if your connection is marked public.
+- The hosting PC's window can manage the people in the session (see [Host controls](#host-controls)).
+  If this PC only hosts (*Also open FL on this PC and join* unticked), tick *Let the session leader use
+  the people controls too* to let the leader do it from their own flim window as well.
 
 ### Dedicated server
 For a server that runs without anyone's FL (an always-on PC or a cloud machine), use the Node.js
@@ -212,6 +215,24 @@ The server listens on port **8080**. Give your friends your address and the pass
   way for the second or two it takes, so nothing you do then gets lost. FL's own dialogs still work.
 - **If the leader's FL stops responding** for 30 s (some plugins take a while to load, so not sooner),
   everyone else gets a popup suggesting they save their own copy.
+
+### Host controls
+*People in the session* in flim's window lists everyone (the leader, who is sync-only, who was removed).
+The PC hosting with flim's built-in server can use its buttons on anyone. The session leader can use them
+too when the host allows it (*Let the session leader use the people controls too*, only when the hosting
+PC doesn't join itself), and always on a [dedicated server](#dedicated-server), which has no host window.
+- **Make leader...** (asks first): that person's FL holds the project from now on, and people who join get
+  it from them. Nobody reloads: everyone already has the same project. Both get a popup.
+- **Sync-only** / **Back to normal**: a sync-only person still gets everything the others do (and can load
+  the leader's project with *Resync from host*), but nothing they do in FL reaches anyone: the server drops
+  it, and their flim doesn't send it either. Their status says *sync-only*. Changes they make meanwhile
+  stay in their FL; switched back, their FL loads the leader's project once so it matches again. It sticks
+  if they reconnect. The leader can't be sync-only (make someone else the leader first).
+- **Remove...** (asks first): their FL is disconnected with a popup saying who removed them, and they
+  can't join this session again (same id or same name) until **Let back in**, or until the session ends.
+- **Ban IP...** (asks first): like Remove, and nobody from their internet address (or with their name) can
+  join any session on that server until **Let back in**, or until the server stops. People sharing that
+  connection are shut out too. The address itself is never shown to the leader.
 
 ### Samples
 The samples your channels, audio clips and sample-based plugins use are sent along automatically,
@@ -328,7 +349,11 @@ See [`server/README.md`](server/README.md) for the protocol and options.
   docker run -p 8080:8080 -e FLIM_PASSWORD=pick-a-password flim-server
   ```
 - **Health check:** `GET /health` answers `flim-server ok`.
-- Sessions live in memory only. Restarting the server ends the session; run a single instance.
+- Sessions live in memory only. Restarting the server ends the session (and lifts IP bans); run a single
+  instance.
+- **Host controls:** the session leader can use them (there is no host window). On fly.io, IP bans use the
+  `Fly-Client-IP` header; elsewhere the address the connection comes from (behind another proxy, that is
+  the proxy's).
 
 ---
 

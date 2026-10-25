@@ -33,7 +33,7 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 360, 108, 50, 15
 END
 
-IDD_MAIN DIALOGEX 0, 0, 560, 320
+IDD_MAIN DIALOGEX 0, 0, 560, 392
 STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME
 CAPTION "flim"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -66,7 +66,7 @@ BEGIN
     LTEXT           "Address to give the others:", -1, 14, 209, 120, 10
     EDITTEXT        IDC_H_SHARE, 14, 220, 256, 13, ES_AUTOHSCROLL | ES_READONLY
     PUSHBUTTON      "Copy", IDC_H_COPY, 274, 219, 52, 15
-    LTEXT           "", IDC_H_PEOPLE, 14, 239, 312, 26
+    AUTOCHECKBOX    "Let the session leader use the people controls too (when this PC doesn't join)", IDC_H_LEADERCTL, 14, 241, 312, 10
 
     GROUPBOX        " Session ", -1, 340, 6, 214, 265
     LTEXT           "FL isn't running.", IDC_S_STATUS, 348, 18, 198, 50
@@ -79,16 +79,24 @@ BEGIN
     EDITTEXT        IDC_S_LOCK, 478, 251, 20, 13, ES_NUMBER
     LTEXT           "s (1-10)", -1, 502, 253, 44, 10
 
-    PUSHBUTTON      "Open FL without connecting", IDC_M_OPENFL, 6, 279, 110, 15
-    AUTOCHECKBOX    "Back up the project every", IDC_M_BACKUP, 124, 282, 94, 10
-    EDITTEXT        IDC_M_BACKUPMIN, 219, 280, 22, 13, ES_NUMBER
-    LTEXT           "min", -1, 244, 282, 14, 10
-    PUSHBUTTON      "Close", IDCANCEL, 500, 279, 54, 15
-    PUSHBUTTON      "Projects folder", IDC_M_PROJECTS, 6, 298, 66, 15
-    PUSHBUTTON      "Change...", IDC_M_PROJDIR, 76, 298, 46, 15
-    PUSHBUTTON      "Shared folder", IDC_M_SHARED, 126, 298, 62, 15
-    PUSHBUTTON      "Crash reports", IDC_M_CRASHES, 192, 298, 62, 15
-    PUSHBUTTON      "Clear cache...", IDC_M_CLEARCACHE, 258, 298, 62, 15
+    GROUPBOX        " People in the session ", -1, 6, 277, 548, 72
+    LISTBOX         IDC_PL_LIST, 14, 289, 380, 54, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "Make leader...", IDC_PL_HOST, 400, 289, 70, 15
+    PUSHBUTTON      "Sync-only", IDC_PL_SYNC, 476, 289, 70, 15
+    PUSHBUTTON      "Remove...", IDC_PL_KICK, 400, 307, 70, 15
+    PUSHBUTTON      "Ban IP...", IDC_PL_BANIP, 476, 307, 70, 15
+    LTEXT           "", IDC_PL_INFO, 400, 325, 146, 20
+
+    PUSHBUTTON      "Open FL without connecting", IDC_M_OPENFL, 6, 355, 110, 15
+    AUTOCHECKBOX    "Back up the project every", IDC_M_BACKUP, 124, 358, 94, 10
+    EDITTEXT        IDC_M_BACKUPMIN, 219, 356, 22, 13, ES_NUMBER
+    LTEXT           "min", -1, 244, 358, 14, 10
+    PUSHBUTTON      "Close", IDCANCEL, 500, 355, 54, 15
+    PUSHBUTTON      "Projects folder", IDC_M_PROJECTS, 6, 374, 66, 15
+    PUSHBUTTON      "Change...", IDC_M_PROJDIR, 76, 374, 46, 15
+    PUSHBUTTON      "Shared folder", IDC_M_SHARED, 126, 374, 62, 15
+    PUSHBUTTON      "Crash reports", IDC_M_CRASHES, 192, 374, 62, 15
+    PUSHBUTTON      "Clear cache...", IDC_M_CLEARCACHE, 258, 374, 62, 15
 END
 
 VS_VERSION_INFO VERSIONINFO
