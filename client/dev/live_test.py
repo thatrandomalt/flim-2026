@@ -856,7 +856,9 @@ def t_auto_clip():
     check('automation clip: channel added', lambda: len(chans(b)), lambda: n + 1, wait=10)
     check('automation clip: its link reached B', lambda: links(a), lambda: links(b), wait=10)
     before = rec_get(b, target)
+    quiet['on'] = True; time.sleep(2)                           # (moved by FL, nobody at the keyboard: by hand it goes out, auto_hand)
     rec_set(a, target, (rec_get(a, target) + 2345) % 12800); time.sleep(2.5)
+    quiet['on'] = False
     check('automated value stays each FL\'s own', lambda: rec_get(b, target), lambda: before)
 def t_auto_add():                                               # another link out of a clip in the middle: B's loader
     srcs = sorted(set(l[0] for l in links(a)))                  # appends it (unsorted), flim sorts
@@ -886,6 +888,29 @@ def t_auto_both():                                              # both make a cl
     check('two clips at once: same channels', lambda: chan_names(a), lambda: chan_names(b), wait=10)
     check('two clips at once: both linked', lambda: links(a), lambda: links(b), wait=10)
     check('two clips at once: B\'s clip has its link', lambda: sorted(set(l[0] >> 16 for l in links(a)) & {n, n + 1}), lambda: [n, n + 1], wait=0)
+
+# An automated knob moved by hand while the song is stopped goes out like any other; while an FL plays, its
+# own automation drives it (nothing sent from there, nothing applied there).
+def t_auto_hand():
+    v3, v4 = mix_id(7, 0x1fc0), mix_id(8, 0x1fc0)
+    for t in (v3, v4):
+        if t not in [l[2] for l in links(a)]: a.call(0x1191a50, t, 1, 0, 1, 1); time.sleep(2)
+    check('automated: links on both', lambda: links(a), lambda: links(b), wait=10)
+    time.sleep(2)                                               # (a busy FL holds the background user's keys: no input meanwhile)
+    rec_set(a, v3, 5000)
+    check('automated, stopped: A moves it, B has it', lambda: (rec_get(a, v3), rec_get(b, v3)), lambda: (5000, 5000), wait=5)
+    rec_set(b, v4, 7000)
+    check('automated, stopped: B moves it, A has it', lambda: (rec_get(a, v4), rec_get(b, v4)), lambda: (7000, 7000), wait=5)
+    space(A); time.sleep(1.5)
+    check('automated: A plays', lambda: a.d(a.a(PLAYING)), lambda: 1, wait=3)
+    rec_set(a, v3, 9000); time.sleep(4)
+    check('automated, A playing: not sent from A', lambda: rec_get(b, v3), lambda: 5000, wait=0)
+    rec_set(b, v4, 3000); time.sleep(4)
+    check('automated, A playing: not applied in A', lambda: rec_get(a, v4) != 3000, lambda: True, wait=0)
+    space(A); time.sleep(2)
+    check('automated: A stopped', lambda: a.d(a.a(PLAYING)), lambda: 0, wait=3)
+    rec_set(a, v3, 2000)
+    check('automated, stopped again: A\'s move reaches B', lambda: (rec_get(a, v3), rec_get(b, v3)), lambda: (2000, 2000), wait=5)
 
 # FL's "Move down" on a track's first effect swaps two slot objects inside the track (sub_1233B30); flim
 # took slot 0's object for the track and replayed it as a track deleted and inserted.

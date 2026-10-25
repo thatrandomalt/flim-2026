@@ -99,7 +99,7 @@ Offsets that changed from FL 25.2.3.5171 are marked with the old value in bracke
 | `PATREFRESH_VA` | `0xea7ae0` | after a rename, on (playlist form `+0xd34` [`0xd00`]) | |
 | `NOTEARR_VA` / `NOTEDEL_VA` | `0x12d16e0` / `0x10603b0` | `NoteArray(pattern, update)`: makes the array if the pattern has none, and then, with `update` while FL plays, calls `sub_11E7470(song pos + 1, 0, 0)`, which takes `SONGLOCK` and then `NOTELOCK` (section 6); `DeleteNote(arr, i, 0)`; note record 24 bytes, channel `+6` | |
 | `NOTELOCK_VA` | `0x15e2008` | CRITICAL_SECTION* held while editing notes (the audio thread reads them); -> the `CRITICAL_SECTION` at `0x16b6b20` | |
-| playing | `0x193fb0c` (slot `0x15e09f8`) | int: 1 while FL plays (a space key posted to the main form starts / stops it) | `NoteArray` |
+| `PLAYING` | `0x193fb0c` (slot `0x15e09f8`, the signature's address) | int: 1 while FL plays (a space key posted to the main form starts / stops it) | `NoteArray` |
 | `GRIDREFRESH_VA` | `0x12d6900` | `RefreshGrid(channel->grid)` | |
 | pattern ops | project vmt (`*(*FLPROJ+0x10)`) | clone `+0xe8`, delete `+0xf8`, insert `+0x118`, split `+0x120` | `EEPat*MenuClick` |
 
@@ -1006,9 +1006,16 @@ target REC id, `+0x14` flags (8 internal, 4 MIDI, 2 smoothing), `+0x18` smoothin
   as an edit of that clip; one made by FL during a load or structure op (`LINK_QUIET_MS`) doesn't. When
   a slot's or channel's plugin changes, the clips with links into it go again after it
   (`links_resend_into`): the clip may have arrived first and lost its link to FL's plugin swap there.
-- A param that is a link's target is never sent or applied (`auto_target`): each FL plays its own
-  automation. Before, one person playing the song sent the automated knob to everyone.
-- Tests: `live_test.py auto_clip auto_add auto_remove slot_move`.
+- A param that is a link's target (`auto_target`) isn't sent while this FL plays or with nobody at the
+  keyboard, and isn't applied while this FL plays: each FL plays its own automation. Before, one person
+  playing the song sent the automated knob to everyone. Moved by hand while stopped, it goes out like any
+  other param (before, never: `stress` makes automation clips and sets random volumes, and failed when both
+  hit one track). FL's playing flag: `PLAYING` (slot `0x15e09f8` -> int), `fl_playing()`. ponytail: a
+  playhead moved by hand while stopped (FL sets automated params to the new position) goes out as an edit
+  too; the receiver gets the value, its own playhead stays.
+  A change from someone else while this FL plays is dropped here, so after it stops the two can differ
+  until the knob is moved again.
+- Tests: `live_test.py auto_clip auto_add auto_remove auto_hand slot_move`.
 
 ## 6. Threads and locks
 

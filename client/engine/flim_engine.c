@@ -1317,6 +1317,11 @@ static void links_scan(DWORD now, int steady) {
         }
     free(prev); prev = s; nprev = ns; gen = g_structGen;
 }
+// FL is playing the song (its automation moves the params a link targets).
+static int fl_playing(void) {
+    __try { return **(int **)(g_flBase + (FLVA(PLAYING) - IMG_BASE)) != 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 static int auto_target(uint32_t id) {
     int lo = 0, hi, r = 0;
     EnterCriticalSection(&g_autoLock);
@@ -7709,9 +7714,10 @@ static DWORD WINAPI pollThread(LPVOID p) {
             if (v != prev && v != REC_NONE && prev != REC_NONE) {
                 int unit, a, b;
                 Unit *u;
-                if (auto_target(s->id)) {               // a clip / controller drives it: each FL plays its own
+                // a clip / controller drives it: each FL plays its own; moved by hand while stopped, it goes out
+                if (auto_target(s->id) && (fl_playing() || !(active < 0 ? (active = input_recent(now)) : active))) {
                     static DWORD said = 0;
-                    if (now - said > 10000) { said = now; logmsg("PARAM 0x%08x is automated: each FL plays its own, not synced", s->id); }
+                    if (now - said > 10000) { said = now; logmsg("PARAM 0x%08x is automated and moved by FL: each FL plays its own, not synced", s->id); }
                     slot_take(s, g0, v);
                     continue;
                 }
@@ -7876,7 +7882,7 @@ static void pend_put(uint32_t id, uint32_t v) {
 // we already have (join state). Returns 1 if an apply was queued.
 static int route_inbound(uint32_t id, uint32_t v, int onlyIfDiff) {
     if (id == MAIN_VOL_ID) return 0;                  // an older flim still sends its main volume
-    if (auto_target(id)) return 0;                    // (an older flim sends automated values as it plays)
+    if (auto_target(id) && fl_playing()) return 0;    // automated: while this FL plays, its own automation drives it
     if (!add_slot(id)) { pend_put(id, v); return 0; }
     Slot *s = slot_by_id(id);
     if (onlyIfDiff && s && s->last == v) return 0;
