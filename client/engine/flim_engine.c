@@ -284,6 +284,7 @@ static HINSTANCE g_hinst = NULL;
 #define PLREFRESH_VA  FLVA(PLREFRESH) // RefreshPlaylist(form): what FL's clip-properties dialog calls after an edit
 #define HINT_VA       FLVA(HINT)   // ShowHint(form, UnicodeString text, 0): FL's hint bar (top left)
 #define PROJ_FX_MASS  3            // this many effects gone in one scan = project close, not a delete
+#define PROJ_CH_MASS  4            // this many channels / mixer tracks gone in one scan, and most of them: the project
 
 typedef int   (*presetfile_t)(const wchar_t *file, int mask, void *obj, int flags);
 typedef char  (*hasplugin_t)(void *obj);
@@ -2012,11 +2013,20 @@ static void do_struct(void) {
         return;
     }
     if (g_nChKnown > 0) {
-        // Every known channel gone (project load/new/close): not a series of deletes.
-        int k, j, common = 0;
-        for (k = 0; k < g_nChKnown && !common; k++)
-            for (j = 0; j < n; j++) if (items[j] == g_chKnown[k]) { common = 1; break; }
+        // Every known channel gone (project load/new/close), or most of them at once: not a series of deletes.
+        // A cancelled project load leaves FL with one channel (a tester's FL kept channel 0 of 44): sent as 43
+        // deletes, it emptied the leader's song too. Most of the song gone in one tick is the project, not edits:
+        // a member then loads the leader's project again, the leader sends its own.
+        int k, j, common = 0, gone;
+        for (k = 0; k < g_nChKnown; k++)
+            for (j = 0; j < n; j++) if (items[j] == g_chKnown[k]) { common++; break; }
+        gone = g_nChKnown - common;
         if (!common) { proj_begin("channel list replaced"); return; }
+        if (gone >= PROJ_CH_MASS && gone * 2 > g_nChKnown) {
+            logmsg("CHAN %d of %d channels gone at once: FL replaced or emptied the project (a load cancelled?), not sent as deletes", gone, g_nChKnown);
+            proj_begin("most channels gone at once");
+            return;
+        }
     }
     if (closing_now()) return;
     if (!chan_list_changed()) deferSince = 0;
@@ -3139,6 +3149,11 @@ static void mix_struct(void) {
         if (i == n) return;
     }
     n = mix_diff(g_mixKnown, n0, del, &nd, ins, &ni, from);
+    if (nd >= PROJ_CH_MASS && nd * 2 > n0 - 2) {             // (as do_struct's channels: the project, not deletes)
+        logmsg("MIX %d of %d tracks gone at once: FL replaced or emptied the project, not sent as deletes", nd, n0 - 2);
+        proj_begin("most mixer tracks gone at once");
+        return;
+    }
     for (j = 1, i = 1, k = 0; j < n - 1; j++) {             // what del + ins alone gives: old index or -1 (new)
         if (k < ni && ins[k] == j) { after[j] = -1; k++; continue; }
         while (i < n0 - 1 && int_in(del, nd, i)) i++;

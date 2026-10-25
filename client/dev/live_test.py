@@ -397,6 +397,37 @@ def t_chan_order():
     a.call(0x1042800, a.q(a.g(0x15e14a0)), 4, a.d(a.g(0x15e3a60)), 1)   # move selected up
     check('channel reorder', lambda: chan_names(a), lambda: chan_names(b), wait=5)
 
+# A tester cancelled a slow project load: FL kept 1 channel of 44, flim sent 43 deletes and emptied the leader's
+# song too. Most channels gone in one scan is the project: B (a member) loads A's project again, A keeps its channels.
+def call_many(p, pid, fn, arglists):
+    """Call FL function fn (VA) once per (a1, a2, a3) in one main-thread call, so flim's scans see only the end."""
+    import ctypes
+    k = ctypes.windll.kernel32
+    k.OpenProcess.restype = ctypes.c_void_p; k.VirtualAllocEx.restype = ctypes.c_void_p
+    k.VirtualAllocEx.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong, ctypes.c_ulong]
+    k.WriteProcessMemory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p]
+    code = b'\x48\x83\xec\x28'                                                        # sub rsp, 0x28
+    for a1, a2, a3 in arglists:
+        code += b'\xb9' + struct.pack('<I', a1 & 0xffffffff) + b'\xba' + struct.pack('<I', a2 & 0xffffffff)   # mov ecx / mov edx
+        code += b'\x41\xb8' + struct.pack('<I', a3 & 0xffffffff)                     # mov r8d
+        code += b'\x48\xb8' + struct.pack('<Q', p.a(fn)) + b'\xff\xd0'               # mov rax, fn; call rax
+    code += b'\x48\x83\xc4\x28\xc3'                                                   # add rsp, 0x28; ret
+    h = k.OpenProcess(0x1F0FFF, False, pid)
+    mem = k.VirtualAllocEx(h, None, len(code), 0x3000, 0x40)
+    k.WriteProcessMemory(h, mem, code, len(code), None)
+    k.CloseHandle(ctypes.c_void_p(h))
+    return p.call(va(p, mem))
+
+def t_mass_delete():
+    while len(chans(a)) < 7: add_named(a, len(chans(a)), 'Mass%d' % len(chans(a)))
+    check('mass delete: setup', lambda: len(chans(b)), lambda: len(chans(a)), wait=10)
+    n = len(chans(a)); time.sleep(2); pos = os.path.getsize(LOG)
+    call_many(b, B, 0x1004a60, [(i, 0, 3) for i in range(n - 1, 0, -1)])            # all but channel 0, in one go
+    time.sleep(4)
+    check('mass delete: A keeps its channels', lambda: len(chans(a)), lambda: n, wait=0)
+    check('mass delete: B took it as the project', lambda: any('gone at once' in l for l in log_since(pos, B)), lambda: True, wait=0)
+    check('mass delete: B has A\'s channels again', lambda: chan_names(b), lambda: chan_names(a), wait=30)
+
 def t_chan_delete():
     a.call(0x1004a60, len(chans(a)) - 1, 0, 3)
     check('channel delete', lambda: len(chans(a)), lambda: len(chans(b)), wait=5)

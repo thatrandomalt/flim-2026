@@ -862,6 +862,24 @@ made before a structure change reached them still names channels / tracks by the
   clips, while B's FL and any project load size them to the pattern. No op carries that, and a reload
   doesn't fix it (the safety net stops reloading for it; see below).
 
+### An emptied project is not a series of deletes
+A tester's FL (26.1.7.5653) took 134 s to open the leader's project (stuck in plugins); the load was cancelled,
+which leaves FL with one channel (it kept channel 0 of 44) and the template's 18 mixer tracks. `do_struct` only
+took a list with *no* known channel left as a project change, so the 43 missing channels went out as 43
+`chan.del` and the 26 tracks as one `mix.struct`: the leader applied them and its song was emptied too (both
+ended with an "empty shell").
+- Now most of the list gone in one scan is the project, not edits: `PROJ_CH_MASS` (4) or more channels and
+  more than half of them (`do_struct`, "CHAN n of m channels gone at once"), and the same for mixer tracks
+  (`mix_struct`). Nothing is sent; project mode starts (`proj_begin`), and when it settles a member asks for
+  the leader's project ("loaded locally on a member") and the leader sends its own.
+- A member that really deletes most channels at once gets them back from the leader that way: the price of
+  never emptying everyone's song.
+- `live_test` `mass_delete` deletes 6 of 7 channels on B inside one main-thread call (`call_many`: a few
+  instructions written into B, so flim's scans only see the end, as with FL's own reset); one probe call per
+  channel let the scans see them in twos and threes, as ordinary deletes.
+- Still open: a load cancelled *during* the leader's project load settles with that one channel ("settled
+  ... (1 channels)"): not sent anywhere, but the member is out of step until the safety net reloads it.
+
 ### The desync safety net
 Whatever still slips through mustn't stay. Examples: two people changing structure in the same instant, an
 op lost to a crash or a dropped connection, a value FL moved by itself on one side only. So the leader
