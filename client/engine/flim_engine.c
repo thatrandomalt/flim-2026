@@ -8516,6 +8516,9 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
     } else if (strstr(m, "\"t\":\"error\"")) {
         logmsg("server: %.300s", m);
         if (strstr(m, "\"code\":\"bad_password\"")) strcpy_s(g_netErr, sizeof(g_netErr), "Wrong password");
+        if (strstr(m, "\"code\":\"full\"") || strstr(m, "\"code\":\"too_many\"") || strstr(m, "\"code\":\"too_many_failures\"") ||
+            strstr(m, "\"code\":\"rate\"") || strstr(m, "\"code\":\"join_timeout\""))   // the server's limits: it hangs up next
+            json_str(m, "\"msg\":\"", g_netErr, sizeof(g_netErr));
         if (strstr(m, "\"code\":\"kicked\"")) {             // removed by the host: the server hangs up next
             json_str(m, "\"msg\":\"", g_netErr, sizeof(g_netErr));
             InterlockedExchange(&g_kicked, 1);

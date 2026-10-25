@@ -46,6 +46,18 @@ curl http://localhost:8080/health    # -> flim-server ok
 Set `FLIM_PASSWORD` to require a password. If it's not set, the server lets in anyone who
 knows its address (a warning is logged).
 
+Limits (the same in flim's built-in host, `client/launcher/host.c`):
+
+| Variable | Default | |
+|---|---|---|
+| `FLIM_MAX_PEOPLE` | 8 | people per session; someone already in may always reconnect (error `full`) |
+| `FLIM_MAX_CONNS_PER_IP` | 12 | open connections per address (error `too_many`) |
+| `FLIM_FAIL_MAX` | 8 | wrong passwords / sample-store keys per address in 10 minutes, then refused until they're over (error `too_many_failures`; HTTP 429) |
+| `FLIM_RATE_PER_S`, `FLIM_RATE_BURST` | 400, 4000 | messages per connection (token bucket); beyond it the connection is closed (error `rate`) |
+
+A connection that hasn't joined a session after 20 s is closed. `client/dev/server_limits.py
+<host:port> <password> <max people>` checks them all against a fresh server.
+
 ## Deploy to fly.io
 ```bash
 fly auth login

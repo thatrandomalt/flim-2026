@@ -29,6 +29,14 @@
 #define FILE_MAX      (2000ull * 1024 * 1024)
 #define STORE_MAX     (4ull * 1024 * 1024 * 1024)  // sample store size; least recently used go first
 #define HDR_MAX       16384
+// Limits for a server open to the internet (as server/src/server.ts; from upstream flim's public server):
+#define CONNS_PER_IP  12                           // open connections per address (WebSocket and HTTP)
+#define FAIL_MAX      8                            // wrong passwords / sample store keys per address in FAIL_WINDOW_MS:
+#define FAIL_WINDOW_MS (10 * 60 * 1000)            //   then refused until the window has passed
+#define RATE_PER_S    400.0                        // messages per connection (token bucket), burst RATE_BURST;
+#define RATE_BURST    4000.0                       //   beyond it the connection is closed
+#define JOIN_TIMEOUT_MS 20000                      // a WebSocket must join a session this soon
+#define IPS_MAX       512
 
 typedef struct Buf { volatile LONG refs; size_t n; unsigned char d[1]; } Buf;
 typedef struct QNode { Buf *b; struct QNode *next; } QNode;
@@ -45,6 +53,8 @@ typedef struct Client {
     HANDLE qev;
     QNode *qh, *qt;
     size_t queued;
+    double tokens;                                         // message rate (RATE_PER_S / RATE_BURST): its reader thread only
+    DWORD tokensAt, since;                                 // since: connected (JOIN_TIMEOUT_MS)
     struct Client *next;
 } Client;
 
@@ -61,6 +71,66 @@ static wchar_t g_blobDir[MAX_PATH];
 static HWND    g_notify;
 static Ban    *g_ipBans;                            // IP bans: every session on this server (admin_do)
 static volatile LONG g_leaderCtl;                  // the session leader may use the host controls too (host_leader_controls)
+static volatile LONG g_maxPeople = 8;              // people per session, the leader included (host_set_max_people)
+// Per address: open connections and wrong passwords (g_ipLk). A slot is free again once it has neither.
+typedef struct { char ip[64]; int conns, fails; DWORD failSince; } IpEnt;
+static IpEnt   g_ips[IPS_MAX];
+static CRITICAL_SECTION g_ipLk;
+static IpEnt *ip_ent(const char *ip, int create) {         // (caller holds g_ipLk)
+    int i, freeAt = -1;
+    DWORD now = GetTickCount();
+    for (i = 0; i < IPS_MAX; i++) {
+        IpEnt *e = &g_ips[i];
+        if (e->ip[0] && e->fails && now - e->failSince > FAIL_WINDOW_MS) e->fails = 0;
+        if (e->ip[0] && !e->conns && !e->fails) e->ip[0] = 0;
+        if (e->ip[0] && strcmp(e->ip, ip) == 0) return e;
+        if (!e->ip[0] && freeAt < 0) freeAt = i;
+    }
+    if (!create || freeAt < 0) return NULL;
+    memset(&g_ips[freeAt], 0, sizeof(IpEnt));
+    strcpy_s(g_ips[freeAt].ip, sizeof(g_ips[freeAt].ip), ip);
+    return &g_ips[freeAt];
+}
+static int ip_conn_begin(const char *ip) {                 // 0 = too many from there already
+    IpEnt *e;
+    int ok = 1;
+    EnterCriticalSection(&g_ipLk);
+    if ((e = ip_ent(ip, 1)) != NULL) { if (e->conns >= CONNS_PER_IP) ok = 0; else e->conns++; }
+    LeaveCriticalSection(&g_ipLk);
+    return ok;
+}
+static void ip_conn_end(const char *ip) {
+    IpEnt *e;
+    EnterCriticalSection(&g_ipLk);
+    if ((e = ip_ent(ip, 0)) != NULL && e->conns > 0) e->conns--;
+    LeaveCriticalSection(&g_ipLk);
+}
+static int ip_locked(const char *ip) {
+    IpEnt *e;
+    int locked;
+    EnterCriticalSection(&g_ipLk);
+    locked = (e = ip_ent(ip, 0)) != NULL && e->fails >= FAIL_MAX;
+    LeaveCriticalSection(&g_ipLk);
+    return locked;
+}
+static void hlog(const char *fmt, ...);
+static void ip_fail(const char *ip) {
+    IpEnt *e;
+    int n = 0;
+    EnterCriticalSection(&g_ipLk);
+    if ((e = ip_ent(ip, 1)) != NULL) { if (!e->fails) e->failSince = GetTickCount(); n = ++e->fails; }
+    LeaveCriticalSection(&g_ipLk);
+    if (n == FAIL_MAX) hlog("%s: %d wrong passwords, refused for %d min", ip, FAIL_MAX, FAIL_WINDOW_MS / 60000);
+}
+static void peer_ip(SOCKET s, char *out, int cap) {
+    struct sockaddr_storage pa;
+    int pl = sizeof(pa);
+    out[0] = 0;
+    if (getpeername(s, (struct sockaddr *)&pa, &pl) != 0) return;
+    if (pa.ss_family == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&pa)->sin6_addr, out, cap);
+    else inet_ntop(AF_INET, &((struct sockaddr_in *)&pa)->sin_addr, out, cap);
+    if (_strnicmp(out, "::ffff:", 7) == 0) memmove(out, out + 7, strlen(out + 7) + 1);   // IPv4 on the dual-stack socket
+}
 
 // ---------------- log ----------------
 static void hlog(const char *fmt, ...) {
@@ -521,6 +591,19 @@ static Lock *lock_find(Session *s, const char *key) {
 static void on_message(Client *c, char *msg, size_t n) {
     char t[32], m[1200];
     (void)n;
+    {   // message rate: a token bucket per connection (its reader thread is the only one here)
+        DWORD now = GetTickCount();
+        c->tokens += (now - c->tokensAt) / 1000.0 * RATE_PER_S;
+        if (c->tokens > RATE_BURST) c->tokens = RATE_BURST;
+        c->tokensAt = now;
+        if (c->tokens < 1) {
+            hlog("%s: more than %d messages a second, disconnected", c->name[0] ? c->name : c->ip, (int)RATE_PER_S);
+            send_error(c, "rate", "Too many messages: disconnected.");
+            InterlockedExchange(&c->closed, 1); SetEvent(c->qev);
+            return;
+        }
+        c->tokens -= 1;
+    }
     js_str(js_get(msg, "t"), t, sizeof(t));
     EnterCriticalSection(&g_lk);
     if (c->closed) { LeaveCriticalSection(&g_lk); return; }   // removed (kick): nothing of theirs counts any more
@@ -533,9 +616,18 @@ static void on_message(Client *c, char *msg, size_t n) {
         if (u) { js_str(js_get(u, "id"), raw, sizeof(raw)); clean(raw, c->id, 64); js_str(js_get(u, "name"), raw, sizeof(raw)); clean(raw, c->name, 24); }
         if (!c->id[0]) sprintf_s(c->id, sizeof(c->id), "anon-%u", (unsigned)GetTickCount());
         if (!c->name[0]) strcpy_s(c->name, sizeof(c->name), "Anonymous");
+        if (ip_locked(c->ip)) {
+            SecureZeroMemory(pw, sizeof(pw));
+            send_error(c, "too_many_failures", "Too many wrong passwords from your address: try again in a few minutes.");
+            c->id[0] = 0;
+            InterlockedExchange(&c->closed, 1); SetEvent(c->qev);
+            LeaveCriticalSection(&g_lk);
+            return;
+        }
         if (!password_ok(pw)) {
             SecureZeroMemory(pw, sizeof(pw));
-            hlog("wrong password from %s", c->name);
+            ip_fail(c->ip);
+            hlog("wrong password from %s (%s)", c->name, c->ip);
             send_error(c, "bad_password", "Wrong server password.");
             c->id[0] = 0;
             LeaveCriticalSection(&g_lk);
@@ -568,6 +660,23 @@ static void on_message(Client *c, char *msg, size_t n) {
             c->leader = 1;
             hlog("%s started session %s (leader)", c->name, room);
         } else {
+            int others = 0;
+            Client *o, *p;
+            for (o = g_clients; o; o = o->next) {             // people other than this one (a reconnect's old connection
+                if (o->sess != s || strcmp(o->id, c->id) == 0) continue;   // may still be here until it times out)
+                for (p = g_clients; p != o && !(p->sess == s && strcmp(p->id, o->id) == 0); p = p->next) {}
+                if (p == o) others++;
+            }
+            if (others >= g_maxPeople) {
+                char e[120];
+                hlog("%s: %s is full (%ld people), not let in", c->name, room, g_maxPeople);
+                sprintf_s(e, sizeof(e), "The session is full (%ld people).", g_maxPeople);
+                send_error(c, "full", e);
+                c->id[0] = 0;
+                InterlockedExchange(&c->closed, 1); SetEvent(c->qev);
+                LeaveCriticalSection(&g_lk);
+                return;
+            }
             c->sync = ban_find(s->syncs, c->id, c->name, NULL) != NULL;   // sync-only sticks across a reconnect
             hlog("%s joined %s%s", c->name, room, c->sync ? " (sync-only)" : "");
         }
@@ -691,6 +800,7 @@ static void ws_client(SOCKET s, const char *key, const char *pre, size_t pren) {
     }
     c = (Client *)calloc(1, sizeof(Client));
     c->s = s; c->alive = 1; c->refs = 2;
+    c->tokens = RATE_BURST; c->tokensAt = c->since = GetTickCount();
     {
         struct sockaddr_storage pa;
         int pl = sizeof(pa);
@@ -809,7 +919,7 @@ static int read_body(SOCKET s, const char *pre, size_t pren, char *out, size_t n
 }
 
 static void http_request(SOCKET s, const char *method, const char *path, uint64_t clen, int hasLen,
-                         const char *key, const char *pre, size_t pren) {
+                         const char *key, const char *pre, size_t pren, const char *ip) {
     unsigned char kh[32], wh[32];
     char hex[65];
     if (strcmp(path, "/health") == 0 || strcmp(path, "/") == 0) { http_resp(s, 200, "text/plain", "flim-server ok\n", 15); return; }
@@ -818,9 +928,10 @@ static void http_request(SOCKET s, const char *method, const char *path, uint64_
         return;
     }
     if (g_hasPw) {                                        // x-flim-key = sha256 hex of the password
+        if (ip_locked(ip)) { http_resp(s, 429, "text/plain", "", 0); return; }   // (wrong passwords: refused a while)
         sha256(key, strlen(key), kh);
         sha256(g_keyHex, 64, wh);
-        if (!same32(kh, wh)) { http_resp(s, 401, "text/plain", "", 0); return; }
+        if (!same32(kh, wh)) { ip_fail(ip); http_resp(s, 401, "text/plain", "", 0); return; }
     }
     if (strcmp(path, "/blobs/missing") == 0) {
         char *body, *out, *tok, *ctx = NULL;
@@ -925,8 +1036,9 @@ static int hdr_get(const char *hdrs, const char *name, char *out, int cap) {
 
 static DWORD WINAPI conn_thread(LPVOID p) {
     SOCKET s = (SOCKET)(uintptr_t)p;
-    char *buf = (char *)malloc(HDR_MAX + 1), *end = NULL, method[16] = "", path[600] = "", v[300];
+    char *buf = (char *)malloc(HDR_MAX + 1), *end = NULL, method[16] = "", path[600] = "", v[300], ip[64];
     int n = 0;
+    peer_ip(s, ip, sizeof(ip));                           // (accept_thread counted it: ip_conn_end below)
     DWORD to = 15000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));   // a request has 15 s to arrive
     while (n < HDR_MAX) {
@@ -952,12 +1064,13 @@ static DWORD WINAPI conn_thread(LPVOID p) {
             hdr_get(buf, "x-flim-key", key, sizeof(key));
             to = 120000;                                  // big uploads: generous per-read timeout
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&to, sizeof(to));
-            http_request(s, method, path, hasLen ? _strtoui64(cl, NULL, 10) : 0, hasLen, key, pre, pren);
+            http_request(s, method, path, hasLen ? _strtoui64(cl, NULL, 10) : 0, hasLen, key, pre, pren, ip);
             shutdown(s, SD_SEND);
             closesocket(s);
         }
     } else closesocket(s);
     free(buf);
+    ip_conn_end(ip);
     return 0;
 }
 
@@ -966,9 +1079,17 @@ static DWORD WINAPI accept_thread(LPVOID p) {
     while (g_run) {
         SOCKET c = accept(g_ls, NULL, NULL);
         HANDLE t;
+        char ip[64];
         if (c == INVALID_SOCKET) { if (!g_run) break; Sleep(50); continue; }
+        peer_ip(c, ip, sizeof(ip));
+        if (!ip_conn_begin(ip)) {                         // one address can't fill the machine with connections (threads)
+            static DWORD said;
+            if (GetTickCount() - said > 10000) { said = GetTickCount(); hlog("%s: more than %d connections, refused", ip, CONNS_PER_IP); }
+            closesocket(c);
+            continue;
+        }
         t = CreateThread(NULL, 0, conn_thread, (LPVOID)(uintptr_t)c, 0, NULL);
-        if (t) CloseHandle(t); else closesocket(c);
+        if (t) CloseHandle(t); else { closesocket(c); ip_conn_end(ip); }
     }
     return 0;
 }
@@ -1006,6 +1127,7 @@ static DWORD WINAPI timer_thread(LPVOID p) {
             EnterCriticalSection(&g_lk);
             for (c = g_clients; c; c = c->next) {
                 if (!c->alive) { shutdown(c->s, SD_BOTH); continue; }   // no pong / message since the last ping
+                if (!c->sess && now - c->since > JOIN_TIMEOUT_MS) { shutdown(c->s, SD_BOTH); continue; }   // never joined
                 c->alive = 0;
                 enqueue(c, ping);
             }
@@ -1018,6 +1140,7 @@ static DWORD WINAPI timer_thread(LPVOID p) {
 
 // ---------------- public ----------------
 int host_running(void) { return g_run != 0; }
+void host_set_max_people(int n) { InterlockedExchange(&g_maxPeople, n < 2 ? 2 : n > 64 ? 64 : n); }
 
 int host_start(int port, const char *password, HWND notify, char *err, int errcap) {
     WSADATA wd;
@@ -1025,7 +1148,7 @@ int host_start(int port, const char *password, HWND notify, char *err, int errca
     int no = 0, yes = 1;
     struct sockaddr_in6 a6;
     if (g_run) return 1;
-    if (!g_lkInit) { InitializeCriticalSection(&g_lk); g_lkInit = 1; }
+    if (!g_lkInit) { InitializeCriticalSection(&g_lk); InitializeCriticalSection(&g_ipLk); g_lkInit = 1; }
     WSAStartup(MAKEWORD(2, 2), &wd);
     g_notify = notify;
     g_hasPw = password && password[0];
@@ -1188,7 +1311,7 @@ int host_admin(const char *action, const char *id, int on, char *err, int errcap
 
 void host_leader_controls(int on) {
     Session *s;
-    if (!g_lkInit) { InitializeCriticalSection(&g_lk); g_lkInit = 1; }
+    if (!g_lkInit) { InitializeCriticalSection(&g_lk); InitializeCriticalSection(&g_ipLk); g_lkInit = 1; }
     EnterCriticalSection(&g_lk);
     if (InterlockedExchange(&g_leaderCtl, on) != on) {
         hlog(on ? "the session leader can use the host controls too" : "only this PC can use the host controls");

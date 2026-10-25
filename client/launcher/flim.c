@@ -944,6 +944,22 @@ static void main_host_status(HWND dlg, const wchar_t *extra) {
                extra ? L"\n" : L"", extra ? extra : L"");
     SetDlgItemTextW(dlg, IDC_H_STATUS, s);
 }
+// "Max people": people per session on the built-in host (2..64, default 8; flim.ini host_max_people). Applies at once,
+// also while hosting (to whoever joins next).
+static void max_people_apply(HWND dlg) {
+    wchar_t v[16];
+    int n;
+    GetDlgItemTextW(dlg, IDC_H_MAXPEOPLE, v, 16);
+    n = _wtoi(v);
+    if (n < 2 || n > 64) {
+        n = n < 2 ? (v[0] ? 2 : 8) : 64;
+        swprintf_s(v, 16, L"%d", n);
+        SetDlgItemTextW(dlg, IDC_H_MAXPEOPLE, v);
+    }
+    swprintf_s(v, 16, L"%d", n);
+    flimcfg_set(L"host_max_people", n == 8 ? NULL : v);
+    host_set_max_people(n);
+}
 static void main_host_controls(HWND dlg, int on) {
     static const int ids[] = { IDC_H_PORT, IDC_H_PW, IDC_H_UPNP, IDC_H_ALSOFL };
     int i;
@@ -1049,6 +1065,7 @@ static void main_host_start(HWND dlg) {
     if (!pw[0] && MessageBoxW(dlg, L"Host without a password? Anyone who has the address could join.", L"flim",
                               MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
     wide_to_utf8(pw, pwu, sizeof(pwu));
+    max_people_apply(dlg);
     if (!host_start(port, pwu, dlg, err, sizeof(err))) {
         wchar_t w[200];
         MultiByteToWideChar(CP_UTF8, 0, err, -1, w, 200);
@@ -1405,6 +1422,9 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         CheckDlgButton(dlg, IDC_J_REMEMBER, v[0] ? BST_CHECKED : BST_UNCHECKED);
         SecureZeroMemory(v, sizeof(v));
         flimcfg_get(L"host_port", v, 512); SetDlgItemTextW(dlg, IDC_H_PORT, v[0] ? v : L"8080");
+        flimcfg_get(L"host_max_people", v, 512); SetDlgItemTextW(dlg, IDC_H_MAXPEOPLE, v[0] ? v : L"8");
+        SendDlgItemMessageW(dlg, IDC_H_MAXPEOPLE, EM_LIMITTEXT, 2, 0);
+        max_people_apply(dlg);
         secret_get_w(L"host_pw", v, 512); SetDlgItemTextW(dlg, IDC_H_PW, v);
         SecureZeroMemory(v, sizeof(v));
         flimcfg_get(L"host_upnp", v, 512); CheckDlgButton(dlg, IDC_H_UPNP, wcscmp(v, L"0") ? BST_CHECKED : BST_UNCHECKED);
@@ -1550,6 +1570,9 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         case IDC_M_BACKUP:
             flimcfg_set(L"backup_on", IsDlgButtonChecked(dlg, IDC_M_BACKUP) ? L"1" : L"0");
             engine_send(dlg, GUI_SETTINGS, NULL);
+            return TRUE;
+        case IDC_H_MAXPEOPLE:
+            if (HIWORD(wp) == EN_KILLFOCUS) max_people_apply(dlg);
             return TRUE;
         case IDC_M_BACKUPMIN: {          // like the lock seconds: valid values saved as typed
             int on;

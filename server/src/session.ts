@@ -52,6 +52,12 @@ export class Session {
   get size(): number {
     return this.clients.size;
   }
+  // People other than `id` (distinct ids: a reconnect's old connection may still be here until it times out).
+  othersThan(id: string): number {
+    const ids = new Set<string>();
+    for (const c of this.clients) if (c.user.id !== id) ids.add(c.user.id);
+    return ids.size;
+  }
 
   private peers(): PeerInfo[] {
     return [...this.clients].map((c) => ({ id: c.user.id, name: c.user.name, role: c.role, ...(c.sync ? { sync: true as const } : {}) }));

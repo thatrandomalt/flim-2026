@@ -84,12 +84,14 @@ function readBody(req: http.IncomingMessage, max: number): Promise<string | null
 }
 
 // Returns true if the request was a blob request (handled).
-export function handleBlob(req: http.IncomingMessage, res: http.ServerResponse, password: string): boolean {
+// onBadKey: a wrong key (counted with the wrong passwords per IP, server.ts).
+export function handleBlob(req: http.IncomingMessage, res: http.ServerResponse, password: string, onBadKey?: () => void): boolean {
   const url = (req.url ?? "").split("?")[0];
   const m = /^\/blob\/([0-9a-f]{64})$/.exec(url);
   const isMissing = url === "/blobs/missing";
   if (!m && !isMissing) return false;
   if (!keyOk(req, password)) {
+    onBadKey?.();
     res.writeHead(401);
     res.end();
     req.resume();

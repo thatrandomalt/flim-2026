@@ -18,6 +18,8 @@ int  host_people(HostPerson *out, int max);
 int  host_admin(const char *action, const char *id, int on, char *err, int errcap);
 // 1: the session leader may use the host controls too (from their flim window). Default 0.
 void host_leader_controls(int on);
+// People per session, the leader included (2..64). Default 8; flim.ini host_max_people.
+void host_set_max_people(int n);
 // This PC's address on its local network (the interface that reaches the internet). 0 = none.
 int  host_lan_ip(wchar_t *out, int cap);
 // Ask the router (UPnP) to forward TCP `port` to this PC (add=1) or stop (add=0). Blocks for a few

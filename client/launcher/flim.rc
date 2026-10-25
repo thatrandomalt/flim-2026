@@ -61,7 +61,9 @@ BEGIN
     EDITTEXT        IDC_H_PW, 118, 123, 110, 13, ES_AUTOHSCROLL | ES_PASSWORD
     PUSHBUTTON      "Start hosting", IDC_H_START, 270, 122, 56, 15
     AUTOCHECKBOX    "Open the port on my router automatically (UPnP), so people outside my network can join", IDC_H_UPNP, 14, 141, 312, 10
-    AUTOCHECKBOX    "Also open FL on this PC and join", IDC_H_ALSOFL, 14, 154, 312, 10
+    AUTOCHECKBOX    "Also open FL on this PC and join", IDC_H_ALSOFL, 14, 154, 190, 10
+    LTEXT           "Max people:", -1, 214, 155, 44, 10
+    EDITTEXT        IDC_H_MAXPEOPLE, 260, 153, 26, 13, ES_NUMBER
     LTEXT           "Not hosting.", IDC_H_STATUS, 14, 169, 312, 36
     LTEXT           "Address to give the others:", -1, 14, 209, 120, 10
     EDITTEXT        IDC_H_SHARE, 14, 220, 256, 13, ES_AUTOHSCROLL | ES_READONLY

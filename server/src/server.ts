@@ -11,6 +11,35 @@ const MAX_PAYLOAD = 64 * 1024 * 1024; // 64 MB — an .flp snapshot in base64
 const PASSWORD = process.env.FLIM_PASSWORD ?? "";
 if (!PASSWORD) console.warn("FLIM_PASSWORD is not set: anyone who knows the URL can join.");
 
+// Limits for a server open to the internet (from upstream flim's public server):
+// open WebSockets per IP, so one visitor can't fill the machine;
+const MAX_CONNS_PER_IP = Number(process.env.FLIM_MAX_CONNS_PER_IP ?? 12);
+// wrong passwords (WebSocket or sample store key) per IP: after FAIL_MAX in FAIL_WINDOW_MS that IP is refused
+// until the window has passed, so a password can't be guessed by reconnecting;
+const FAIL_MAX = Number(process.env.FLIM_FAIL_MAX ?? 8);
+const FAIL_WINDOW_MS = 10 * 60_000;
+// messages per connection, a token bucket (RATE_PER_S, burst RATE_BURST): beyond it the connection is closed;
+// flim's own traffic (cursors every 50 ms, bursts of edits) stays far below it;
+const RATE_PER_S = Number(process.env.FLIM_RATE_PER_S ?? 400);
+const RATE_BURST = Number(process.env.FLIM_RATE_BURST ?? 4000);
+// people per session (the leader included), and how soon a connection must host / join.
+const MAX_PEOPLE = Number(process.env.FLIM_MAX_PEOPLE ?? 8);
+const JOIN_TIMEOUT_MS = 20_000;
+
+const fails = new Map<string, { n: number; since: number }>(); // ip -> wrong passwords in the current window
+function failCount(ip: string): number {
+  const f = fails.get(ip);
+  if (f && Date.now() - f.since > FAIL_WINDOW_MS) { fails.delete(ip); return 0; }
+  return f ? f.n : 0;
+}
+function failRecord(ip: string): void {
+  const f = fails.get(ip);
+  if (!f || Date.now() - f.since > FAIL_WINDOW_MS) fails.set(ip, { n: 1, since: Date.now() });
+  else f.n++;
+  if (failCount(ip) === FAIL_MAX) console.log(`[auth] ${ip}: ${FAIL_MAX} wrong passwords, refused for ${FAIL_WINDOW_MS / 60_000} min`);
+}
+const connsPerIp = new Map<string, number>();
+
 function passwordOk(given: unknown): boolean {
   if (!PASSWORD) return true;
   const h = (v: string) => crypto.createHash("sha256").update(v, "utf8").digest();
@@ -30,7 +59,14 @@ function makeCode(): string {
 // Health check for the Fly proxy (TCP connect here also wakes a stopped machine), and the
 // sample file store (blobs.ts).
 const httpServer = http.createServer((req, res) => {
-  if (handleBlob(req, res, PASSWORD)) return;
+  const ip = clientIp(req);
+  if (req.url?.startsWith("/blob") && failCount(ip) >= FAIL_MAX) {   // (locked out: the store's key is the password too)
+    res.writeHead(429);
+    res.end();
+    req.resume();
+    return;
+  }
+  if (handleBlob(req, res, PASSWORD, () => failRecord(ip))) return;
   if (req.url === "/health" || req.url === "/") {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("flim-server ok\n");
@@ -46,11 +82,26 @@ const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_PAYLOAD })
 interface Conn {
   client?: Client;
   session?: Session;
+  tokens: number;      // message rate (RATE_PER_S / RATE_BURST)
+  tokensAt: number;
+}
+function rateOk(conn: Conn): boolean {
+  const now = Date.now();
+  conn.tokens = Math.min(RATE_BURST, conn.tokens + ((now - conn.tokensAt) / 1000) * RATE_PER_S);
+  conn.tokensAt = now;
+  if (conn.tokens < 1) return false;
+  conn.tokens -= 1;
+  return true;
 }
 const conns = new WeakMap<WebSocket, Conn>();
 
 function fail(ws: WebSocket, code: string, msg: string): void {
   send(ws, { t: "error", code, msg });
+}
+function full(ws: WebSocket, code: string): void {
+  console.log(`[${code}] full (${MAX_PEOPLE} people): refused`);
+  fail(ws, "full", `The session is full (${MAX_PEOPLE} people).`);
+  setTimeout(() => ws.close(4004, "full"), 200);
 }
 
 // The address a connection comes from (IP bans). Behind fly.io's proxy, the one it reports (FLY_APP_NAME is set
@@ -62,23 +113,47 @@ function clientIp(req: http.IncomingMessage): string {
 
 wss.on("connection", (ws, req) => {
   const ip = clientIp(req);
-  conns.set(ws, {});
+  const n = (connsPerIp.get(ip) ?? 0) + 1;
+  connsPerIp.set(ip, n);
+  conns.set(ws, { tokens: RATE_BURST, tokensAt: Date.now() });
   (ws as any).isAlive = true;
   ws.on("pong", () => ((ws as any).isAlive = true));
+  if (n > MAX_CONNS_PER_IP) {
+    console.log(`[limit] ${ip}: more than ${MAX_CONNS_PER_IP} connections, refused`);
+    fail(ws, "too_many", "Too many connections from your address.");
+    ws.close(4008, "too_many");
+  } else if (failCount(ip) >= FAIL_MAX) {
+    fail(ws, "too_many_failures", "Too many wrong passwords from your address: try again in a few minutes.");
+    ws.close(4001, "too_many_failures");
+  }
+  const joinTimer = setTimeout(() => { if (!conns.get(ws)?.session) ws.close(4002, "join_timeout"); }, JOIN_TIMEOUT_MS);
 
   ws.on("message", (raw) => {
+    const conn = conns.get(ws);
+    if (!conn) return;
+    if (!rateOk(conn)) {
+      console.log(`[limit] ${conn.client?.user.name ?? ip}: more than ${RATE_PER_S} messages a second, disconnected`);
+      fail(ws, "rate", "Too many messages: disconnected.");
+      ws.close(4008, "rate");
+      return;
+    }
     let msg: ClientMsg;
     try {
       msg = JSON.parse(raw.toString());
     } catch {
       return fail(ws, "bad_json", "Malformed message.");
     }
-    const conn = conns.get(ws)!;
 
     // ---- pre-session messages ----
     if (!conn.session) {
+      if ((msg.t === "host" || msg.t === "join" || msg.t === "join_room") && failCount(ip) >= FAIL_MAX) {
+        fail(ws, "too_many_failures", "Too many wrong passwords from your address: try again in a few minutes.");
+        ws.close(4001, "too_many_failures");
+        return;
+      }
       if ((msg.t === "host" || msg.t === "join" || msg.t === "join_room") && !passwordOk(msg.password)) {
-        console.log(`[auth] wrong password from ${sanitizeUser(msg.user).name}`);
+        failRecord(ip);
+        console.log(`[auth] wrong password from ${sanitizeUser(msg.user).name} (${ip})`);
         fail(ws, "bad_password", "Wrong server password.");
         // a little delay makes guessing slow; then hang up
         setTimeout(() => ws.close(4001, "bad_password"), 1000);
@@ -98,6 +173,7 @@ wss.on("connection", (ws, req) => {
         if (!session) return fail(ws, "no_session", "Session not found.");
         const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true, ip };
         if (session.isBanned(client.user, ip)) return fail(ws, "kicked", "You were removed from this session. The host can let you back in");
+        if (session.othersThan(client.user.id) >= MAX_PEOPLE) return full(ws, session.code);
         conn.client = client;
         conn.session = session;
         session.add(client);
@@ -123,6 +199,7 @@ wss.on("connection", (ws, req) => {
             setTimeout(() => ws.close(4003, "kicked"), 200);
             return;
           }
+          if (session.othersThan(client.user.id) >= MAX_PEOPLE) return full(ws, code);
           conn.client = client;
           conn.session = session;
           session.add(client);
@@ -170,6 +247,10 @@ wss.on("connection", (ws, req) => {
 
   ws.on("close", () => {
     const conn = conns.get(ws);
+    const left = (connsPerIp.get(ip) ?? 1) - 1;
+    if (left > 0) connsPerIp.set(ip, left);
+    else connsPerIp.delete(ip);
+    clearTimeout(joinTimer);
     if (conn?.client) console.log(`[disconnect] ${conn.client.user.name}`);
     conn?.session?.remove(ws);
     conns.delete(ws);
@@ -209,6 +290,7 @@ const ping = setInterval(() => {
 // Lock TTL safety sweep.
 const sweep = setInterval(() => {
   for (const s of sessions.values()) s.sweepLocks();
+  for (const ip of [...fails.keys()]) failCount(ip);   // (drops windows that have passed)
 }, 5_000);
 
 wss.on("close", () => {

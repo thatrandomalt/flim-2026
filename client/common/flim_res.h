@@ -34,6 +34,7 @@
 #define IDC_H_STATUS     1125
 #define IDC_H_SHARE      1126
 #define IDC_H_COPY       1127
+#define IDC_H_MAXPEOPLE  1129      // people per session (the built-in host), flim.ini host_max_people
 #define IDC_H_LEADERCTL  1128      // the session leader may use the people controls too (hosting without FL here)
 #define IDC_PL_LIST      1150      // people in the session (host controls)
 #define IDC_PL_HOST      1151      //   make the selected person the session leader (asks first)

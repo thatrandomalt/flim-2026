@@ -335,6 +335,18 @@ See [`server/README.md`](server/README.md) for the protocol and options.
 - **Password:** set `FLIM_PASSWORD`. If it isn't set, the server lets in anyone who knows its address
   (fine for testing on your own PC, not for a public server). A wrong password is rejected right away.
 - **Port:** 8080 by default; set `PORT` to change it.
+- **Limits** (both servers, for one open to the internet):
+  - **People per session:** 8 by default. Set `FLIM_MAX_PEOPLE` on the Node server; on the built-in host
+    it's **Max people** in the Host section of flim's window (2–64, applies at once, also while hosting).
+    Someone already in the session can always reconnect.
+  - **Connections per address:** at most 12 open at once (`FLIM_MAX_CONNS_PER_IP`).
+  - **Wrong passwords:** after 8 from one address within 10 minutes, that address is refused until the
+    10 minutes are over, even with the right password (`FLIM_FAIL_MAX`). Wrong sample-store keys count
+    too.
+  - **Message rate:** a connection sending more than 400 messages a second for long (bursts up to 4000)
+    is disconnected (`FLIM_RATE_PER_S`, `FLIM_RATE_BURST`). flim's own traffic stays far below that.
+  - **Joining:** a connection must join a session within 20 seconds.
+  - Whoever hits a limit gets a message saying which one in flim's window.
 - **Encryption:** the server speaks plain `ws://`. For `wss://`, put it behind any reverse proxy that
   handles HTTPS and WebSockets (Caddy, nginx, a cloud load balancer, ...) and forward to port 8080.
   The proxy must pass plain HTTP requests too (sample files use `/blob/...` on the same port) and allow
