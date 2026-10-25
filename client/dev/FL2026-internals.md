@@ -644,6 +644,10 @@ the structure op:
   - a new channel's / track's values aren't watched until `rescan` adds them (`RESCAN_MS`), and `rescan`
     takes what they are then as their start: an edit made on a just-inserted track was never sent.
     `chan_rebase` / `mix_rebaseline` now ask for a rescan on the next tick (`g_rescanNow`).
+    That rescan runs on the poll thread, which skips it while the main thread is in a flim task, so in a
+    busy session the gap stayed (`stress`, both: a volume set on a just-inserted track never went out).
+    Now `chan_rebase` / `mix_rebaseline` watch a new channel's / track's values themselves, on the main
+    thread, from FL's defaults (`watch_channel`, `watch_track`; `add_slot` re-checks under its lock).
   - the same for a track's name: routing a channel to a new mixer track ("route to free track") inserts
     the track already named after the channel. `meta_remap` took a new track's name and color as known,
     so the name never went out and the others kept FL's default: "mixer names differ" and a reload after
@@ -877,8 +881,12 @@ ended with an "empty shell").
 - `live_test` `mass_delete` deletes 6 of 7 channels on B inside one main-thread call (`call_many`: a few
   instructions written into B, so flim's scans only see the end, as with FL's own reset); one probe call per
   channel let the scans see them in twos and threes, as ordinary deletes.
-- Still open: a load cancelled *during* the leader's project load settles with that one channel ("settled
-  ... (1 channels)"): not sent anywhere, but the member is out of step until the safety net reloads it.
+- A load of the *leader's* project cancelled half-way settled with that one channel ("settled ... (1
+  channels)") and the ops held during the load were replayed onto it. `do_projload` now counts the file's
+  channels (FLP event 64, one per channel); if FL ends the load with fewer than half (and the file has
+  `PROJ_CH_MASS`+), `do_projdone` loads it again once ("FL ended its load with n (cancelled?): loading it
+  again"). A second time in a row the user gets a popup instead (they may be stopping it on purpose) and
+  "Resync from host..." is theirs to press (`live_test` `short_load`).
 
 ### The desync safety net
 Whatever still slips through mustn't stay. Examples: two people changing structure in the same instant, an

@@ -520,6 +520,7 @@ static int add_slot(uint32_t id) {
     uint32_t v = read_value(id);
     if (v == REC_NONE) return 0;
     EnterCriticalSection(&g_slotLock);
+    if (slot_by_id(id)) { LeaveCriticalSection(&g_slotLock); return 1; }   // (the main thread's watch_* and rescan)
     if (g_nslot < MAX_SLOTS) {
         Slot *s = &g_slots[g_nslot];
         memset(s, 0, sizeof(*s));
@@ -537,6 +538,19 @@ static int add_slot(uint32_t id) {
     return 1;
 }
 
+// A track / channel just inserted (here or by a peer): its values watched at once, from FL's defaults. Left to the
+// poll thread's rescan (which waits while the main thread is in a flim task), a value set meanwhile became its start
+// and was never sent (live_test stress: a volume on a new track stayed on one FL). Its plugins come with rescan.
+static void watch_track(int t) {
+    int k, sl;
+    for (k = 0; k < (int)(sizeof(MIX_SUBS) / sizeof(MIX_SUBS[0])); k++) add_slot(MIX_ID(t, MIX_SUBS[k]));
+    add_slot(MUTE_ID(t));
+    for (sl = 0; sl < MAX_FX_SLOTS; sl++) { add_slot(SLOTGEN_ID(t, sl, 0)); add_slot(SLOTGEN_ID(t, sl, 1)); }
+}
+static void watch_channel(int c) {
+    int k;
+    for (k = 0; k < NSUB; k++) add_slot(((uint32_t)c << 16) | SUBS[k]);
+}
 // Discover channels, plugins and mixer slots; extend param ranges that grew.
 // Cheap enough to run every few seconds (only probes past known ranges).
 static void rescan(void) {
@@ -1069,6 +1083,7 @@ static uint64_t fnv64(const unsigned char *p, size_t n) {
     return h ? h : 1;
 }
 
+#define EV_NEWCHAN       64        // one per channel (word: its index)
 #define EV_PLUGNAME      201
 #define EV_NEWPLUGIN     212
 #define EV_SAMPLE_PATH   196
@@ -3126,6 +3141,7 @@ static void mix_rebaseline(const int *from, int n) {
     (void)i;
     plug_agreed_reset(0, 1);
     slots_rebase(NULL, 0, from, n);                          // values, names, colors and sends go with their tracks,
+    for (t = 0; t < n; t++) if (from[t] < 0) watch_track(t);
     meta_remap(M_MIX, from, n);                              // so edits made in the same moment still go out
     meta_remap(M_ROUTE, from, n);
     ulock_release_moved("plug:fx:", NULL, from, n);
@@ -4007,6 +4023,9 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
 static volatile LONG  g_inHook = 0;
 static volatile LONG  g_projBusy = 0;          // project mode
 static volatile LONG  g_projRemote = 0;        // member: loading the leader's project
+static volatile LONG  g_projExpectCh = 0;      //   how many channels its file has (do_projload; 0 = not known)
+static int            g_projShortLoads = 0;    //   loads of it in a row that FL ended with most channels missing
+static volatile DWORD g_resyncAt;              // (resync)
 static volatile DWORD g_projAskedAt = 0;       // member: asked for it (state.req: join, re-sync), until it comes
 #define PROJ_ASK_MAX_MS 15000                  // (no answer by then: let the user work again)
 // Member: the leader's project is on its way or loading. What the user does meanwhile would be lost to the
@@ -4301,7 +4320,27 @@ static void do_projdone(void) {
     }
     if (closing_now()) { logmsg("PROJECT settled while FL is closing: nothing sent"); proj_end(); return; }
     logmsg("PROJECT settled after %lu ms (%d channels, %ld params)", GetTickCount() - g_projSince, g_nChKnown, g_nslot);
-    if (remote) { g_replayAt = GetTickCount(); InterlockedExchange(&g_replaying, 1); proj_end(); replay_held(); member_reloading(); return; }
+    if (remote && g_projExpectCh >= PROJ_CH_MASS && g_nChKnown * 2 < g_projExpectCh) {
+        // FL ended the load with most of the song missing: cancelled half-way (a tester's slow load stopped at 1 of 44
+        // channels). Replaying the others' ops onto it only got it further out of step. Loaded again once; a second
+        // time, the user is told (they may be cancelling on purpose) and "Resync from host" is theirs to press.
+        int expect = g_projExpectCh;
+        proj_end();
+        if (++g_projShortLoads <= 1) {
+            logmsg("PROJECT the leader's project has %d channels, FL ended its load with %d (cancelled?): loading it again", expect, g_nChKnown);
+            g_resyncAt = 0;
+            resync("the leader's project didn't load completely");
+        } else {
+            char a[400];
+            g_projShortLoads = 0;
+            logmsg("PROJECT the leader's project has %d channels, FL ended its load with %d again: not loading it a third time", expect, g_nChKnown);
+            sprintf_s(a, sizeof(a), "The session's project didn't finish loading in FL (it has %d channels, FL ended with %d). "
+                      "If the load was stopped, press \"Resync from host...\" in flim's window when you're ready to load it.", expect, g_nChKnown);
+            gui_push(GUI_ALERT, a);
+        }
+        return;
+    }
+    if (remote) { g_projShortLoads = 0; g_replayAt = GetTickCount(); InterlockedExchange(&g_replaying, 1); proj_end(); replay_held(); member_reloading(); return; }
     proj_end();
     if (g_isLeader) leader_project_loaded();
     else {
@@ -4342,12 +4381,24 @@ static void leader_name_project(void) {
 }
 
 // Member: open the leader's project. it->path = UTF-16 path of the received file.
+static int newchan_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end) {
+    (void)p; (void)n; (void)at; (void)end;
+    if (id == EV_NEWCHAN) (*(int *)ctx)++;
+    return 1;
+}
 static void do_projload(const QItem *it) {
     const wchar_t *path = (const wchar_t *)it->path;
     void *form = fl_form(), *proj = fl_project();
     char r = 0;
     DWORD t0 = GetTickCount();
     if (!form || !proj) { logmsg("PROJECT load: FL objects not found"); return; }
+    {   // how many channels it has: a load cancelled half-way ends with fewer (do_projdone)
+        size_t n = 0;
+        unsigned char *d = read_file_w(path, &n);
+        int c = 0;
+        if (d) { flp_walk(d, n, newchan_cb, &c); free(d); }
+        InterlockedExchange(&g_projExpectCh, c);
+    }
     wchar_t *w = dstr_keep(path);
     __try {
         ((formfn_t)(g_flBase + (BUSYBEGIN_VA - IMG_BASE)))(form);
@@ -4368,7 +4419,7 @@ static void do_projload(const QItem *it) {
 // net, minutes later): it goes out when its turn comes (resync_tick), unless the leader's project arrives
 // first (on_project_load), which covers it.
 static volatile LONG g_resyncPending = 0;
-static volatile DWORD g_resyncAt = 0;
+static volatile DWORD g_resyncAt = 0;   // (declared with g_projRemote)
 static void resync(const char *why) {
     DWORD now = GetTickCount();
     if ((g_resyncAt && now - g_resyncAt < RESYNC_MS) || (g_isLeader && g_projBusy)) {
@@ -4971,7 +5022,9 @@ static void notes_remap(const int *from, int n) {
 }
 
 static void chan_rebase(const int *from, int n) {
+    int i;
     slots_rebase(from, n, NULL, 0);
+    for (i = 0; i < n; i++) if (from[i] < 0) watch_channel(i);
     meta_remap(M_CHAN, from, n);
     notes_remap(from, n);
     ulock_release_moved("plug:ch:", "pat:", from, n);

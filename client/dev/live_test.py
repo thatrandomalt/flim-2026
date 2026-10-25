@@ -428,6 +428,21 @@ def t_mass_delete():
     check('mass delete: B took it as the project', lambda: any('gone at once' in l for l in log_since(pos, B)), lambda: True, wait=0)
     check('mass delete: B has A\'s channels again', lambda: chan_names(b), lambda: chan_names(a), wait=30)
 
+# A load of the leader's project that FL ends with most channels missing (cancelled half-way): loaded again once.
+# Here: B's re-sync is set off as in mass_delete, then most channels go again right after FL opened it (inside the
+# settle window), as a stopped load leaves them.
+def t_short_load():
+    while len(chans(a)) < 7: add_named(a, len(chans(a)), 'Short%d' % len(chans(a)))
+    check('short load: setup', lambda: len(chans(b)), lambda: len(chans(a)), wait=10)
+    n = len(chans(a)); time.sleep(2); pos = os.path.getsize(LOG)
+    call_many(b, B, 0x1004a60, [(i, 0, 3) for i in range(n - 1, 0, -1)])
+    t0 = time.time()
+    while time.time() - t0 < 20 and not any('PROJECT opened' in l for l in log_since(pos, B)): time.sleep(0.05)
+    call_many(b, B, 0x1004a60, [(i, 0, 3) for i in range(len(chans(b)) - 1, 0, -1)])
+    check("short load: B saw it didn't load completely", lambda: any("didn't load completely" in l or 'loading it again' in l for l in log_since(pos, B)), lambda: True, wait=15)
+    check("short load: B has A's channels", lambda: chan_names(b), lambda: chan_names(a), wait=30)
+    check('short load: A kept its channels', lambda: len(chans(a)), lambda: n, wait=0)
+
 def t_chan_delete():
     a.call(0x1004a60, len(chans(a)) - 1, 0, 3)
     check('channel delete', lambda: len(chans(a)), lambda: len(chans(b)), wait=5)
