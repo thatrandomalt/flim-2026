@@ -53,6 +53,7 @@ samples) is kept in sync over the internet. It works a bit like [Drawpile](https
 | Notes in every pattern; pattern names, colors and length (so new patterns too) | |
 | Inserting, cloning, deleting and splitting patterns (later patterns move along) | |
 | Playlist clips; playlist track names and colors | |
+| Arrangements: adding, cloning, deleting and renaming them (everyone stays on their own arrangement and pattern, also when the leader's project is loaded again) | |
 | Playlist markers (including time signature markers); the project's time signature | |
 | Time signatures of single patterns (pattern menu) and piano roll markers | |
 | Automation clips, with their links to what they automate (made, cloned, added or removed in the session too), and the links of internal controllers (Peak, Formula...) | |
@@ -83,13 +84,19 @@ row reloads the leader's project, at most every 2 minutes.
 
 **What isn't an edit:** values that move by themselves (automation playing back, a Patcher preset's
 own modulation, controllers linked inside FL) happen the same way on every PC, so flim only syncs a
-change when someone is using FL (a click or key press in the last 1.5 s). A knob an automation clip
-or controller drives is never synced: each FL plays its own automation, so one person playing the
-song doesn't move everyone's knob. Changes made with a MIDI controller alone aren't synced for now.
+change when someone is using FL (a click, a key press or a MIDI controller's knob, fader or button in the
+last 1.5 s). A knob an automation clip
+or controller drives syncs only when someone moves it by hand while the song is stopped: each FL plays
+its own automation, so one person playing the song doesn't move everyone's knob.
+
+**Playing is yours:** play, stop and the song position are each person's own. flim never starts or
+stops anyone's FL; its log notes every start and stop here (`PLAY started here (input here: ...)`), so if
+someone's FL ever seems to start by itself, that person's log shows what came in just before.
 
 **Solo is yours:** soloing a mixer track only changes what you hear. The others keep their mutes, and
 when you unsolo, your tracks get back the mutes everyone shares, including any someone changed while
-you were soloing. A song saved while soloed opens soloed only for whoever opens it; the others get it
+you were soloing. (A mute reaches the others about 0.4 s after you click it: a solo click mutes a track
+just before it solos, and that mute must not go out.) A song saved while soloed opens soloed only for whoever opens it; the others get it
 with every track on, which is what the solo leaves when it ends. Soloing a channel in the channel rack is
 yours the same way. The main volume knob is yours too.
 
@@ -121,7 +128,8 @@ untick **Show cursors** in flim's window.
 ## Quick start
 
 ### Client
-1. Download `flim-client-win64.zip` from [Releases](../../releases) and unzip it anywhere.
+1. Get the flim zip (`flim.exe` and `flim_engine.dll`) from whoever runs your session, or build it
+   (see [Building the client from source](#building-the-client-from-source)), and unzip it anywhere.
    Keep `flim.exe` and `flim_engine.dll` in the same folder.
 2. Double-click **`flim.exe`**. The first time, it asks for:
    - your **FL Studio 2026 folder** (the one that contains `FL64.exe`, usually
@@ -170,8 +178,9 @@ The host is built into `flim.exe`, nothing else to install. What to give the oth
 ### Dedicated server
 For a server that runs without anyone's FL (an always-on PC or a cloud machine), use the Node.js
 version. Only one person needs to run this.
+Copy the `server` folder of the same flim version everyone uses to that machine (e.g. `scp -r server
+user@host:flim/`), then:
 ```bash
-git clone https://github.com/fckwader/flim.git
 cd flim/server
 npm install
 npm run build
