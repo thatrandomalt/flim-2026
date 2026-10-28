@@ -332,6 +332,20 @@ How flim keeps it local (engine `solo_*`, `mute_*`):
   soloed (a tester's "soloing for one person does it for everyone").
 - Tests: `live_test.py solo solo_song`, harness `t_solo`.
 
+### Other people's selection
+- Selection is local in FL (note `+0x13` bit `0x80`, clip `+0x13` bit `0x80`; never synced). `sel_poll` (poll
+  thread, every 200 ms, only on a change) sends the selected notes of the current pattern (pos, length, key `+12`)
+  and clips of the current arrangement (pos, length, playlist track = 500 - `+0x0c`), up to 256 each, as a `sel`
+  op. It isn't an edit (`op_changes_song`, the detailed log and the `PLAY` line leave it out); the servers relay
+  it like any op (ponytail: they take it as editing, which keeps that person's locks fresh).
+- `sel_update` (with the arrows' timer) draws them on our piano roll / playlist when it shows the same pattern /
+  arrangement: one `FlimSel` window per person and editor over the grid (layered, colour key, click-through,
+  owned by FL's main form), 2 px outlines in the arrow's colour, with the arrows' mapping (`ed_geom`: key k's row
+  is `(topkey - k - 1) * keyh - vscroll`; a track's from `trk_rows`). An outline whose middle another window
+  covers isn't drawn; the window is only moved / redrawn when the outlines change.
+- Test: `live_test.py sel` (B's log: `SEL <id>: n notes selected in pattern p, c clips in arrangement a`; no
+  edits go out for it). The drawing isn't checked by it: the test FLs run minimized.
+
 ### MIDI controller input
 flim counts a change as someone's edit only with input in the last 1.5 s (`input_recent`), so a knob turned on a
 MIDI controller looked like FL moving it by itself and never synced.

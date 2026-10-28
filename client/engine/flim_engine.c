@@ -417,7 +417,7 @@ static void logmsg(const char *fmt, ...) {
 // Detailed log: an op sent or received, its data cut down to its size. The arrows, the leader's
 // "alive" and who-is-where would drown everything else out.
 static void log_op(const char *dir, const char *m) {
-    static const char *const QUIET[] = { "\"kind\":\"cur\"", "\"kind\":\"alive\"", "\"kind\":\"focus\"" };
+    static const char *const QUIET[] = { "\"kind\":\"cur\"", "\"kind\":\"alive\"", "\"kind\":\"focus\"", "\"kind\":\"sel\"" };
     char s[480];
     size_t o = 0;
     const char *p = m;
@@ -5750,7 +5750,7 @@ static int cur_passthrough(HWND hw) {
     DWORD pid = 0;
     RECT r;
     if (!root) return 0;
-    if (wnd_class_is(root, "FlimCursor")) return 1;
+    if (wnd_class_is(root, "FlimCursor") || wnd_class_is(root, "FlimSel")) return 1;
     GetWindowThreadProcessId(root, &pid);
     if (pid != GetCurrentProcessId() || root == g_mainForm || !(GetWindowLongW(root, GWL_STYLE) & WS_POPUP)) return 0;
     return GetWindowRect(root, &r) && r.right - r.left < CUR_POPUP_W && r.bottom - r.top < CUR_POPUP_H;
@@ -5960,6 +5960,212 @@ static void cursor_update(void) {
         if (shown && s.x == c->sx && s.y == c->sy) continue;
         c->sx = s.x; c->sy = s.y;
         SetWindowPos(c->ov, HWND_TOP, s.x, s.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | (shown ? SWP_NOZORDER : SWP_SHOWWINDOW));
+    }
+    LeaveCriticalSection(&g_netTextLock);
+}
+
+// ---- what everyone has selected ----
+// The notes selected in someone's current pattern and the clips selected in their current arrangement go out
+// (only when they change, at most every SEL_SEND_MS) and show as outlines in their colour on our piano roll /
+// playlist when it shows the same pattern / arrangement: one click-through window per person and editor over
+// the grid, with "Show cursors". An outline whose middle is covered by another window isn't drawn.
+// ponytail: the servers treat "sel" as an edit (it keeps that person's locks fresh; the Node one logs it).
+#define SEL_SEND_MS 200
+#define SEL_MAX     256
+typedef struct { int pos, len, row; } SelBox;          // ticks; row: key (piano roll) / playlist track 1..500
+typedef struct { COLORREF col; int n; RECT r[SEL_MAX]; } SelDraw;   // an overlay's outlines, in its client area
+typedef struct { char id[64]; int pat, np, arr, nc; SelBox n[SEL_MAX], c[SEL_MAX]; HWND ov[2]; uint64_t drawn[2]; SelDraw d[2]; } PeerSel;
+static PeerSel g_psel[FOCUS_MAX];
+static int g_npsel = 0;                     // guarded by g_netTextLock
+
+static int sel_peek(int pl, int ctx, SelBox *out) {   // our selection (poll thread; SEH-guarded reads)
+    int k = 0;
+    unsigned i, n;
+    __try {
+        char *a = pl ? arr_clips(ctx) : pat_notes_arr(ctx);
+        unsigned char *d = a ? *(unsigned char **)(a + (pl ? CLIPS_DATA : NOTES_DATA)) : NULL;
+        n = a ? *(unsigned *)(a + (pl ? CLIPS_COUNT : NOTES_COUNT)) : 0;
+        if (n > 1000000) n = 0;
+        for (i = 0; i < n && k < SEL_MAX; i++) {
+            const unsigned char *r = d + (size_t)i * (pl ? CLIP_SIZE : NOTE_SIZE);
+            if (!(r[pl ? CLIP_SEL_OFS : NOTE_SEL_OFS] & (pl ? CLIP_SEL_BIT : NOTE_SEL_BIT))) continue;
+            out[k].pos = *(const int *)r; out[k].len = *(const int *)(r + 8);
+            out[k].row = pl ? 500 - *(const uint16_t *)(r + CLIP_TRK_OFS) : *(const uint16_t *)(r + 12);   // track 1..500 / key
+            k++;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return k;
+}
+static int sel_json(char *o, int cap, const SelBox *b, int n) {
+    int i, len = 0;
+    for (i = 0; i < n && len < cap - 40; i++) len += sprintf_s(o + len, cap - len, "%s%d,%d,%d", i ? "," : "", b[i].pos, b[i].len, b[i].row);
+    return len;
+}
+// Poll thread: tell the others what we have selected, when it changes.
+static void sel_poll(DWORD now) {
+    static DWORD last = 0;
+    static uint64_t sent = 0;
+    static SelBox nb[SEL_MAX], cb[SEL_MAX];
+    int pat, arr, nn, nc, o;
+    uint64_t h;
+    char *m;
+    if (now - last < SEL_SEND_MS || !g_ws) return;
+    last = now;
+    pat = cur_pat(); arr = cur_arr();
+    nn = pat >= 1 ? sel_peek(0, pat, nb) : 0;
+    nc = arr >= 0 ? sel_peek(1, arr, cb) : 0;
+    h = fnv_add(fnv_add(fnv_add(1469598103934665603ull, nb, sizeof(SelBox) * (size_t)nn), cb, sizeof(SelBox) * (size_t)nc), &pat, sizeof(pat));
+    h = fnv_add(fnv_add(h, &arr, sizeof(arr)), &nn, sizeof(nn));
+    if (h == sent) return;
+    sent = h;
+    m = (char *)malloc(128 + (size_t)SEL_MAX * 2 * 36);
+    o = sprintf_s(m, 128, "{\"t\":\"op\",\"op\":{\"kind\":\"sel\",\"p\":%d,\"a\":%d,\"n\":[", pat, arr);
+    o += sel_json(m + o, SEL_MAX * 36, nb, nn);
+    o += sprintf_s(m + o, 16, "],\"c\":[");
+    o += sel_json(m + o, SEL_MAX * 36, cb, nc);
+    sprintf_s(m + o, 8, "]}}");
+    ws_send(m);
+    free(m);
+}
+static int sel_parse(const char *m, const char *key, SelBox *b) {
+    const char *p = strstr(m, key);
+    int k = 0;
+    char *e;
+    if (!p) return 0;
+    for (p += strlen(key); *p && *p != ']' && k < SEL_MAX; k++) {
+        b[k].pos = (int)strtol(p, &e, 10); if (*e != ',') break;
+        b[k].len = (int)strtol(e + 1, &e, 10); if (*e != ',') break;
+        b[k].row = (int)strtol(e + 1, &e, 10);
+        p = *e == ',' ? e + 1 : e;
+    }
+    return k;
+}
+// Inbound sel op (recv thread).
+static void on_sel(const char *m) {
+    const char *f = strstr(m, "\"from\":\"");
+    char id[64];
+    int i, p = 0, a = -1;
+    if (!f) return;
+    for (f += 8, i = 0; f[i] && f[i] != '"' && i < (int)sizeof(id) - 1; i++) id[i] = f[i];
+    id[i] = 0;
+    int_after(m, NULL, "\"p\":", &p);
+    int_after(m, NULL, "\"a\":", &a);
+    EnterCriticalSection(&g_netTextLock);
+    for (i = 0; i < g_npsel && strcmp(g_psel[i].id, id) != 0; i++) {}
+    if (i == g_npsel && g_npsel < FOCUS_MAX) { memset(&g_psel[i], 0, sizeof(g_psel[i])); strcpy_s(g_psel[g_npsel++].id, sizeof(g_psel[0].id), id); }
+    if (i < g_npsel) {
+        PeerSel *s = &g_psel[i];
+        int np = s->np, nc = s->nc;
+        s->pat = p; s->arr = a;
+        s->np = sel_parse(m, "\"n\":[", s->n);
+        s->nc = sel_parse(m, "\"c\":[", s->c);
+        if (s->np != np || s->nc != nc) logmsg("SEL %s: %d notes selected in pattern %d, %d clips in arrangement %d", id, s->np, p, s->nc, a);
+    }
+    LeaveCriticalSection(&g_netTextLock);
+}
+
+static LRESULT CALLBACK sel_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_NCHITTEST) return HTTRANSPARENT;
+    if (m == WM_PAINT || m == WM_PRINTCLIENT) {          // (PRINTCLIENT: PrintWindow, for checking it)
+        PAINTSTRUCT ps;
+        HDC dc = m == WM_PAINT ? BeginPaint(h, &ps) : (HDC)wp;
+        const SelDraw *d = (const SelDraw *)GetPropW(h, L"sel");
+        RECT rc;
+        HBRUSH bk = CreateSolidBrush(CUR_KEY);
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, bk);
+        if (d) {
+            HBRUSH br = CreateSolidBrush(d->col);
+            int i;
+            for (i = 0; i < d->n; i++) {
+                RECT r = d->r[i], r2 = { r.left + 1, r.top + 1, r.right - 1, r.bottom - 1 };
+                FrameRect(dc, &r, br);
+                if (r2.right > r2.left && r2.bottom > r2.top) FrameRect(dc, &r2, br);   // 2 px
+            }
+            DeleteObject(br);
+        }
+        DeleteObject(bk);
+        if (m == WM_PAINT) EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_DESTROY) RemovePropW(h, L"sel");
+    return DefWindowProcW(h, m, wp, lp);
+}
+static HWND sel_window(SelDraw *d) {
+    static int reg = 0;
+    HWND h;
+    if (!reg) {
+        WNDCLASSW wc; memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = sel_proc; wc.hInstance = g_hinst; wc.lpszClassName = L"FlimSel";
+        RegisterClassW(&wc);
+        reg = 1;
+    }
+    h = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"FlimSel", L"", WS_POPUP,
+                        0, 0, 1, 1, g_mainForm, NULL, g_hinst, NULL);
+    if (!h) return NULL;
+    SetLayeredWindowAttributes(h, CUR_KEY, 0, LWA_COLORKEY);
+    SetPropW(h, L"sel", d);
+    return h;
+}
+// A selection box -> its rectangle in the grid's client area (before clipping). 0 = not in this arrangement.
+static int sel_rect(int pl, const EdGeom *g, const SelBox *b, RECT *r) {
+    r->left = (int)(b->pos / g->tpp) - g->hs;
+    r->right = (int)((b->pos + (b->len > 0 ? b->len : 1)) / g->tpp) - g->hs + 1;
+    if (!pl) { r->top = (g->topkey - b->row) * g->keyh - g->vs; r->bottom = r->top + g->keyh + 1; }
+    else {
+        int top, h;
+        if (b->row < 1 || b->row > PL_TRK_MAX || !trk_rows(g->arr, b->row, &top, &h) || h <= 0) return 0;
+        r->top = top - g->vs; r->bottom = r->top + h + 1;
+    }
+    return 1;
+}
+// Main thread (with cursor_update): place, redraw or hide every person's selection outlines.
+static void sel_update(void) {
+    int i, pl, live = g_netState == NET_ON && g_mainForm && !IsIconic(g_mainForm) && g_showCursors;
+    EnterCriticalSection(&g_netTextLock);
+    for (i = 0; i < g_npsel; i++) {
+        PeerSel *s = &g_psel[i];
+        char pat[96];
+        sprintf_s(pat, sizeof(pat), "\"id\":\"%s\",", s->id);
+        for (pl = 0; pl < 2; pl++) {
+            EdGeom g;
+            SelDraw *d = &s->d[pl];
+            const SelBox *b = pl ? s->c : s->n;
+            int nb = pl ? s->nc : s->np, k;
+            POINT o = { 0, 0 };
+            uint64_t h;
+            d->n = 0;
+            if (live && nb && strstr(g_peersJson, pat) && (pl ? s->arr == cur_arr() : s->pat == cur_pat()) && ed_geom(pl, &g)) {
+                o.x = g.L; o.y = g.T;
+                ClientToScreen(g.h, &o);
+                for (k = 0; k < nb && d->n < SEL_MAX; k++) {
+                    RECT r;
+                    POINT c;
+                    HWND hw;
+                    if (!sel_rect(pl, &g, &b[k], &r) || r.right <= 0 || r.bottom <= 0 || r.left >= g.W || r.top >= g.H) continue;
+                    if (r.left < 0) r.left = 0;
+                    if (r.top < 0) r.top = 0;
+                    if (r.right > g.W) r.right = g.W;
+                    if (r.bottom > g.H) r.bottom = g.H;
+                    c.x = o.x + (r.left + r.right) / 2; c.y = o.y + (r.top + r.bottom) / 2;
+                    hw = WindowFromPoint(c);
+                    if (!g_curNoCover && hw != g.h && !IsChild(g.h, hw) && !cur_passthrough(hw)) continue;   // covered there
+                    d->r[d->n++] = r;
+                }
+            }
+            if (!d->n) {
+                if (s->ov[pl] && IsWindowVisible(s->ov[pl])) ShowWindow(s->ov[pl], SW_HIDE);
+                s->drawn[pl] = 0;
+                continue;
+            }
+            d->col = cursor_color(s->id);
+            h = fnv_add(fnv_add(fnv_add(1469598103934665603ull, d->r, sizeof(RECT) * (size_t)d->n), &o, sizeof(o)), &g.W, sizeof(int) * 2);
+            if (h == s->drawn[pl] && s->ov[pl] && IsWindowVisible(s->ov[pl])) continue;
+            s->drawn[pl] = h;
+            if (!s->ov[pl] && !(s->ov[pl] = sel_window(d))) continue;
+            SetWindowPos(s->ov[pl], HWND_TOP, o.x, o.y, g.W, g.H, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            InvalidateRect(s->ov[pl], NULL, FALSE);
+        }
     }
     LeaveCriticalSection(&g_netTextLock);
 }
@@ -7318,7 +7524,7 @@ static void main_stuck(DWORD forMs) {
 
 static LRESULT CALLBACK task_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_FLIM_TASKS) { drain_queue_mainthread(); return 0; }
-    if (m == WM_TIMER && wp == CUR_TIMER) { cursor_update(); return 0; }
+    if (m == WM_TIMER && wp == CUR_TIMER) { cursor_update(); sel_update(); return 0; }
     if (m == WM_TIMER && wp == BUSY_TIMER) { KillTimer(h, BUSY_TIMER); drain_queue_mainthread(); return 0; }
     if (m == WM_TIMER && wp == BACKUP_TIMER) { backup_tick(); return 0; }
     if (m == WM_TIMER && wp == ALIVE_TIMER) {
@@ -7876,6 +8082,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
         resync_tick(now);
         focus_poll(now);
         cursor_poll(now);
+        sel_poll(now);
         solo_poll(now);
         uint64_t mixH = mix_ids_hash();
         int mixSteady = mixH == lastMixH;              // no track moved since the last pass
@@ -8238,7 +8445,7 @@ static uint32_t g_leaderDg[DG_N];          // the leader's last fingerprint (g_q
 static int      g_leaderArr;
 static volatile DWORD g_leaderDgAt;
 static int op_changes_song(const char *m) {
-    static const char *const QUIET[] = { "\"kind\":\"cur\"", "\"kind\":\"alive\"", "\"kind\":\"focus\"", "\"kind\":\"saving\"",
+    static const char *const QUIET[] = { "\"kind\":\"cur\"", "\"kind\":\"alive\"", "\"kind\":\"focus\"", "\"kind\":\"saving\"", "\"kind\":\"sel\"",
                                          "\"kind\":\"hello\"", "\"kind\":\"shared.", "\"kind\":\"digest\"", "\"kind\":\"state.req\"" };
     int i;
     if (!strstr(m, "\"t\":\"op\"")) return 0;
@@ -8514,7 +8721,7 @@ static void handle_msg(const char *m) {
         if (k) {
             for (k += 8; *k && *k != '"' && i < (int)sizeof(kind) - 1; ) kind[i++] = *k++;
             kind[i] = 0;
-            if (strcmp(kind, "cur") && strcmp(kind, "alive")) { strcpy_s(g_lastInKind, sizeof(g_lastInKind), kind); g_lastInAt = GetTickCount(); }
+            if (strcmp(kind, "cur") && strcmp(kind, "alive") && strcmp(kind, "sel")) { strcpy_s(g_lastInKind, sizeof(g_lastInKind), kind); g_lastInAt = GetTickCount(); }
         }
     }
     {   // "sc":[ch,mix,pat]
@@ -8590,6 +8797,8 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         on_focus(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"cur\"")) {
         on_cursor(m);
+    } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"sel\"")) {
+        on_sel(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"notes.full\"")) {
         if (!g_isLeader) {
             unsigned char *keep = (unsigned char *)calloc(MAX_PAT, 1);

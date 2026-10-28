@@ -42,7 +42,7 @@ samples) is kept in sync over the internet. It works a bit like [Drawpile](https
 | Synced | Not yet |
 |---|---|
 | Channel volume / pan / on-off / mixer routing, filter, pitch, portamento, gate, swing, time offset, delay and arp settings | Samples inside plugins that store them compressed or encrypted (Kontakt, ...) |
-| Every plugin parameter (generators and effects, FL's own and third-party VSTs) | Showing other people's selection inside an editor |
+| Every plugin parameter (generators and effects, FL's own and third-party VSTs) | |
 | Full plugin state (presets, wavetables, samples loaded inside a VST, ...), checked as soon as you stop working in the plugin's window | |
 | Tempo, swing and main pitch (the main volume is each person's own) | |
 | Mixer volume / pan / stereo separation / mute / built-in EQ; each effect slot's on/off and mix level | |
@@ -59,7 +59,7 @@ samples) is kept in sync over the internet. It works a bit like [Drawpile](https
 | Automation clips, with their links to what they automate (made, cloned, added or removed in the session too), and the links of internal controllers (Peak, Formula...) | |
 | Sample files used by channels, audio clips and plugins like FPC, and other files plugins load, such as SF2 Player's soundfont (see [Samples](#samples)) | |
 | Opening or loading a project (the leader's project is sent to everyone) | |
-| Which window everyone is working in, and where their mouse is in the piano roll and playlist (see [Who's where](#whos-where)) | |
+| Which window everyone is working in, where their mouse is and what they have selected in the piano roll and playlist (see [Who's where](#whos-where)) | |
 
 **Working at the same time:** everyone can edit at once. Notes and playlist clips sync about 0.25 s
 after you stop moving them, one channel / one playlist track at a time, so two people can write in the
@@ -111,8 +111,9 @@ e.g. `Connected to flim.example.com · leader · 2 people · Alex: Piano roll - 
 
 When someone's mouse is over the piano roll or the playlist, you see a small arrow with their name at
 the same spot in yours (the same note and bar, whatever your zoom or scroll), as long as you are looking
-at the same pattern or arrangement. The arrows can't be clicked and never get in your way. To hide them,
-untick **Show cursors** in flim's window.
+at the same pattern or arrangement. The notes and playlist clips someone has selected show as outlines in
+their arrow's colour (in the same pattern or arrangement, up to 256 each). Arrows and outlines can't be
+clicked and never get in your way. To hide them, untick **Show cursors** in flim's window.
 
 ---
 

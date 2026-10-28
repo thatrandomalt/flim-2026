@@ -1080,6 +1080,27 @@ def t_sample_compressed():
             return min((abs(fr / r - 2.5), round(fr / r, 1)) for r in (44100, 48000))[1]
         check('...and the real sound (2.5 s, not the placeholder)', lambda: secs(b), lambda: secs(a), wait=20)
 
+# What someone has selected reaches the others (drawn as outlines on their editors: not checked here, the test FLs
+# run minimized): A selects notes and clips, B's log says how many.
+def t_sel():
+    p = a.d(a.g(V(a, 'CURPAT'))); pa = a.call(0x12d16e0, p, 0); n = a.d(pa + 0x14); d = a.q(pa + 8)
+    if n < 2:
+        rec = a.alloc(24)
+        for k in range(3): a.w(rec, struct.pack('<IHHIH', k * 96, 0, 0, 48, 60 + k) + bytes(10)); a.call(va(a, a.q(a.q(pa) + 8)), pa, rec)
+        time.sleep(1); n = a.d(pa + 0x14); d = a.q(pa + 8)
+    pos = os.path.getsize(LOG)
+    for k in range(2): a.w(d + k * 24 + 0x13, bytes([a.r(d + k * 24 + 0x13, 1)[0] | 0x80]))
+    check('selection: B hears of 2 notes', lambda: any(re.search(r'SEL \S+: 2 notes selected in pattern %d' % p, l) for l in log_since(pos, B)), lambda: True, wait=4)
+    for k in range(n): a.w(d + k * 24 + 0x13, bytes([a.r(d + k * 24 + 0x13, 1)[0] & 0x7f]))
+    check('...and of none again', lambda: any(re.search(r'SEL \S+: 0 notes selected', l) for l in log_since(pos, B)), lambda: True, wait=4)
+    ca = a.q(arr(a) + 0x14); nc = a.d(ca + 0x14); cd = a.q(ca + 8)
+    if nc:
+        pos = os.path.getsize(LOG)
+        a.w(cd + 0x13, bytes([a.r(cd + 0x13, 1)[0] | 0x80]))
+        check('selection: B hears of 1 clip', lambda: any(re.search(r'SEL \S+: 0 notes selected in pattern \d+, 1 clips', l) for l in log_since(pos, B)), lambda: True, wait=4)
+        a.w(cd + 0x13, bytes([a.r(cd + 0x13, 1)[0] & 0x7f]))
+    check('...no edits went out for it', lambda: [l for l in log_since(pos, A) if 'NOTES sent' in l or 'CLIPS sent' in l], lambda: [], wait=1)
+
 def t_arr_many():                                               # playlist tracks of arrangements past the 8th (META_ARR_MAX)
     n0 = arr_count(a)
     while arr_count(a) < 11: a.call(V(a, 'ADDARR'), 0, 0); time.sleep(0.6)
