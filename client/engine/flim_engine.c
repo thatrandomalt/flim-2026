@@ -489,6 +489,39 @@ static uint32_t mute_get(int t, int solo) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return REC_NONE; }
 }
 
+// The channel rack's solo is each person's own too. FL's toggle (sub_FFAAA0, chsolo_detour) turns the other
+// channels off, keeping each one's on/off from before in CH_PRESOLO (2 on, 1 off) for the unsolo; a solo is FL's
+// shape (one channel on, the rest off, CH_SOLOSKIP aside), and CH_PRESOLO stays behind after it. So flim takes a
+// solo as on from the toggle until that shape is gone, and meanwhile a channel's on/off as the others know it is
+// its CH_PRESOLO.
+#define CH_ON        0x32e         // byte: the channel is on (FL's isChannelSolo reads it)
+#define CH_PRESOLO   0x891         // byte: its on/off from before a solo, put back on unsolo: 2 on, 1 off, 0 none
+#define CH_SOLOSKIP  0x892         // byte: solo leaves this channel alone
+#define IS_CH_MUTE(id) ((id) < 0x70000000u && ((id) >> 16) < MAX_CH && ((id) & 0xFFFFu) == 7)   // REC_Chan_Mute: on/off
+static volatile LONG g_chSolo;             // a channel solo is on here
+static volatile DWORD g_chSoloAt;          // when it last went on or off (FL's loop over the channels: reads wait)
+static int chan_list(void ***items);
+static char *chan_at(int i) {
+    void **items;
+    int n = chan_list(&items);
+    return items && i >= 0 && i < n ? (char *)items[i] : NULL;
+}
+static int chsolo_shape(void) {            // FL's sub_FFAA40: some channel is soloed
+    void **items;
+    int n = chan_list(&items), i, on = 0;
+    if (!items) return 0;
+    __try {
+        for (i = 0; i < n; i++) if (!((char *)items[i])[CH_SOLOSKIP] && ((char *)items[i])[CH_ON] && ++on > 1) return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return on == 1;
+}
+static uint32_t chmute_presolo(int ch, uint32_t cur) {   // its shared on/off while soloing here
+    char *c = chan_at(ch), p;
+    if (!c) return REC_NONE;
+    __try { p = c[CH_PRESOLO]; } __except (EXCEPTION_EXECUTE_HANDLER) { return REC_NONE; }
+    return p ? (p == 2 ? 1u : 0u) : cur;   // (0: one added since the solo began)
+}
+
 // Current value of any synced id (REC param or pseudo id). REC_NONE if absent.
 // SEH-guarded so a bad moment inside FL (e.g. mid project load) can't take FL down.
 static uint32_t read_value(uint32_t id) {
@@ -497,6 +530,10 @@ static uint32_t read_value(uint32_t id) {
             int t = (int)(id & 0xFFFFF);
             if (t >= mix_count()) return REC_NONE;
             return mute_get(t, solo_on());
+        }
+        if (g_chSolo && IS_CH_MUTE(id)) {
+            uint32_t v = g_rec(id, 0, REC_GetValue);
+            return v == REC_NONE ? v : chmute_presolo((int)(id >> 16), v);
         }
         return g_rec(id, 0, REC_GetValue);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -514,6 +551,12 @@ static uint32_t write_value(uint32_t id, uint32_t v) {
             if (solo) (*(char **)(g_flBase + (MIXARR_VA - IMG_BASE)))[(size_t)t * MIX_STRIDE + MIX_PRESOLO] = v ? 1 : 0;
             else g_setEnabled(t, v ? 1 : 0);
             return mute_get(t, solo);
+        }
+        if (g_chSolo && IS_CH_MUTE(id)) {          // soloing here: heard after the unsolo
+            char *c = chan_at((int)(id >> 16));
+            if (!c) return REC_NONE;
+            c[CH_PRESOLO] = v ? 2 : 1;
+            return v ? 1u : 0u;
         }
         return g_rec(id, v, REC_UpdateValue | REC_UpdateControl);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -7310,6 +7353,23 @@ static void delchan_detour_install(void) {
     else logmsg("CHAN: FL's channel delete looks different: a delete and an add right after it may sync as a move");
 }
 
+// FL's channel solo toggle (the mute button's solo click, the menu, scripts): see CH_PRESOLO.
+typedef uint64_t (*chsolo_t)(void *ch, char flags);
+static chsolo_t g_chsoloOrig;
+static uint64_t chsolo_detour(void *ch, char flags) {
+    uint64_t r;
+    g_chSoloAt = GetTickCount();
+    r = g_chsoloOrig(ch, flags);
+    InterlockedExchange(&g_chSolo, chsolo_shape());
+    g_chSoloAt = GetTickCount();
+    return r;
+}
+static void chsolo_detour_install(void) {
+    static const unsigned char PRO[12] = { 0x41, 0x55, 0x57, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x28, 0x48, 0x89, 0xCB };   // push r13/rdi/rsi/rbx; sub rsp,28h; mov rbx,rcx
+    g_chsoloOrig = (chsolo_t)detour_tramp((unsigned char *)(g_flBase + (FLVA(CHSOLO) - IMG_BASE)), PRO, 12, (void *)chsolo_detour);
+    if (!g_chsoloOrig) logmsg("SOLO: FL's channel solo looks different: a channel rack solo syncs as mutes");
+}
+
 // FL loads a preset into a channel or effect slot (its browser, a plugin's preset menu, a drop): that
 // unit's state goes out once it settles, as after a preset-sized burst of knobs. A preset that moves no
 // knob (another soundfont, sample or wavetable) waited for the round-robin check, a minute in a big
@@ -7587,6 +7647,27 @@ static void schedule_units(DWORD now) {
 #define MUTE_FADE_MS 500
 static unsigned char g_mutePend[MAX_MIX];  // a track's new mute reading + 1, until the next pass confirms it
 static DWORD g_soloChangedAt;              // when solo last went on or off here
+// The channel rack's solo: ended by a click (that channel back on: no longer FL's shape) as well as by the toggle.
+// Afterwards the channels go back to the on/off everyone shares (FL may turn them all on instead, or a click
+// that ended it left the rest off).
+static void chsolo_poll(DWORD now) {
+    static LONG was;
+    static DWORD restoreAt;
+    int i, n = g_nslot;
+    if (g_chSolo && now - g_chSoloAt >= SOLO_HOLD_MS && !chsolo_shape()) { InterlockedExchange(&g_chSolo, 0); g_chSoloAt = now; }
+    if (restoreAt && (LONG)(now - restoreAt) >= 0) {
+        restoreAt = 0;
+        if (!g_chSolo)
+            for (i = 0; i < n; i++) {
+                Slot *s = &g_slots[i];
+                if (IS_CH_MUTE(s->id) && s->last != REC_NONE && g_rec(s->id, 0, REC_GetValue) != s->last) enqueue_apply(s->id, s->last, 0);
+            }
+    }
+    if (g_chSolo == was) return;
+    logmsg("SOLO %s in the channel rack here (each person's own: not synced)", g_chSolo ? "on" : "off");
+    restoreAt = was ? (now + SOLO_RESTORE_MS) | 1 : 0;
+    was = g_chSolo;
+}
 static void solo_poll(DWORD now) {
     static int was = -1;
     static DWORD restoreAt;                // an unsolo's put-back is due (0 = none)
@@ -7602,6 +7683,7 @@ static void solo_poll(DWORD now) {
                 if (IS_MUTE_ID(s->id) && t < mix_count() && s->last != REC_NONE && mute_get(t, 0) != s->last) enqueue_apply(s->id, s->last, 0);
             }
     }
+    chsolo_poll(now);
     if (on == was) return;
     if (was >= 0) logmsg("SOLO %s here (each person's own: not synced)", on ? "on" : "off");
     restoreAt = was == 1 ? (now + SOLO_RESTORE_MS) | 1 : 0;   // (soloed again meanwhile: its own unsolo puts back)
@@ -7707,6 +7789,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
                 continue;
             }
             if (IS_MUTE_ID(s->id) && !mute_settled(s, v, now)) continue;
+            if (IS_CH_MUTE(s->id) && now - g_chSoloAt < SOLO_HOLD_MS) continue;   // a channel solo going on / off
             // A change becomes "seen" (last) only once this tick turns out clean (below): a structure change
             // mid-tick renumbers the slot, and a value taken as seen there was never sent.
             uint32_t prev = s->last;
@@ -11633,6 +11716,7 @@ static DWORD WINAPI engineMain(LPVOID p) {
         patops_install();
         save_detour_install();
         delchan_detour_install();
+        chsolo_detour_install();
         loadpreset_detour_install();
         InterlockedExchange(&g_uiWanted, 1);
         PostMessageW(g_mainWnd, WM_NULL, 0, 0);

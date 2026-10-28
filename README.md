@@ -90,7 +90,8 @@ song doesn't move everyone's knob. Changes made with a MIDI controller alone are
 **Solo is yours:** soloing a mixer track only changes what you hear. The others keep their mutes, and
 when you unsolo, your tracks get back the mutes everyone shares, including any someone changed while
 you were soloing. A song saved while soloed opens soloed only for whoever opens it; the others get it
-with every track on, which is what the solo leaves when it ends. The main volume knob is yours too.
+with every track on, which is what the solo leaves when it ends. Soloing a channel in the channel rack is
+yours the same way. The main volume knob is yours too.
 
 **Staying out of your way:** someone else's plugin changes load without opening the plugin's window,
 and they wait while you're in the middle of something (holding a mouse button, a menu or dialog of a

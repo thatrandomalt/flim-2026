@@ -325,6 +325,30 @@ How flim keeps it local (engine `solo_*`, `mute_*`):
   soloed (a tester's "soloing for one person does it for everyone").
 - Tests: `live_test.py solo solo_song`, harness `t_solo`.
 
+### Channel rack solo
+The channel rack's solo also mutes the others, as channel on/off (`REC_Chan_Mute`, sub 7), so it soloed for
+everyone (a tester, 2026-10-27).
+- `sub_FFAAA0(channel, flags)` (`CHSOLO`) toggles it: the mute button's solo click (`sub_FFE920`, "knob tweak
+  (mute / solo)"), `channels.soloChannel` (`sub_D59B40`) and eight more callers. Flag 1: only the channel's
+  group (`+0x798`).
+- Soloed is a shape, not a flag: `sub_FFA980(ch)` (`channels.isChannelSolo`) = `+0x32e` (on) and every other
+  channel off, channels with `+0x892` aside; `sub_FFAA40` = some channel is soloed. Solo saves each channel's
+  on/off into `+0x891` (2 on, 1 off; only when nothing was soloed: a second solo keeps the first's) and turns
+  them off; unsolo turns each one with `+0x891` set back on from it, or every one on, depending on a
+  main-form option (as the mixer's). `+0x891` stays behind after.
+- It switches each channel through its mute button (`ch+0x7bc`, `sub_737640`), whose click (`sub_FFE8B0`)
+  sends REC with the button's id (`+24`, `ch << 16 | 7`). The channel rack gives buttons their ids; on
+  channels made by `ADDCH` from the probe it is 0, and their solo wrote channel 0's volume. `chan_solo` sets
+  them as the rack would.
+- flim (engine `chsolo_*`): `chsolo_detour` takes the solo as on when the toggle leaves FL's shape, and
+  `chsolo_poll` as off once the shape is gone (a click turning another channel on ends it too). Meanwhile a
+  channel's synced on/off is its `+0x891` (0: one added since, its own) and someone else's change is written
+  there. No channel change is read for `SOLO_HOLD_MS` after the solo changes (FL's loop), and after it ends
+  every channel gets the shared on/off back after `SOLO_RESTORE_MS` (what FL did, or a click left).
+  ponytail: a click that ended the solo is put back too; a project snapshot while soloed still has the solo's
+  channel mutes (the mixer's are stripped).
+- Test: `live_test.py chan_solo` (4 of its 9 checks fail on the old engine).
+
 ### Mute fade
 - While audio runs, `SetTrackEnabled(t, 0)` doesn't clear `+0x18`: `sub_12C1810(record, 0)` starts a
   fade-out (`+0x151` = 2, samples left at `+0x154`) and the audio thread clears `+0x18` when it ends.

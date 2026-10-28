@@ -656,6 +656,31 @@ def t_solo():
     check('mute ends solo: B unchanged', lambda: mutes(b), lambda: before)
     check('mute ends solo: A back to shared', lambda: mutes(a), lambda: mutes(b), wait=4)
 
+# The channel rack's solo is each person's own as well: FL's toggle turns the other channels off.
+CHSOLO = 0xffaaa0                                               # toggle(channel, flags): solo / unsolo
+def chon(p): return [rec_get(p, i << 16 | 7) for i in range(len(chans(p)))]   # REC_Chan_Mute: 1 on
+def t_chan_solo():
+    while len(chans(a)) < 4: add_named(a, len(chans(a)), 'S%d' % len(chans(a))); time.sleep(1.5)
+    check('channel solo: channels on both', lambda: len(chans(b)), lambda: len(chans(a)), wait=10)
+    for i, c in enumerate(chans(a)):                            # (FL's solo clicks each mute button, whose REC id the
+        a.w(a.q(c + 0x7bc) + 24, struct.pack('<I', i << 16 | 7))   # channel rack gives it: 0 on channels made by ADDCH)
+    rec_set(a, 3 << 16 | 7, 0)
+    check('channel 3 off (shared)', lambda: (chon(a)[3], chon(b)[3]), lambda: (0, 0), wait=4)
+    before = chon(b)
+    a.call(CHSOLO, chans(a)[1], 0); time.sleep(2.5)
+    check('channel solo: A has only 1 on', lambda: chon(a), lambda: [int(i == 1) for i in range(len(chans(a)))])
+    check('channel solo: B keeps its on/off', lambda: chon(b), lambda: before, wait=3)
+    rec_set(b, 2 << 16 | 7, 0); rec_set(b, 3 << 16 | 7, 1)       # B turns 2 off and 3 on meanwhile
+    check('channel solo: A stays soloed', lambda: chon(a), lambda: [int(i == 1) for i in range(len(chans(a)))], wait=3)
+    a.call(CHSOLO, chans(a)[1], 0)
+    check('channel unsolo: A has the shared on/off', lambda: chon(a), lambda: chon(b), wait=4)
+    check('...with B\'s changes', lambda: chon(a)[2:4], lambda: [0, 1], wait=0)
+    before = chon(b)
+    a.call(CHSOLO, chans(a)[1], 0); time.sleep(2); rec_set(a, 0 << 16 | 7, 1)   # a click turning another channel on ends it
+    time.sleep(3)
+    check('click ends channel solo: B unchanged', lambda: chon(b), lambda: before)
+    check('click ends channel solo: A back to shared', lambda: chon(a), lambda: chon(b), wait=4)
+
 # Quick mute + unmute. While audio runs FL fades a mute out, and an unmute during the fade is lost: the
 # two queued behind other work apply as one, and a track that ends up against flim's apply gets it again.
 def t_mute_fast():
