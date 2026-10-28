@@ -1038,6 +1038,24 @@ def t_arrangements():
         check("reload: B kept its own arrangement and pattern", lambda: (arr_cur(b), b.d(b.g(V(b, 'CURPAT')))), lambda: (0, 3), wait=3)
     a.call(V(a, 'SETARR'), 0); b.call(V(b, 'SETARR'), 0); a.call(V(a, 'PATSELECT'), 1); b.call(V(b, 'PATSELECT'), 1)   # (later tests compare the current one)
 
+# A knob turned on a MIDI controller is someone using FL: FL's MIDI input callback (sub_BA2180) is fed a control
+# change (a zeroed device record: +189 set skips its PostMessage, +128 not FL's clock device) with nobody at the keyboard.
+MIDIINCB = 0xba2180
+def t_midi_input():
+    dev = a.alloc(512); a.w(dev + 128, struct.pack('<I', 0xffffffff)); a.w(dev + 189, b'\x01')
+    t = mix_id(9, 0x1fc0)
+    quiet['on'] = True; time.sleep(2)                           # (input_recent: 1.5 s)
+    rec_set(a, t, 4321); time.sleep(3)
+    check('no input: a moved knob stays FL\'s own', lambda: rec_get(b, t) != 4321, lambda: True, wait=0)
+    a.call(MIDIINCB, 0, 0x3C3, dev, 0x7F07B0, 0)                # MIM_DATA: CC 7 = 127 on channel 1
+    rec_set(a, t, 6543)
+    check('MIDI controller: the knob it moved syncs', lambda: rec_get(b, t), lambda: 6543, wait=5)
+    time.sleep(2)
+    a.call(MIDIINCB, 0, 0x3C3, dev, 0x7F3C90, 0)                # a note (on) isn't a controller
+    rec_set(a, t, 2222); time.sleep(3)
+    check('MIDI note only: stays FL\'s own', lambda: rec_get(b, t) != 2222, lambda: True, wait=0)
+    quiet['on'] = False
+
 def t_arr_many():                                               # playlist tracks of arrangements past the 8th (META_ARR_MAX)
     n0 = arr_count(a)
     while arr_count(a) < 11: a.call(V(a, 'ADDARR'), 0, 0); time.sleep(0.6)

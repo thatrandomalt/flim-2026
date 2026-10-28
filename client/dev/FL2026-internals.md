@@ -332,6 +332,18 @@ How flim keeps it local (engine `solo_*`, `mute_*`):
   soloed (a tester's "soloing for one person does it for everyone").
 - Tests: `live_test.py solo solo_song`, harness `t_solo`.
 
+### MIDI controller input
+flim counts a change as someone's edit only with input in the last 1.5 s (`input_recent`), so a knob turned on a
+MIDI controller looked like FL moving it by itself and never synced.
+- FL opens its MIDI inputs with winmm `midiInOpen(..., sub_BA2180, device, CALLBACK_FUNCTION)` (`sub_BA3010`); the
+  callback gets `MIM_DATA` (963) with the short message in `dwParam1` and the device record as `dwInstance`, and
+  queues it (ring at `+172`, posts `0x54E` to `+120`).
+- `midiin_detour` (signature `MIDIINCB`, 15-byte prologue) notes when a control change, program change or pitch bend
+  came (`g_lastMidiIn`, read by `input_recent`). Notes, clock and system messages don't count.
+- Test: `live_test.py midi_input` calls the callback with a zeroed device record (`+189` = 1 skips the post, `+128`
+  not FL's clock device) and the background user paused: a knob moved right after a CC syncs, after a note only
+  or nothing it doesn't. This PC has no MIDI input port, so a real controller isn't tried.
+
 ### Channel rack solo
 The channel rack's solo also mutes the others, as channel on/off (`REC_Chan_Mute`, sub 7), so it soloed for
 everyone (a tester, 2026-10-27).

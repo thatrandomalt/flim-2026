@@ -7630,12 +7630,29 @@ static Change g_changes[MAX_SLOTS];
 #define SELF_MS       3000
 // Local input lately: our hook's, or into a window of another process inside FL (a bridged
 // plugin's editor: its input never passes our hook).
+// A MIDI controller's knob, fader or button (control change, program change, pitch bend) is someone using FL too:
+// FL's MIDI input callback (sub_BA2180, winmm's CALLBACK_FUNCTION, midiin_detour) notes when one last came. Notes,
+// clock and other system messages don't count (a keyboard played or a clock running isn't an edit).
+static volatile DWORD g_lastMidiIn;
+typedef void (CALLBACK *midiincb_t)(void *h, UINT msg, DWORD_PTR inst, DWORD_PTR p1, DWORD_PTR p2);
+static midiincb_t g_midiInOrig;
+static void CALLBACK midiin_detour(void *h, UINT msg, DWORD_PTR inst, DWORD_PTR p1, DWORD_PTR p2) {
+    unsigned st = (unsigned)(p1 & 0xF0);
+    if (msg == 0x3C3 /* MIM_DATA */ && (st == 0xB0 || st == 0xC0 || st == 0xE0)) g_lastMidiIn = GetTickCount() | 1;
+    g_midiInOrig(h, msg, inst, p1, p2);
+}
+static void midiin_detour_install(void) {
+    static const unsigned char PRO[15] = { 0x55, 0x41, 0x56, 0x41, 0x55, 0x57, 0x56, 0x53, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x8B, 0xEC };   // push rbp/r14/r13/rdi/rsi/rbx; sub rsp,48h; mov rbp,rsp
+    g_midiInOrig = (midiincb_t)detour_tramp((unsigned char *)(g_flBase + (FLVA(MIDIINCB) - IMG_BASE)), PRO, 15, (void *)midiin_detour);
+    if (!g_midiInOrig) logmsg("MIDI: FL's MIDI input looks different: changes made with a MIDI controller alone don't sync");
+}
 static int input_recent(DWORD now) {
     LASTINPUTINFO li;
     POINT pt;
     HWND h;
     DWORD pid = 0, root = 0;
     if (g_lastInput && now - g_lastInput < EDIT_INPUT_MS) return 1;
+    if (g_lastMidiIn && (LONG)(now - g_lastMidiIn) < EDIT_INPUT_MS) return 1;   // (signed: it's now | 1, set on another thread)
     li.cbSize = sizeof(li);
     if (!GetLastInputInfo(&li) || now - li.dwTime >= EDIT_INPUT_MS || !GetCursorPos(&pt) || !(h = WindowFromPoint(pt))) return 0;
     GetWindowThreadProcessId(h, &pid);
@@ -11823,6 +11840,7 @@ static DWORD WINAPI engineMain(LPVOID p) {
         save_detour_install();
         delchan_detour_install();
         chsolo_detour_install();
+        midiin_detour_install();
         loadpreset_detour_install();
         InterlockedExchange(&g_uiWanted, 1);
         PostMessageW(g_mainWnd, WM_NULL, 0, 0);
