@@ -930,6 +930,14 @@ How flim keeps them in step:
   B switched too. That made `arrangements`' edit-then-switch check fail on a fresh pair; it compares only the
   edited clip's track now.
 - FL renumbers clip ids on add (`+0x20`), so clip records with another FL's ids are safe to add.
+- **A clip naming a channel FL doesn't have crashes FL** when the playlist draws it (access violation at
+  `sub_DE466A`-ish, offset `0x9E466A`, reading `+0x160` of a null channel; flim's own refresh right after the apply
+  faults first: "CLIPS refresh faulted"). Twice in a tester's session (2026-10-27), each time an audio clip dropped
+  in with its new channel: its chan.add was still being made ready here (the sample) when its clips.set came,
+  and the channel arrived 0.06-0.14 s after. `do_clips` now holds clips that name a channel past the list
+  (`clips_missing_ch`) and `clips_hold_retry` applies them after a remote chan.add; a newer op for the track
+  replaces a held one, the leader's project drops them. Test: `live_test.py clip_hold` (a raw client sends clips
+  for channel n, then A adds channel n).
 - `live_test` `arrangements` (both FLs make the second arrangement themselves with `ADDARR`): insert / rename /
   delete by A, add by B, a clone (insert + clips inside one main-thread call), an edit then a switch, and B
   keeping its own arrangement and pattern across a reload.

@@ -138,6 +138,7 @@ static void send_notes_full(void);
 static void notes_rebaseline(void);
 static void proj_begin(const char *why);
 static void clips_rebaseline(void);
+static void clips_hold_retry(void);
 static int  unit_before_send(const char *key, int isPat, int idx, const unsigned char *d, unsigned n, int g);
 static void unit_agreed(int isPat, int idx, const unsigned char *d, unsigned n, int g);
 static int  unit_base(int isPat, int idx, unsigned char **d, unsigned *n);
@@ -1839,6 +1840,7 @@ static void do_addch(const QItem *it) {
         sc_done(SC_CH, from, nk + 1);
     }
     logmsg("CHAN added index %d (remote)", a);
+    clips_hold_retry();
     {   // its state loads on a later tick, into this channel wherever it is by then
         QItem q; memset(&q, 0, sizeof(q));
         q.type = T_LOAD; q.unit = U_CH; q.a = pos < n ? pos : n; q.path = it->path; q.chobj = obj;
@@ -2724,8 +2726,56 @@ static void do_clipsnap(const QItem *it) {
     free(d);
 }
 
+// A peer's clips naming a channel this FL doesn't have yet (its chan.add is still being made ready here, e.g.
+// its sample): added, FL's playlist read a channel that isn't there as it drew them and FL crashed (a tester,
+// 2026-10-27: an audio clip dropped in with its new channel). Held until the channel is here (clips_hold_retry
+// after a remote chan.add); a newer op for the same playlist track replaces it, the leader's project drops them.
+// ponytail: channel moves while one is held aren't followed (the next chan.add or project load sorts it out).
+#define CLIP_HOLD_MAX 16
+typedef struct { int arr, trk; unsigned n; unsigned char *d; } ClipHold;
+static ClipHold g_clipHold[CLIP_HOLD_MAX];
+static int g_nClipHold;
+static int clips_missing_ch(const unsigned char *d, unsigned n) {
+    void **items;
+    int nch = chan_list(&items);
+    unsigned i;
+    for (i = 0; i < n; i++) {
+        uint32_t item = *(const uint32_t *)(d + (size_t)i * CLIP_SIZE + 4);
+        if ((item & 0xFFFFu) == 0x5000u && (item >> 16) < 0x5000u && (int)(item >> 16) >= nch) return 1;
+    }
+    return 0;
+}
+static void clips_hold_drop(int arr, int trk) {   // trk -2: all
+    int i, k = 0;
+    for (i = 0; i < g_nClipHold; i++)
+        if (trk == -2 || (g_clipHold[i].arr == arr && (g_clipHold[i].trk == trk || trk == -1 || g_clipHold[i].trk == -1))) free(g_clipHold[i].d);
+        else g_clipHold[k++] = g_clipHold[i];
+    g_nClipHold = k;
+}
+static void clips_hold_retry(void) {
+    int i, k = 0;
+    for (i = 0; i < g_nClipHold; i++) {
+        ClipHold *h = &g_clipHold[i];
+        if (clips_missing_ch(h->d, h->n)) { g_clipHold[k++] = *h; continue; }
+        clips_apply(h->arr, h->d, h->n, h->trk);
+        logmsg("CLIPS applied arrangement %d track %d (%u clips): their channel is here now", h->arr, h->trk, h->n);
+        free(h->d);
+    }
+    g_nClipHold = k;
+}
 // it->b: the playlist track (-1 = every clip)
 static void do_clips(const QItem *it) {
+    clips_hold_drop(it->a, it->b);
+    if (clips_missing_ch((const unsigned char *)it->order, (unsigned)it->mode)) {
+        ClipHold *h;
+        if (g_nClipHold == CLIP_HOLD_MAX) { free(g_clipHold[0].d); memmove(g_clipHold, g_clipHold + 1, sizeof(ClipHold) * --g_nClipHold); }
+        h = &g_clipHold[g_nClipHold++];
+        h->arr = it->a; h->trk = it->b; h->n = (unsigned)it->mode;
+        h->d = (unsigned char *)malloc((size_t)h->n * CLIP_SIZE + 1);
+        memcpy(h->d, it->order, (size_t)h->n * CLIP_SIZE);
+        logmsg("CLIPS for arrangement %d track %d name a channel this FL doesn't have yet: held until it's here", it->a, it->b);
+        return;
+    }
     clips_apply(it->a, (const unsigned char *)it->order, (unsigned)it->mode, it->b);
     logmsg("CLIPS applied arrangement %d track %d (%d clips)", it->a, it->b, it->mode);
 }
@@ -6999,6 +7049,7 @@ static void run_task_inner(const QItem *it) {
     case T_PROJLOAD:                          // the leader's project: its structure count from here on
         if (it->peer) {
             int k;
+            clips_hold_drop(0, -2);           // (it has them)
             // the edits our locks were for are gone with the load: the locks go back (kept, they made the
             // leader revert its own edits to them, and the two differed until the safety net)
             ulock_release_moved("", NULL, NULL, 0);

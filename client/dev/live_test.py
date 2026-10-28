@@ -681,6 +681,25 @@ def t_chan_solo():
     check('click ends channel solo: B unchanged', lambda: chon(b), lambda: before)
     check('click ends channel solo: A back to shared', lambda: chon(a), lambda: chon(b), wait=4)
 
+# Clips naming a channel this FL doesn't have yet (its chan.add still being made ready, e.g. its sample) were
+# added at once, and FL crashed drawing the playlist. Now they wait for the channel.
+def t_clip_hold():
+    import base64
+    ca = a.q(arr(a, 0) + 0x14); rec = a.alloc(0x58)
+    a.call(va(a, a.q(a.q(ca) + 16)), ca, rec)                   # FL's default clip record
+    n = len(chans(a))
+    r = bytearray(a.r(rec, 0x58)); struct.pack_into('<IIIH', r, 0, 0, n << 16 | 0x5000, 384, 490)   # channel n: not there yet
+    pos = os.path.getsize(LOG)
+    x = RawWs('raw-clip-%d' % os.getpid(), 'RawClip'); x.pump(1)
+    x.send({'t': 'op', 'op': {'kind': 'clips.set', 'key': 'clips:0:490', 'arr': 0, 'trk': 490, 'data': base64.b64encode(bytes(r)).decode()}})
+    x.pump(2)
+    check('clips for a missing channel: held on B', lambda: any('name a channel this FL doesn\'t have yet' in l for l in log_since(pos, B)), lambda: True, wait=4)
+    check('...and B still runs', lambda: len(chans(b)), lambda: n, wait=0)
+    add_named(a, n, 'Held')                                     # the channel arrives at B (chan.add from A)
+    check('channel arrives: B applies the held clips', lambda: [c[:16] for c in clips(b, 0)[1] if c[12:14] == struct.pack('<H', 490)], lambda: [bytes(r[:16])], wait=10)
+    x.send({'t': 'op', 'op': {'kind': 'clips.set', 'key': 'clips:0:490', 'arr': 0, 'trk': 490, 'data': ''}}); x.pump(2); x.close()
+    check('...emptied again', lambda: [c for c in clips(b, 0)[1] if c[12:14] == struct.pack('<H', 490)], lambda: [], wait=5)
+
 # Quick mute + unmute. While audio runs FL fades a mute out, and an unmute during the fade is lost: the
 # two queued behind other work apply as one, and a track that ends up against flim's apply gets it again.
 def t_mute_fast():
