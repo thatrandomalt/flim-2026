@@ -352,9 +352,13 @@ everyone (a tester, 2026-10-27).
   channel's synced on/off is its `+0x891` (0: one added since, its own) and someone else's change is written
   there. No channel change is read for `SOLO_HOLD_MS` after the solo changes (FL's loop), and after it ends
   every channel gets the shared on/off back after `SOLO_RESTORE_MS` (what FL did, or a click left).
-  ponytail: a click that ended the solo is put back too; a project snapshot while soloed still has the solo's
-  channel mutes (the mixer's are stripped).
-- Test: `live_test.py chan_solo` (4 of its 9 checks fail on the old engine).
+  ponytail: a click that ended the solo is put back too.
+- A project snapshot while soloed has the solo's channel on/off (FLP event 0, a byte after each channel's event
+  64): `chsolostrip_cb` writes each channel's `+0x891` state there instead, as the mixer's are stripped. Before,
+  a member reloading meanwhile got the solo and kept it after the leader's unsolo. (A song file saved while
+  channel-soloed still opens soloed: FL doesn't save `+0x891`.)
+- Test: `live_test.py chan_solo` (12 checks; 4 fail on the engine before it, 2 more on the one before the
+  snapshot strip).
 
 ### Mute fade
 - While audio runs, `SetTrackEnabled(t, 0)` doesn't clear `+0x18`: `sub_12C1810(record, 0)` starts a

@@ -4371,6 +4371,19 @@ static int solostrip_cb(void *ctx, int id, const unsigned char *p, size_t n, siz
     (*t)++;
     return 1;
 }
+// Nor a channel rack solo of ours: each channel gets its on/off from before it (CH_PRESOLO), event 0 after the
+// channel's EV_NEWCHAN (its index), as everyone else has it.
+#define EV_CHON 0                          // byte: the channel is on
+static int chsolostrip_cb(void *ctx, int id, const unsigned char *p, size_t n, size_t at, size_t end) {
+    int *ch = (int *)ctx;
+    (void)at; (void)end;
+    if (id == EV_NEWCHAN && n >= 2) *ch = *(const uint16_t *)p;
+    else if (id == EV_CHON && n == 1 && *ch >= 0) {
+        uint32_t v = chmute_presolo(*ch, *p ? 1u : 0u);
+        if (v != REC_NONE) *(unsigned char *)p = (unsigned char)v;
+    }
+    return 1;
+}
 
 // Leader: snapshot of the current project (FL's own project writer; the current file
 // name stays as it is). Returns malloc'd bytes or NULL. Main thread.
@@ -4388,6 +4401,7 @@ static unsigned char *project_snapshot(size_t *n) {
     unsigned char *d = read_file_w(path, n);
     DeleteFileW(path);
     if (d && solo_scan()) { int t = 0; flp_walk(d, *n, solostrip_cb, &t); }
+    if (d && g_chSolo) { int ch = -1; flp_walk(d, *n, chsolostrip_cb, &ch); }
     return d;
 }
 

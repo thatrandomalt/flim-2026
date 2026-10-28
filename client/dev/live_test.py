@@ -685,6 +685,14 @@ def t_chan_solo():
     time.sleep(3)
     check('click ends channel solo: B unchanged', lambda: chon(b), lambda: before)
     check('click ends channel solo: A back to shared', lambda: chon(a), lambda: chon(b), wait=4)
+    before = chon(b)                                            # the leader's project while A is soloed: no solo in it
+    a.call(CHSOLO, chans(a)[1], 0); time.sleep(2.5)
+    pos = os.path.getsize(LOG); engine_cmd(B, GUI_RESYNC)
+    check('channel solo, B reloads: B loaded the project', lambda: any('PROJECT caught up' in l or 'PROJECT received' in l for l in log_since(pos, B)), lambda: True, wait=40)
+    time.sleep(3)
+    check('...with the shared on/off, not A\'s solo', lambda: chon(b), lambda: before, wait=5)
+    a.call(CHSOLO, chans(a)[1], 0)
+    check('...unsolo: the same on both', lambda: chon(a), lambda: chon(b), wait=5)
 
 # Clips naming a channel this FL doesn't have yet (its chan.add still being made ready, e.g. its sample) were
 # added at once, and FL crashed drawing the playlist. Now they wait for the channel.
