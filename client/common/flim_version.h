@@ -3,5 +3,5 @@
 #define FLIM_VER_Y 26
 #define FLIM_VER_M 10
 #define FLIM_VER_D 23
-#define FLIM_VERSION   "26.10.27"
-#define FLIM_VERSION_W L"26.10.27"
+#define FLIM_VERSION   "26.10.28"
+#define FLIM_VERSION_W L"26.10.28"
