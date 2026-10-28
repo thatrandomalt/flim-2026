@@ -1046,7 +1046,10 @@ target REC id, `+0x14` flags (8 internal, 4 MIDI, 2 smoothing), `+0x18` smoothin
   playhead moved by hand while stopped (FL sets automated params to the new position) goes out as an edit
   too; the receiver gets the value, its own playhead stays.
   A change from someone else while this FL plays is dropped here, so after it stops the two can differ
-  until the knob is moved again.
+  until the knob is moved again. And FL itself snaps automated knobs back to their curve after a structure
+  change: with someone at the keyboard that goes out as an edit, and in `stress_both` (both FLs
+  restructuring at once) it once crossed the other value and left one volume different (the safety net
+  leaves automated values out).
 - Tests: `live_test.py auto_clip auto_add auto_remove auto_hand slot_move`.
 
 ## 6. Threads and locks
