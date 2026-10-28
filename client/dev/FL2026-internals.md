@@ -927,7 +927,8 @@ How flim keeps them in step:
   baseline) and each person's current arrangement is moved so it stays the same arrangement. Several changes in
   one look, or an `n0` that isn't this FL's count (two people at once): re-sync. ponytail: clips / meta ops
   already on their way during an insert / delete land on the old numbers (arrangements aren't in the structure
-  counts); meta covers the first `META_ARR_MAX` (8) arrangements.
+  counts); meta covers the first `META_ARR_MAX` (32, was 8) arrangements. At 8, a 9th and later arrangement
+  didn't even reach the others (`arr_many`: B stayed at 8 of 11).
 - **A new arrangement's content goes too** (a clone, or AddArrangement copying links): `arr_send_content` sends
   its clips per playlist track, the playlist tracks that aren't FL's default (the most common state among its
   500) and its markers.

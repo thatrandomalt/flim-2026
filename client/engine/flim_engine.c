@@ -2895,7 +2895,7 @@ static void on_clips_set(const char *m) {
 #define TSNUMSET_VA   FLVA(TSNUMSET) // SetNumerator(main form, n): what general.setNumerator calls (controls + globals)
 #define TSDENSET_VA   FLVA(TSDENSET) // SetDenominator(main form, d): what general.setDenominator calls
 #define PATLENSET_VA  FLVA(PATLENSET) // PatternLengthChanged(pattern): what patterns.setPatternLength calls after the write
-#define META_ARR_MAX  8
+#define META_ARR_MAX  32          // arrangements whose playlist tracks and markers sync (was 8)
 #define META_MAX      (META_ARR_MAX * 512)
 #define META_SCAN_MS  150
 #define META_SETTLE_MS 300         // some dialogs rename per keystroke: send once it stops

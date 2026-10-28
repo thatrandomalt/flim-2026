@@ -1038,6 +1038,15 @@ def t_arrangements():
         check("reload: B kept its own arrangement and pattern", lambda: (arr_cur(b), b.d(b.g(V(b, 'CURPAT')))), lambda: (0, 3), wait=3)
     a.call(V(a, 'SETARR'), 0); b.call(V(b, 'SETARR'), 0); a.call(V(a, 'PATSELECT'), 1); b.call(V(b, 'PATSELECT'), 1)   # (later tests compare the current one)
 
+def t_arr_many():                                               # playlist tracks of arrangements past the 8th (META_ARR_MAX)
+    n0 = arr_count(a)
+    while arr_count(a) < 11: a.call(V(a, 'ADDARR'), 0, 0); time.sleep(0.6)
+    check('11 arrangements on both', lambda: arr_count(b), lambda: arr_count(a), wait=10)
+    a.call(0x12e60f0, arr(a, 10), 3, a.mkstr('Arr11Track'), 0x0000ff00)
+    check('arrangement 11: playlist track name', lambda: ustr(b, b.q(arr(b, 10) + 3 * 0x114 + 0x24)), lambda: 'Arr11Track', wait=8)
+    while arr_count(a) > n0: a.call(V(a, 'DELARR'), arr_count(a) - 1, 1, 0); time.sleep(0.6)
+    check('...back to %d on both' % n0, lambda: arr_count(b), lambda: n0, wait=10)
+
 def t_slot_move():
     t = 4
     if not (has_plug(a, t, 0) and has_plug(a, t, 1)): print('   (track %d needs effects in slots 0 and 1: skipped)' % t); return
