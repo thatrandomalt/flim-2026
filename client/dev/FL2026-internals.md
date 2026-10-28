@@ -540,6 +540,17 @@ which then travels like any sample. `FLIM_SHARED_DIR` moves the folder (tests: t
   backup, an old-dated copy still wins, unfinished files and programs stay put, a delete survives B
   reconnecting, a channel keeps a shared path).
 
+**Placeholders for MP3 / FLAC / OGG.** FL's sample loader goes by the content, not the extension: WAV data
+saved as `.mp3`, `.flac` or `.ogg` loads with its exact frame count (a Sampler's is at `*(ch + 0x330) + 0x94`).
+So those get the same silent 8 kHz WAV placeholder, under their own name (`placeholder_format` 3), when the
+sender sends their length (`compressed_ms`): FLAC from STREAMINFO, OGG from the last page's granule position
+(Vorbis at its rate, Opus at 48 kHz minus the pre-skip), MP3 from the Xing / Info or VBRI frame count plus one
+(FL decodes that header frame as a silent frame too; ffprobe drops it with the LAME delay and padding) or, without
+one, from the size and bitrate. All matched FL's own frame counts on ffmpeg's files and FL's factory samples. A
+compressed sample of unknown length still waits for its download. Each FL resamples to its own rate (the two test
+FLs: 48 and 44.1 kHz), so frame counts differ between FLs and lengths don't. Test: `live_test.py sample_compressed`
+(with `-NoLocalB`): a placeholder for each of the three, then the real sound; the engine before waited for each.
+
 **Sample plugins and placeholders (Slicer 2).** Loaded with flim's silent 8 kHz placeholder, Fruity
 Slicer 2 fits its slices to that; its own save afterwards has lost them. So after the download flim
 reloads the state it *received* (`phload_*`), not the plugin's save of itself.

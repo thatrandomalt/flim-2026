@@ -43,7 +43,7 @@ samples) is kept in sync over the internet. It works a bit like [Drawpile](https
 |---|---|
 | Channel volume / pan / on-off / mixer routing, filter, pitch, portamento, gate, swing, time offset, delay and arp settings | Samples inside plugins that store them compressed or encrypted (Kontakt, ...) |
 | Every plugin parameter (generators and effects, FL's own and third-party VSTs) | Showing other people's selection inside an editor |
-| Full plugin state (presets, wavetables, samples loaded inside a VST, ...), checked as soon as you stop working in the plugin's window | Placeholders for MP3 / FLAC / OGG samples (those wait for their download, see [Samples](#samples)) |
+| Full plugin state (presets, wavetables, samples loaded inside a VST, ...), checked as soon as you stop working in the plugin's window | |
 | Tempo, swing and main pitch (the main volume is each person's own) | |
 | Mixer volume / pan / stereo separation / mute / built-in EQ; each effect slot's on/off and mix level | |
 | Mixer track names, colors and routing (sends on/off and send levels) | |
@@ -252,12 +252,12 @@ both when the leader's project is sent and when someone loads a new sample durin
   (one you already have is hard-linked there, or copied from another drive), the leader's too.
 - Nobody waits for a transfer: the change that uses a sample (a new audio clip, a sample dropped on a
   channel, the leader's project) arrives right away, and the upload and download happen in the
-  background. Until a WAV or AIFF sample has arrived, the others get a **silent placeholder** with the
+  background. Until a WAV, AIFF, MP3, FLAC or OGG sample has arrived, the others get a **silent placeholder** with the
   same name and about the same length, so the audio clip or channel is already there and the arrangement
   keeps its shape; when the download finishes, the real sound replaces it by itself. flim's window
   shows *"Uploading samples: 12.3 / 40.0 MB"* / *"Downloading samples: … (placeholders until done)"*.
-- MP3, FLAC, OGG and other formats can't have a placeholder: a change that uses one waits until that
-  file has downloaded (your other edits still go out right away).
+- Other formats (and an MP3, FLAC or OGG file whose length flim can't read) can't have a placeholder: a
+  change that uses one waits until that file has downloaded (your other edits still go out right away).
 - **If more than 50 MB would have to be uploaded at once, flim asks first** (before anything is sent) and shows the exact amount,
   e.g. *"Sending them uploads 60.6 MB (63,504,132 bytes). Send them now?"*. **No** leaves those samples
   out (they will be missing for the others) and flim won't ask about them again until FL restarts.

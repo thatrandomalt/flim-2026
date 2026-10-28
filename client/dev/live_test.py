@@ -1056,6 +1056,30 @@ def t_midi_input():
     check('MIDI note only: stays FL\'s own', lambda: rec_get(b, t) != 2222, lambda: True, wait=0)
     quiet['on'] = False
 
+# An MP3 / FLAC / OGG sample gets a silent placeholder of its length, as WAV / AIFF do (FL's loader goes by the
+# content, so a WAV under its name loads). Needs B to download: restart_test.ps1 -NoLocalB. A Sampler's frame
+# count is at *(ch + 0x330) + 0x94.
+def smp_frames(p, c): s = p.q(c + 0x330); return p.d(s + 0x94) if s else None
+def t_sample_compressed():
+    import subprocess
+    if not os.environ.get('ISO_NOLOCAL_B') and not os.environ.get('FLIM_TEST_NOLOCAL_B'):
+        print('   (B uses local copies: sample_compressed needs -NoLocalB, set FLIM_TEST_NOLOCAL_B=1: skipped)'); return
+    for ext in ('mp3', 'flac', 'ogg'):
+        f = os.path.join(TMP, 'flim live %s %d.%s' % (ext, os.getpid(), ext))
+        hz = 300 + int(time.time() * 7) % 400                   # new content each run: a real upload
+        subprocess.run(['ffmpeg', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'sine=f=%d:d=2.5:sample_rate=44100' % hz, '-ac', '2', f], check=True)
+        src, dst = os.path.join(TMP, 'flim_live_cmp0.fst'), os.path.join(TMP, 'flim_live_cmp.fst')
+        a.call(0xf54570, a.mkstr(src), 32, chans(a)[0], 1)
+        fst_with_sample(src, dst, f)
+        pos = os.path.getsize(LOG); n = len(chans(a))
+        a.call(0x1004230, -1, 0, 1); a.call(0xf54760, a.mkstr(dst), 32, chans(a)[-1], 0)
+        check('%s sample: channel added on B' % ext, lambda: len(chans(b)), lambda: n + 1, wait=15)
+        check('...with a placeholder (not waited for)', lambda: any(re.search(r'SAMPLES op lists \d+ samples: [1-9]\d* placeholders', l) for l in log_since(pos, B)), lambda: True, wait=5)
+        def secs(p):                                            # (each FL resamples to its own rate: 44.1 or 48 kHz)
+            fr = smp_frames(p, chans(p)[n]) or 0
+            return min((abs(fr / r - 2.5), round(fr / r, 1)) for r in (44100, 48000))[1]
+        check('...and the real sound (2.5 s, not the placeholder)', lambda: secs(b), lambda: secs(a), wait=20)
+
 def t_arr_many():                                               # playlist tracks of arrangements past the 8th (META_ARR_MAX)
     n0 = arr_count(a)
     while arr_count(a) < 11: a.call(V(a, 'ADDARR'), 0, 0); time.sleep(0.6)

@@ -8792,10 +8792,10 @@ static volatile uint64_t g_upDone, g_upTotal, g_dnDone, g_dnTotal;   // backgrou
 static DWORD   g_xferShown;
 
 // Background transfers. Uploads: the op goes out right away, the file follows. Downloads: the
-// op is applied right away with a silent placeholder file (WAV / AIFF) where the sample will
+// op is applied right away with a silent placeholder file (WAV / AIFF; MP3 / FLAC / OGG with their length) where the sample will
 // be; the download retries until the sender's upload is there, then the real data is written
 // INTO the placeholder file (same file, so hard-link aliases see it too) and the units that use
-// it are reloaded. Other formats can't have a placeholder: their ops wait for the download.
+// it are reloaded. Other formats (and compressed ones of unknown length) wait for the download.
 typedef struct XJob { char hex[65]; uint64_t size; wchar_t path[MAX_PATH * 2]; int ph; DWORD first, next; struct XJob *nx; } XJob;
 static XJob   *g_upQ, *g_dnQ;                                // under g_sampleLock
 typedef struct { wchar_t *path; char hex[65]; uint64_t size; } Placeholder;
@@ -8898,9 +8898,12 @@ static wchar_t *reload_take(int *n, size_t *len) {
     free(names);
     return list;
 }
-static int placeholder_format(const wchar_t *p) {         // 1 = WAV, 2 = AIFF, 0 = no placeholder possible
+// 1 = WAV, 2 = AIFF, 3 = compressed (MP3 / FLAC / OGG: a WAV under its name, FL's loader goes by the content, so it
+// needs the sender's length), 0 = no placeholder possible
+static int placeholder_format(const wchar_t *p) {
     if (ends_with_ci(p, L".wav")) return 1;
     if (ends_with_ci(p, L".aif") || ends_with_ci(p, L".aiff")) return 2;
+    if (ends_with_ci(p, L".mp3") || ends_with_ci(p, L".flac") || ends_with_ci(p, L".ogg")) return 3;
     return 0;
 }
 static void be32(unsigned char *o, uint32_t v) { o[0] = (unsigned char)(v >> 24); o[1] = (unsigned char)(v >> 16); o[2] = (unsigned char)(v >> 8); o[3] = (unsigned char)v; }
@@ -8917,7 +8920,7 @@ static int placeholder_write(const wchar_t *path, uint64_t ms) {
     if (ms > 20 * 60 * 1000) ms = 20 * 60 * 1000;
     n = (uint32_t)(RATE * ms / 1000);
     memset(h, 0, sizeof(h));
-    if (fmt == 1) {
+    if (fmt != 2) {
         memcpy(h, "RIFF", 4); *(uint32_t *)(h + 4) = 36 + n; memcpy(h + 8, "WAVEfmt ", 8);
         *(uint32_t *)(h + 16) = 16; *(uint16_t *)(h + 20) = 1; *(uint16_t *)(h + 22) = 1;
         *(uint32_t *)(h + 24) = RATE; *(uint32_t *)(h + 28) = RATE; *(uint16_t *)(h + 32) = 1; *(uint16_t *)(h + 34) = 8;
@@ -8931,7 +8934,7 @@ static int placeholder_write(const wchar_t *path, uint64_t ms) {
         hn = 54;
     }
     body = (unsigned char *)malloc((size_t)n + 1);
-    memset(body, fmt == 1 ? 0x80 : 0, (size_t)n + 1);     // silence: unsigned 8-bit WAV, signed AIFF
+    memset(body, fmt != 2 ? 0x80 : 0, (size_t)n + 1);     // silence: unsigned 8-bit WAV, signed AIFF
     f = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, CREATE_ALWAYS, 0, NULL);
     ok = f != INVALID_HANDLE_VALUE;
     if (ok) {
@@ -8959,6 +8962,93 @@ static uint64_t wav_ms(const wchar_t *p) {
         o += 8 + (size_t)len + (len & 1);
     }
     return 0;
+}
+
+// Length in ms of an MP3 / FLAC / OGG (Vorbis or Opus) file from its headers (0 = unknown): for placeholders.
+static unsigned char *file_part(HANDLE f, int64_t at, DWORD n, DWORD *got) {
+    unsigned char *b = (unsigned char *)malloc(n);
+    LARGE_INTEGER li;
+    li.QuadPart = at;
+    *got = 0;
+    if (!SetFilePointerEx(f, li, NULL, at < 0 ? FILE_END : FILE_BEGIN) || !ReadFile(f, b, n, got, NULL)) *got = 0;
+    return b;
+}
+static uint64_t flac_ms(const unsigned char *h, DWORD got) {
+    uint32_t rate;
+    uint64_t total;
+    if (got < 42 || memcmp(h, "fLaC", 4) != 0 || (h[4] & 0x7F) != 0) return 0;   // STREAMINFO comes first
+    rate = ((uint32_t)h[18] << 12) | ((uint32_t)h[19] << 4) | (h[20] >> 4);
+    total = ((uint64_t)(h[21] & 0x0F) << 32) | ((uint64_t)h[22] << 24) | ((uint64_t)h[23] << 16) | ((uint64_t)h[24] << 8) | h[25];
+    return rate ? total * 1000 / rate : 0;
+}
+static uint64_t ogg_ms(HANDLE f, const unsigned char *h, DWORD got) {
+    uint32_t rate = 0, pre = 0;
+    unsigned char *t;
+    DWORD tn, i;
+    uint64_t gran = 0;
+    if (got < 64 || memcmp(h, "OggS", 4) != 0) return 0;
+    {
+        const unsigned char *pk = h + 27 + h[26];                // first packet, after the segment table
+        if (pk + 20 > h + got) return 0;
+        if (memcmp(pk, "\x01vorbis", 7) == 0) rate = *(const uint32_t *)(pk + 12);
+        else if (memcmp(pk, "OpusHead", 8) == 0) { rate = 48000; pre = *(const uint16_t *)(pk + 10); }
+    }
+    if (!rate) return 0;
+    t = file_part(f, -65536, 65536, &tn);
+    if (!tn) { free(t); t = file_part(f, 0, 65536, &tn); }
+    for (i = tn >= 14 ? tn - 14 : 0; i > 0; i--)                // the last page's granule position: the length
+        if (memcmp(t + i, "OggS", 4) == 0) { gran = *(const uint64_t *)(t + i + 6); break; }
+    free(t);
+    if (!gran || gran == ~0ull || gran <= pre) return 0;
+    return (gran - pre) * 1000 / rate;
+}
+static uint64_t mp3_ms(HANDLE f, const unsigned char *h, DWORD got) {
+    static const int BR[2][16] = { { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0 },     // MPEG 1 layer III
+                                   { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0 } };     // MPEG 2 / 2.5
+    static const int SR[4] = { 44100, 48000, 32000, 0 };
+    LARGE_INTEGER sz;
+    DWORD o = 0;
+    int v, rate, br, spf, side, mono;
+    uint32_t frames = 0;
+    if (got >= 10 && memcmp(h, "ID3", 3) == 0) o = 10 + (((DWORD)(h[6] & 0x7F) << 21) | ((DWORD)(h[7] & 0x7F) << 14) | ((DWORD)(h[8] & 0x7F) << 7) | (h[9] & 0x7F));
+    {   // the first frame (after the tag: read it if it was longer than the head)
+        unsigned char *b = NULL;
+        DWORD bn = 0;
+        const unsigned char *q;
+        if (o + 4 > got) { b = file_part(f, o, 4096, &bn); q = b; } else { q = h + o; bn = got - o; }
+        while (bn >= 4 && !(q[0] == 0xFF && (q[1] & 0xE6) == 0xE2)) { q++; bn--; o++; }   // sync, layer III
+        if (bn < 4) { free(b); return 0; }
+        v = (q[1] >> 3) & 3;                                     // 3 MPEG 1, 2 MPEG 2, 0 MPEG 2.5
+        rate = SR[(q[2] >> 2) & 3];
+        if (!rate || v == 1) { free(b); return 0; }
+        rate = v == 3 ? rate : v == 2 ? rate / 2 : rate / 4;
+        br = BR[v == 3 ? 0 : 1][q[2] >> 4];
+        spf = v == 3 ? 1152 : 576;
+        mono = (q[3] >> 6) == 3;
+        side = v == 3 ? (mono ? 17 : 32) : (mono ? 9 : 17);
+        if (bn >= (DWORD)(4 + side + 12) && (memcmp(q + 4 + side, "Xing", 4) == 0 || memcmp(q + 4 + side, "Info", 4) == 0) && (q[4 + side + 7] & 1))
+            frames = ((uint32_t)q[4 + side + 8] << 24) | ((uint32_t)q[4 + side + 9] << 16) | ((uint32_t)q[4 + side + 10] << 8) | q[4 + side + 11];
+        else if (bn >= 4 + 32 + 18 && memcmp(q + 4 + 32, "VBRI", 4) == 0)
+            frames = ((uint32_t)q[36 + 14] << 24) | ((uint32_t)q[36 + 15] << 16) | ((uint32_t)q[36 + 16] << 8) | q[36 + 17];
+        free(b);
+    }
+    if (frames) return (uint64_t)(frames + 1) * spf * 1000 / rate;   // (FL decodes the Xing / VBRI frame too: a silent one)
+    if (!br || !GetFileSizeEx(f, &sz) || sz.QuadPart <= o) return 0;   // constant bitrate: from the size
+    return (uint64_t)(sz.QuadPart - o) * 8 / br;
+}
+static uint64_t compressed_ms(const wchar_t *p) {
+    HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    unsigned char *h;
+    DWORD got;
+    uint64_t ms = 0;
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    h = file_part(f, 0, 8192, &got);
+    if (ends_with_ci(p, L".flac")) ms = flac_ms(h, got);
+    else if (ends_with_ci(p, L".ogg")) ms = ogg_ms(f, h, got);
+    else if (ends_with_ci(p, L".mp3")) ms = mp3_ms(f, h, got);
+    free(h);
+    CloseHandle(f);
+    return ms;
 }
 
 static int file_info(const wchar_t *p, uint64_t *size, FILETIME *mt) {
@@ -9914,7 +10004,7 @@ static char *samples_attach(const char *msg, const unsigned char *blob, size_t n
             continue;
         } else {
             if (wcscmp(found, full) != 0) logmsg("SAMPLES %S isn't there: sent the one in the project's folder", full);
-            E[ne].ms = wav_ms(found);
+            E[ne].ms = placeholder_format(found) == 3 ? compressed_ms(found) : wav_ms(found);
         }
         E[ne].p = L.paths[i];
         E[ne].full = _wcsdup(found);
@@ -10370,7 +10460,7 @@ static void samples_resolve(const char *m) {
             continue;
         }
         if (sample_hash(R[i].cache, hx, &sz) && strcmp(hx, R[i].hex) == 0) { map_set(R[i].p, R[i].cache); continue; }
-        if (placeholder_format(R[i].cache)) {
+        if (placeholder_format(R[i].cache) && (placeholder_format(R[i].cache) != 3 || R[i].ms)) {   // (compressed: with its length only)
             // a silent placeholder now (unless this content is already on its way: same file),
             // the real data in the background
             int queued = download_pending(R[i].hex);
@@ -10392,7 +10482,7 @@ static void samples_resolve(const char *m) {
         R[i].need = 1;
         nneed++;
     }
-    // formats without a placeholder (mp3, flac, ogg, sf2...): this op waits for them
+    // formats without a placeholder (sf2..., or a compressed one of unknown length): this op waits for them
     for (i = 0; i < nr; i++) {
         char hx[65];
         uint64_t sz;
