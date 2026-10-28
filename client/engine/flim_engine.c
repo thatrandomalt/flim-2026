@@ -7696,7 +7696,13 @@ static void schedule_units(DWORD now) {
 // mute that ends up against flim's last apply this soon after it is put back, not taken for an edit.
 // Later, any change is someone's click: a mute click goes back to the value flim applied all the time.
 #define MUTE_FADE_MS 500
-static unsigned char g_mutePend[MAX_MIX];  // a track's new mute reading + 1, until the next pass confirms it
+// A mute change goes out once it has read the same for MUTE_SETTLE_MS: FL's solo click mutes the track on the mouse
+// button going down and solos on it coming up (~0.2 s later), and that mute went out before the solo was seen (a
+// tester's "mixer solos get synced", 2 of 54 solos). A solo starting meanwhile takes it as its own: the track's
+// mute from before it (MIX_PRESOLO) gets the shared one back.
+#define MUTE_SETTLE_MS 400
+static unsigned char g_mutePend[MAX_MIX];  // a track's new mute reading + 1, until it has settled
+static DWORD g_mutePendAt[MAX_MIX];        // since when it reads that
 static DWORD g_soloChangedAt;              // when solo last went on or off here
 // The channel rack's solo: ended by a click (that channel back on: no longer FL's shape) as well as by the toggle.
 // Afterwards the channels go back to the on/off everyone shares (FL may turn them all on instead, or a click
@@ -7737,6 +7743,16 @@ static void solo_poll(DWORD now) {
     chsolo_poll(now);
     if (on == was) return;
     if (was >= 0) logmsg("SOLO %s here (each person's own: not synced)", on ? "on" : "off");
+    if (on == 1)                           // mutes not out yet: part of the solo click (applied now: into MIX_PRESOLO)
+        for (i = 0; i < n; i++) {
+            Slot *s = &g_slots[i];
+            int t = (int)(s->id & 0xFFFFF);
+            if (IS_MUTE_ID(s->id) && t < MAX_MIX && g_mutePend[t] && s->last != REC_NONE) {
+                g_mutePend[t] = 0;
+                enqueue_apply(s->id, s->last, 0);
+                logmsg("MUTE track %d changed just before a solo here: part of it, not synced", t);
+            }
+        }
     restoreAt = was == 1 ? (now + SOLO_RESTORE_MS) | 1 : 0;   // (soloed again meanwhile: its own unsolo puts back)
     was = on;
     g_soloChangedAt = now;
@@ -7746,7 +7762,8 @@ static int mute_settled(Slot *s, uint32_t v, DWORD now) {
     if (t >= MAX_MIX) return 1;
     if (v == s->last || v == REC_NONE || s->last == REC_NONE) { g_mutePend[t] = 0; return 1; }
     if (now - g_soloChangedAt < SOLO_HOLD_MS) return 0;
-    if (g_mutePend[t] != v + 1) { g_mutePend[t] = (unsigned char)(v + 1); return 0; }
+    if (g_mutePend[t] != v + 1) { g_mutePend[t] = (unsigned char)(v + 1); g_mutePendAt[t] = now; return 0; }
+    if (now - g_mutePendAt[t] < MUTE_SETTLE_MS) return 0;
     g_mutePend[t] = 0;
     return 1;
 }

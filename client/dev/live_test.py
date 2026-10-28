@@ -655,6 +655,11 @@ def t_solo():
     time.sleep(2.5)
     check('mute ends solo: B unchanged', lambda: mutes(b), lambda: before)
     check('mute ends solo: A back to shared', lambda: mutes(a), lambda: mutes(b), wait=4)
+    before = mutes(b)                                            # FL's solo click: the mute on mouse down, the solo ~0.2 s later
+    a.call(MUTE, 8, 0); time.sleep(0.2); a.call(SOLO, 3, 1, 2); time.sleep(2.5)
+    check('mute just before a solo: B unchanged', lambda: mutes(b), lambda: before)
+    a.call(SOLO, 3, 0, 2)
+    check('...unsolo: A back to shared', lambda: mutes(a), lambda: mutes(b), wait=4)
 
 # The channel rack's solo is each person's own as well: FL's toggle turns the other channels off.
 CHSOLO = 0xffaaa0                                               # toggle(channel, flags): solo / unsolo
@@ -709,7 +714,7 @@ def t_mute_fast():
     busy = threading.Thread(target=lambda: b.call(va(b, sleep), 2500)); busy.start()   # B's main thread busy
     time.sleep(0.3); a.call(MUTE, t, 0); time.sleep(0.5); a.call(MUTE, t, 1); busy.join()
     check('mute + unmute while B is busy', lambda: (mixb(a, t, 0x18), mixb(b, t, 0x18)), lambda: (1, 1), wait=4)
-    check('...B applies only the last', lambda: sum('APPLY id=0x%08x' % (0xF0000000 | t) in l for l in log_since(pos, B)), lambda: 1)
+    check('...B applies only the last', lambda: sum('APPLY id=0x%08x' % (0xF0000000 | t) in l for l in log_since(pos, B)) <= 1, lambda: True)   # (none: the mute hadn't settled, MUTE_SETTLE_MS)
     a.call(MUTE, t, 0)
     check('mute (shared)', lambda: mixb(b, t, 0x18), lambda: 0, wait=4)
     pos = os.path.getsize(LOG); a.call(MUTE, t, 1); t0 = time.time()

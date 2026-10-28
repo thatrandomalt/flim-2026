@@ -313,8 +313,15 @@ How flim keeps it local (engine `solo_*`, `mute_*`):
   others ("soloing and muting act weird after a while, and sometimes sync", a tester's session
   2026-10-23: two tracks unmuted in the same millisecond a second after an unsolo went out as edits).
 - FL changes the tracks one at a time around flagging the soloed one, so a poll pass can land
-  half-way. A mute change counts only once two passes in a row read it, and not for `SOLO_HOLD_MS`
-  (1.5 s, was 1 s) after the solo state changed.
+  half-way. A mute change counts only once it has read the same for `MUTE_SETTLE_MS` (0.4 s; was two
+  passes in a row), and not for `SOLO_HOLD_MS` (1.5 s, was 1 s) after the solo state changed.
+- A solo click mutes a track about 0.2 s before the solo is flagged (seemingly the mute on the mouse button
+  going down, the solo on it coming up). Two passes in a row read that mute and it went out: 2 of a tester's
+  54 solos (2026-10-27, "mixer insert solos are getting synced"). Now a solo that starts while a mute hasn't
+  settled takes it as part of the solo: that track's `+0x1c` gets the shared mute back (an apply, which
+  writes `+0x1c` while soloed) and nothing goes out ("MUTE track n changed just before a solo here").
+  Test: `solo`'s "mute just before a solo" (failed on the previous engine). ponytail: a real mute click less
+  than 0.4 s before an unrelated solo is put back too.
 - A project snapshot (join, re-sync, backup) has none of the leader's solo: `project_snapshot` puts
   each track's `+0x1c` into bit 8 of event 236 and clears `0x1000`. Checked by restarting B while A
   had a track soloed: B came in with the shared mutes and no solo.
