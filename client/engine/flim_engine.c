@@ -7704,6 +7704,19 @@ static void schedule_units(DWORD now) {
 static unsigned char g_mutePend[MAX_MIX];  // a track's new mute reading + 1, until it has settled
 static DWORD g_mutePendAt[MAX_MIX];        // since when it reads that
 static DWORD g_soloChangedAt;              // when solo last went on or off here
+// Playing is each person's own: flim never starts or stops FL. A tester saw someone's space key start others'
+// FLs "sometimes" (not reproduced): FL starting or stopping is logged with whether anyone was at the keyboard
+// and what came from the others just before, so the next time shows what did it.
+static char g_lastInKind[24];
+static volatile DWORD g_lastInAt;
+static void play_poll(DWORD now) {
+    static int was = -1;
+    int on = fl_playing();
+    if (on == was) return;
+    if (was >= 0) logmsg("PLAY %s here (input here: %s; last from the others: %s %lu ms before)", on ? "started" : "stopped",
+                        input_recent(now) ? "yes" : "no", g_lastInAt ? g_lastInKind : "nothing", g_lastInAt ? now - g_lastInAt : 0);
+    was = on;
+}
 // The channel rack's solo: ended by a click (that channel back on: no longer FL's shape) as well as by the toggle.
 // Afterwards the channels go back to the on/off everyone shares (FL may turn them all on instead, or a click
 // that ended it left the rest off).
@@ -7741,6 +7754,7 @@ static void solo_poll(DWORD now) {
             }
     }
     chsolo_poll(now);
+    play_poll(now);
     if (on == was) return;
     if (was >= 0) logmsg("SOLO %s here (each person's own: not synced)", on ? "on" : "off");
     if (on == 1)                           // mutes not out yet: part of the solo click (applied now: into MIX_PRESOLO)
@@ -8462,6 +8476,16 @@ static void sh_joined(void);
 static void handle_msg(const char *m) {
     log_op("in", m);
     if (op_changes_song(m)) g_lastOpAt = GetTickCount();
+    {   // what came last (play_poll; not the constant cursors / alive)
+        const char *k = strstr(m, "\"kind\":\"");
+        char kind[sizeof(g_lastInKind)];
+        int i = 0;
+        if (k) {
+            for (k += 8; *k && *k != '"' && i < (int)sizeof(kind) - 1; ) kind[i++] = *k++;
+            kind[i] = 0;
+            if (strcmp(kind, "cur") && strcmp(kind, "alive")) { strcpy_s(g_lastInKind, sizeof(g_lastInKind), kind); g_lastInAt = GetTickCount(); }
+        }
+    }
     {   // "sc":[ch,mix,pat]
         const char *q = strstr(m, "\"sc\":[");
         int k;
