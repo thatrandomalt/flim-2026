@@ -577,7 +577,17 @@ FL then sent the whole state back under the plugin lock, and the editor's next m
 while the editor held the lock, the tester's FL reloaded the old agreed state every couple of seconds
 instead, undoing the edits there. Now each param applied from someone else delays that unit's checks
 until a new baseline (`REBASE_MS` after the last one), and params a plugin moves along with it
-(`SUPPRESS_MS`) aren't local edits. `live_test.py fd3_lock` failed both ways before.
+aren't local edits. `live_test.py fd3_lock` failed both ways before.
+
+Since 26.11.02 a plugin's knobs lock one by one (`param:<id>`, as upstream flim 26.10.29 does); the
+plugin lock (`plug:...`) only covers a preset-sized burst and state sends. That made the old way of
+ignoring linked params wrong: every local change of the plugin was ignored for `SUPPRESS_MS` (600 ms)
+after each applied param, so someone turning another knob of a plugin someone else was working on
+never got through (`knob_split`: B's knob, with A's changes landing every 300 ms). Plugins move linked
+params inside the write itself (setParameter), so the apply now re-reads that plugin's watched params
+right after it and takes the ones that moved as seen (logged "moved N linked params"), skipping knobs
+whose lock is ours (the user here is turning them). `SUPPRESS_MS` stays for state loads, whose updates
+can come late.
 
 **Big note edits are edits.** `scan_notes` used to take 8+ patterns changing at once for a project load
 and not send them; a transpose across many patterns was lost (upstream fix by cashflowbeatz, 26.10.30).

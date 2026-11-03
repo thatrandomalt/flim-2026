@@ -69,10 +69,11 @@ getting in each other's way.
 **Locks:** while you tweak a mixer knob, change a plugin, edit one channel's notes in a pattern or edit
 a playlist track, that part is yours. If someone else touches the same part at the same time, their
 change is undone and FL's hint bar shows *"Channel 'Kick' in pattern 3 is being edited by Alex"*,
-*"Playlist track 4 is being edited by Alex"* or *"Channel 'Serum 2' is being edited by Alex"*. A plugin
-is locked as a whole: any knob or preset change on it takes the lock. Locks are released shortly after
-you stop: about 0.6 s for a channel or mixer knob, 2 s for notes or a playlist track, and for a plugin
-**10 s** by default. Each person sets their own plugin time (1–10 s, *Keep a plugin I change locked to
+*"Playlist track 4 is being edited by Alex"* or *"Channel 'Serum 2' is being edited by Alex"*. Each knob
+of a plugin has its own lock, so two people can turn different knobs of one synth at once; a preset
+change (many knobs at once) or loading the plugin's whole state locks the plugin as a whole. Locks are
+released shortly after you stop: about 0.6 s for a knob, 2 s for notes or a playlist track, and for a
+whole plugin **10 s** by default. Each person sets their own plugin time (1–10 s, *Keep a plugin I change locked to
 me for … s* in flim's window): it is how long a plugin you're working on stays yours after your last change.
 Names, colors, routing, markers and the time signature have no locks; if two people change the same
 one at the same moment, the leader's change wins. If the channel lists ever end up different anyway (say,

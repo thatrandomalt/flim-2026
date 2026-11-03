@@ -757,6 +757,28 @@ def t_fd3_lock():
     bad += [l[13:110] for l in log_since(pos, B) if u + ': reverting' in l or 'PLUG sent plug.state unit=' + u in l]
     check('FD3: B leaves A\'s plugin alone', lambda: bad[:2], lambda: [])
 
+# Two people turn different knobs of one plugin at once: each knob has its own lock, both edits stay (needs
+# fd3_lock's Fruity Delay 3). A knob dragged fast goes out at most every 60 ms, ending on the last value.
+def t_knob_split():
+    t, s = 6, 1
+    if not has_plug(a, t, s): print('   (no Fruity Delay 3 on track 6: run fd3_lock first)'); return
+    pa, pb = fx_id(t, s, 14), fx_id(t, s, 16)
+    time.sleep(5)                                               # (a preset load just before holds the whole plugin until it settles)
+    pos = os.path.getsize(LOG)
+    for k in range(10):
+        rec_set(a, pa, 1100 + 90 * k); rec_set(b, pb, 2100 + 90 * k); time.sleep(0.3)
+    check('knobs of one plugin: A\'s knob', lambda: rec_get(b, pa), lambda: rec_get(a, pa), wait=4)
+    check('knobs of one plugin: B\'s knob', lambda: rec_get(a, pb), lambda: rec_get(b, pb), wait=4)
+    bad = [l[13:110] for x in (A, B) for l in log_since(pos, x) if 'snapped back' in l or 'local edit put back' in l]
+    check('...neither snapped back', lambda: bad[:2], lambda: [])
+    pos = os.path.getsize(LOG)
+    t0 = time.time()
+    for k in range(40): rec_set(a, pa, 3000 + 50 * k); time.sleep(0.02)
+    ms = (time.time() - t0) * 1000
+    check('fast drag: B ends on the last value', lambda: rec_get(b, pa), lambda: rec_get(a, pa), wait=4)
+    sent = [l for l in log_since(pos, A) if 'DETECT id=0x%08x' % pa in l and '(sent' in l]
+    check('...sent at most every 60 ms (%d sends in %d ms)' % (len(sent), ms), lambda: len(sent) <= ms / 60 + 2, lambda: True, wait=0)
+
 # One edit that changes the notes of many patterns at once (a transpose) is an edit, not a project load.
 def t_notes_bulk():
     src = struct.pack('<IHHIH', 0, 0, 0, 48, 60) + bytes(10)

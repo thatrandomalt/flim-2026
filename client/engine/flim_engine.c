@@ -203,6 +203,8 @@ typedef struct {
     uint32_t echo;          // value read back right after our last apply, and when (ECHO_MS): the
     DWORD echoAt;           //   plugin's own rounding of it, not a local edit
     uint32_t applied;       // the value of that apply: a target that takes it late (mute) reaches it then
+    DWORD lastSent;         // our last param.set for it (poll thread: PARAM_SEND_MS)
+    int  sendPending;       // changed again sooner: its newest value (last) is still to go out
 } Slot;
 #define ECHO_MS 2000
 
@@ -7447,10 +7449,27 @@ static void drain_queue_mainthread(void) {
             // a plugin links to the one it got aren't local edits either.
             int un, ua, ub;
             Unit *u = unit_of_id(it.id, &un, &ua, &ub) ? unit_ptr(un, ua, ub) : NULL;
-            if (u) {
-                DWORD now = GetTickCount();
-                u->baselineAt = now + REBASE_MS;
-                if ((it.id & 0xFFFF) >= REC_PLUG_FIRST) u->suppressUntil = now + SUPPRESS_MS;
+            if (u) u->baselineAt = GetTickCount() + REBASE_MS;
+            if (u && plug_param_unit(it.id, &un, &ua, &ub)) {
+                // params the plugin moved along with it (it does that inside the write): taken as seen. Only
+                // those: a time window would also swallow knobs the user here turns meanwhile (each knob has
+                // its own lock, so two people can work one plugin)
+                int k, n = 0;
+                for (k = 0; k < g_nslot; k++) {
+                    Slot *o = &g_slots[k];
+                    int u2, a2, b2;
+                    uint32_t ov;
+                    // (a knob the user here is turning (its lock is ours) is theirs. ponytail: a turn that starts in
+                    // the 30 ms before an apply can be taken for linked; the drag's next step goes out anyway)
+                    if (o == s || o->lockedByMe || !plug_param_unit(o->id, &u2, &a2, &b2) || u2 != un || a2 != ua || b2 != ub) continue;
+                    if ((ov = read_value(o->id)) == REC_NONE || ov == o->last) continue;
+                    EnterCriticalSection(&g_slotLock);
+                    o->last = ov;
+                    InterlockedIncrement(&o->gen);
+                    LeaveCriticalSection(&g_slotLock);
+                    n++;
+                }
+                if (n) logmsg("APPLY id=0x%08x moved %d linked params of its plugin here: not edits", it.id, n);
             }
         }
         if (s) {
@@ -7821,6 +7840,28 @@ static uint32_t container_of(uint32_t id) {
 
 #define BULK_MIN_CHANGES    24
 #define BULK_MIN_CONTAINERS 4
+#define PARAM_SEND_MS       60      // one param.set per knob per this interval; the newest value always goes out
+
+// Someone else holds the plugin's lock (they are loading a preset / sending its whole state).
+static int plug_held_by_peer(int unit, int a, int b) {
+    char key[32];
+    int r;
+    plug_key(unit, a, b, key, sizeof(key));
+    EnterCriticalSection(&g_ulockLock);
+    ULock *l = ulock_get(key, 0);
+    r = l && l->peer;
+    LeaveCriticalSection(&g_ulockLock);
+    return r;
+}
+// Poll thread. A value that keeps changing (a knob dragged, the tempo scrolled) goes out at most once per
+// PARAM_SEND_MS: the steps between are dropped, never the newest value.
+static void param_send(Slot *s, const char *key, uint32_t v, DWORD now) {
+    char op[160];
+    sprintf_s(op, sizeof(op), "{\"t\":\"op\",\"op\":{\"kind\":\"param.set\",\"key\":\"%s\",\"id\":%u,\"v\":%u}}", key, s->id, v);
+    ws_send(op);
+    s->lastSent = now;
+    s->sendPending = 0;
+}
 
 typedef struct { Slot *s; uint32_t prev, v, id; LONG gen; int self; } Change;
 static Change g_changes[MAX_SLOTS];
@@ -8198,8 +8239,10 @@ static DWORD WINAPI pollThread(LPVOID p) {
                 if (now - said > 10000) { said = now; logmsg("PARAM 0x%08x moves by itself (automation / modulation): not synced", s->id); }
                 continue;
             }
-            if (plug_param_unit(s->id, &unit, &a, &b)) {
-                // plugin params go under their plugin's lock
+            Unit *pu = plug_param_unit(s->id, &unit, &a, &b) ? unit_ptr(unit, a, b) : NULL;
+            if (pu && (pu->burst || plug_held_by_peer(unit, a, b))) {
+                // a preset-sized change (or someone is replacing this plugin's whole state right now): under
+                // the plugin's lock, like the state that follows it
                 if (!plug_lock_param(unit, a, b, s, g_changes[i].prev, key, sizeof(key))) {
                     logmsg("LOCK %s held by another user: param 0x%08x snapped back", key, s->id);
                     enqueue_apply(s->id, g_changes[i].prev, 0);
@@ -8207,6 +8250,7 @@ static DWORD WINAPI pollThread(LPVOID p) {
                     continue;
                 }
             } else {
+                // a knob (channel, mixer or plugin): its own lock; two people can turn different knobs of one plugin
                 if (s->lockedByPeer) {
                     // someone else holds this knob: snap our local edit back
                     enqueue_apply(s->id, g_changes[i].prev, 0);
@@ -8219,12 +8263,25 @@ static DWORD WINAPI pollThread(LPVOID p) {
                 s->lastTouch = now;
                 sprintf_s(key, sizeof(key), "param:%u", s->id);
             }
-            char op[160];
-            sprintf_s(op, sizeof(op),
-                "{\"t\":\"op\",\"op\":{\"kind\":\"param.set\",\"key\":\"%s\",\"id\":%u,\"v\":%u}}",
-                key, s->id, g_changes[i].v);
-            ws_send(op);
+            if (!IS_MUTE_ID(s->id) && now - s->lastSent < PARAM_SEND_MS) { s->sendPending = 1; continue; }   // coalesced
+            param_send(s, key, g_changes[i].v, now);
             logmsg("DETECT id=0x%08x %u -> %u (sent)", s->id, g_changes[i].prev, g_changes[i].v);
+        }
+        for (i = 0; i < g_nslot; i++) {                     // coalesced changes that stopped: their newest value
+            Slot *s = &g_slots[i];
+            char key[32];
+            int unit, a, b;
+            Unit *pu;
+            if (!s->sendPending || now - s->lastSent < PARAM_SEND_MS) continue;
+            pu = plug_param_unit(s->id, &unit, &a, &b) ? unit_ptr(unit, a, b) : NULL;
+            if (pu && plug_held_by_peer(unit, a, b)) { s->sendPending = 0; continue; }   // the holder's state wins
+            if (pu && pu->burst) plug_key(unit, a, b, key, sizeof(key));
+            else {
+                if (s->lockedByPeer) { s->sendPending = 0; continue; }
+                sprintf_s(key, sizeof(key), "param:%u", s->id);
+            }
+            param_send(s, key, s->last, now);
+            logmsg("DETECT id=0x%08x -> %u (sent, coalesced)", s->id, s->last);
         }
         Sleep(POLL_MS);
     }
