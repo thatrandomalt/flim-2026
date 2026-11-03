@@ -4,11 +4,11 @@
 own windows, zoom and selection, while the song itself (knobs, plugins, channels, notes, playlist, mixer,
 samples) is kept in sync over the internet. It works a bit like [Drawpile](https://drawpile.net/), but for FL.
 
-> 🚧 **Still missing features.** A few things don't sync yet, such as samples inside Kontakt and
-> other people's selection. See [What's synced](#whats-synced) for the full list.
+> 🚧 **Still missing features.** A few things don't sync yet, such as samples inside Kontakt.
+> See [What's synced](#whats-synced) for the full list.
 
 > ⚠️ **Unofficial and experimental.** flim is not made by, affiliated with or endorsed by Image-Line.
-> It works by running extra code inside FL Studio's process, and it only supports **one exact FL build**
+> It works by running extra code inside FL Studio's process, and it only supports **FL Studio 2026**
 > (see [Requirements](#requirements)). It can crash FL, so save often. flim never overwrites your
 > original `.flp` files (see [Sessions](#sessions)).
 
@@ -120,9 +120,10 @@ clicked and never get in your way. To hide them, untick **Show cursors** in flim
 
 ## Requirements
 
-- **Client:** Windows 10 or 11 (64-bit) and **FL Studio 2026, build 26.1.7.5654 exactly** (Help → About).
-  The engine calls into FL at fixed internal addresses, and those change with every FL build. With any
-  other build, flim warns you before starting and FL will most likely crash.
+- **Client:** Windows 10 or 11 (64-bit) and **FL Studio 2026** (made on build 26.1.7.5654, also tested
+  on 26.1.5.5613). The engine finds FL's internal functions by searching FL's code when it starts, so FL
+  updates usually work without a flim update. If an FL update changed something flim can't find, FL
+  runs normally but sync is off, and flim's window says so.
 - **Server:** any machine with Node.js 20 or newer (Windows, Linux or macOS) that everyone can reach.
 
 ---
@@ -428,7 +429,8 @@ server/                 flim-server (Node.js + TypeScript, WebSocket + HTTP)
 ```
 
 ## Troubleshooting
-- **"This FL Studio is version X, but flim was built against 26.1.7.5654"**: your FL build is different.
+- **"Sync is off: flim doesn't know this FL Studio (X) yet"**: an FL update changed something flim
+  relies on. FL works normally, but nothing is shared; a flim update for that FL version is needed.
   See [Requirements](#requirements).
 - **"Can't connect: server not found"** or **"nothing answers at that address"**: check the address, that
   the server is running, and (over the internet) that the port is forwarded. If you host, check that
