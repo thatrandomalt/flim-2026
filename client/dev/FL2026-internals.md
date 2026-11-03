@@ -579,6 +579,17 @@ instead, undoing the edits there. Now each param applied from someone else delay
 until a new baseline (`REBASE_MS` after the last one), and params a plugin moves along with it
 (`SUPPRESS_MS`) aren't local edits. `live_test.py fd3_lock` failed both ways before.
 
+**Big note edits are edits.** `scan_notes` used to take 8+ patterns changing at once for a project load
+and not send them; a transpose across many patterns was lost (upstream fix by cashflowbeatz, 26.10.30).
+The scan doesn't run while FL loads (`fl_loading`) or in project mode (`proj_begin`: the param bulk guard,
+the channel list replaced), and notes are re-baselined when that ends, so the guard only dropped real
+edits. Renumbered patterns (a channel inserted) are still filtered by `pat_matches_base`.
+
+**A peer's network path is never opened.** A sample path a peer lists (`samples_resolve`) or one found in
+a received plugin state (`raw_path_at`'s existence check) that is `\\host\...` or `//host/...` isn't
+touched here: opening it would connect this PC to a host the peer names (upstream fix, 26.10.30). Such
+samples come by content (hash) like any other.
+
 **Only a plugin someone worked in here goes out (the drift ping-pong).** Some plugins never save the
 same bytes twice: Kilohearts' (kHs Gate, kHs Compactor) state is a zip whose entries carry the save
 time (DOS time and date, 2 s steps: local header `+10`, central directory `+12`), and automation moves

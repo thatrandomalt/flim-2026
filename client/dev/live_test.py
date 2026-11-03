@@ -757,6 +757,19 @@ def t_fd3_lock():
     bad += [l[13:110] for l in log_since(pos, B) if u + ': reverting' in l or 'PLUG sent plug.state unit=' + u in l]
     check('FD3: B leaves A\'s plugin alone', lambda: bad[:2], lambda: [])
 
+# One edit that changes the notes of many patterns at once (a transpose) is an edit, not a project load.
+def t_notes_bulk():
+    src = struct.pack('<IHHIH', 0, 0, 0, 48, 60) + bytes(10)
+    fresh = [p for p in range(100, 999) if not a.q(pat_rec(a, p) + 0x28) and not b.q(pat_rec(b, p) + 0x28)][:10]
+    rec = a.alloc(24); a.w(rec, src)
+    for p in fresh:
+        arr = a.call(0x12d16e0, p, 0); a.call(va(a, a.q(a.q(arr) + 8)), arr, rec); time.sleep(0.4)
+    check('notes in 10 patterns', lambda: [unsel(notes(a, p)) for p in fresh], lambda: [unsel(notes(b, p)) for p in fresh], wait=10)
+    for p in fresh:                                             # all at once: up a semitone
+        x = a.q(pat_rec(a, p) + 0x28); d = a.q(x + 8)
+        a.w(d + 12, struct.pack('<H', struct.unpack('<H', a.r(d + 12, 2))[0] + 1))
+    check('transpose across 10 patterns at once', lambda: [unsel(notes(b, p)) for p in fresh], lambda: [unsel(notes(a, p)) for p in fresh], wait=8)
+
 # Channels FL puts in the middle, quickly: Clone inserts its copy right after the source
 # (AddChannel(source + 1, ...), then the source's state copied in), undo puts deleted ones back in place.
 ADDCH, CHCOPY = 0x1004230, 0x1005590                            # AddChannel(pos or -1, select, group) -> channel; Clone's copy(src, dst, 0)

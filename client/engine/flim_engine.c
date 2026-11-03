@@ -2199,7 +2199,7 @@ static volatile LONG g_notesReady = 0;    // baseline taken
 
 #define NOTES_SCAN_MS   100
 #define NOTES_SETTLE_MS 250     // a drag rewrites notes every frame: send once it stops
-#define NOTES_BULK      8       // this many patterns changing at once = project load, not an edit
+#define NOTES_BULK      8       // this many patterns changing at once: check for renumbered ones first
 
 // Hash of note records with the selection bit masked out: selecting is not an edit.
 static uint64_t notes_fnv(const unsigned char *p, unsigned n) {
@@ -2480,12 +2480,9 @@ static void scan_notes(DWORD now) {
             else pend[k++] = pend[i];
         np = k;
     }
-    if (np >= NOTES_BULK) {
-        // project load/new: never broadcast as edits (the param bulk guard syncs the whole project)
-        for (i = 0; i < np; i++) { g_patHash[pend[i]] = g_patSeen[pend[i]]; pat_capture(pend[i]); }
-        logmsg("NOTES bulk change in %d patterns: not sent", np);
-        return;
-    }
+    // The rest are edits, however many patterns (a transpose across many of them). A project load / new
+    // never gets here: this scan pauses while FL loads and in project mode (proj_begin: the param bulk
+    // guard, the channel list replaced), and notes are re-baselined when that ends.
     for (i = 0; i < np; i++) enqueue_unit(T_NOTESNAP, 0, pend[i], 0, 0, NULL);
 }
 
@@ -9270,6 +9267,11 @@ static int file_info(const wchar_t *p, uint64_t *size, FILETIME *mt) {
 static int is_abs_path(const wchar_t *p) {
     return (iswalpha(p[0]) && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/')) || (p[0] == L'\\' && p[1] == L'\\');
 }
+// A network path (\\host\share\..., //host/...). One a peer sent is never opened here: that would make this
+// PC connect to whatever host the peer names. Such samples come by content like any other.
+static int is_net_path(const wchar_t *p) {
+    return (p[0] == L'\\' || p[0] == L'/') && (p[1] == L'\\' || p[1] == L'/');
+}
 
 static int hash_file(const wchar_t *p, char hex[65]) {
     HANDLE f = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
@@ -9586,7 +9588,7 @@ static size_t raw_path_at(const unsigned char *v, size_t i, size_t n, int wide, 
         if (path_text(v + i, k, wide, out, cap) && content_file(out, wcslen(out))) return k;
     for (len = k; len > 4; len--)
         if (path_text(v + i, len, wide, out, cap) && content_file(out, wcslen(out)) &&
-            (audio_ext(out, wcslen(out)) || (expand_path(out, full, SAMPLE_PATH_MAX) && file_exists_w(full)))) return len;
+            (audio_ext(out, wcslen(out)) || (!is_net_path(out) && expand_path(out, full, SAMPLE_PATH_MAX) && file_exists_w(full)))) return len;   // (received states are walked too)
     out[0] = 0;
     return 0;
 }
@@ -10655,7 +10657,7 @@ static void samples_resolve(const char *m) {
         // plugin gets it reloaded when it is: state_has_placeholder). NULL also drops an earlier rewrite.
         // (Listed anyway: someone whose Windows isn't on C: has another shared path, sent as a sample.)
         if (expand_path(R[i].p, full, SAMPLE_PATH_MAX) && in_shared(full)) { map_set(R[i].p, NULL); continue; }
-        if (!g_noLocal && expand_path(R[i].p, full, SAMPLE_PATH_MAX) && sample_hash(full, hx, &sz) && strcmp(hx, R[i].hex) == 0)
+        if (!g_noLocal && !is_net_path(R[i].p) && expand_path(R[i].p, full, SAMPLE_PATH_MAX) && sample_hash(full, hx, &sz) && strcmp(hx, R[i].hex) == 0)
             have = full;                                // the same file is right where the peer has it
         else if (!g_noLocal && find_by_hash(R[i].hex, found, SAMPLE_PATH_MAX)) have = found;
         if (have && !song[0]) { map_set(R[i].p, have == full ? NULL : have); continue; }
