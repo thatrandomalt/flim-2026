@@ -4,6 +4,9 @@
 own windows, zoom and selection, while the song itself (knobs, plugins, channels, notes, playlist, mixer,
 samples) is kept in sync over the internet. It works a bit like [Drawpile](https://drawpile.net/), but for FL.
 
+This is an unofficial fork of [fckwader's flim](https://github.com/fckwader/flim), ported to FL Studio 2026.
+See [Credits](#credits).
+
 > 🚧 **Still missing features.** A few things don't sync yet, such as samples inside Kontakt.
 > See [What's synced](#whats-synced) for the full list.
 
@@ -475,6 +478,15 @@ server/                 flim-server (Node.js + TypeScript, WebSocket + HTTP)
   on. When it happens again, note the time, click **Export log...** and attach the zip to an issue,
   one from each person if you can.
 - **FL crashed**: attach the crash report zip (see [Backups and crash reports](#backups-and-crash-reports)).
+
+---
+
+## Credits
+
+- **[fckwader](https://github.com/fckwader)** created [flim](https://github.com/fckwader/flim), which this fork
+  is built on. fckwader's project isn't responsible for this fork, so please report its bugs here.
+- **[cashflowbeatz](https://github.com/cashflowbeatz)** found fixes in upstream flim that this fork adapted, such as
+  big note edits getting dropped.
 
 ---
 
