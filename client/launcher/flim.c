@@ -8,6 +8,8 @@
 #include <shobjidl.h>
 #include <stdio.h>
 #include "../common/flim_config.h"
+#include "../common/flim_url.h"
+#pragma comment(lib, "winhttp.lib")
 #include "../common/flim_res.h"
 #include "../common/flim_version.h"
 #include "../common/flim_zip.h"
@@ -153,6 +155,11 @@ static int config_ok(void) {
     return name[0] && check_fl_dir(dir, why, 256, ver, 64);
 }
 
+// The room picked in the room browser, on the server g_joinUrl. Join / Connect go back to it while the
+// address stays the same; empty: the server's default room.
+static wchar_t g_joinUrl[512], g_joinRoom[40], g_joinRoomPw[256];
+static int g_roomEnvSet;                              // (FLIM_ROOM is a dev shortcut too: only undo our own)
+
 // Start FL with the engine. url (optional): the engine connects to it right away, with pw.
 // gui (optional): this window, which then gets FL's status and log. Returns FL's process handle
 // (the caller closes it), NULL if FL didn't start.
@@ -161,6 +168,11 @@ static HANDLE launch(const wchar_t *flDir, const wchar_t *url, const wchar_t *pw
     // the child inherits these (the engine reads FLIM_AUTOCONNECT / FLIM_PASSWORD / FLIM_GUI at start)
     SetEnvironmentVariableW(L"FLIM_AUTOCONNECT", url && url[0] ? url : NULL);
     SetEnvironmentVariableW(L"FLIM_PASSWORD", url && url[0] && pw ? pw : NULL);
+    if ((url && url[0] && g_joinRoom[0]) || g_roomEnvSet) {
+        g_roomEnvSet = url && url[0] && g_joinRoom[0];
+        SetEnvironmentVariableW(L"FLIM_ROOM", g_roomEnvSet ? g_joinRoom : NULL);
+        SetEnvironmentVariableW(L"FLIM_ROOM_PASSWORD", g_roomEnvSet && g_joinRoomPw[0] ? g_joinRoomPw : NULL);
+    }
     swprintf_s(gv, 32, L"%llx", (unsigned long long)(uintptr_t)gui);
     SetEnvironmentVariableW(L"FLIM_GUI", gui ? gv : NULL);
 
@@ -397,6 +409,166 @@ static void session_buttons(HWND dlg) {
 
 static void wide_to_utf8(const wchar_t *w, char *out, int cap) {
     if (!WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL)) out[0] = 0;
+}
+
+// ---------------- the room browser (a dedicated server's GET /rooms) ----------------
+// flim's built-in host has no list (it answers 404): it holds one session, which plain Join reaches.
+#define ROOMS_MAX      256
+#define ROOMS_BODY_MAX (64 * 1024)
+#define ROOM_NAME_MAX  32
+#define WM_ROOMS_DONE  (WM_APP + 60)
+typedef struct { wchar_t name[ROOM_NAME_MAX + 8]; int people, max, locked; } RoomRow;
+typedef struct { HWND dlg; char url[1600]; char pw[800]; int code; char *body; } RoomsReq;   // code 0: no answer, -1: bad address
+static RoomRow g_rooms[ROOMS_MAX];
+static int g_roomsN, g_roomsKnown;                    // known: the server answered with its list
+static const wchar_t *g_roomsUrl, *g_roomsPw;         // the address and password in flim's window
+
+static DWORD WINAPI rooms_thread(LPVOID p) {
+    RoomsReq *r = (RoomsReq *)p;
+    NetUrl u;
+    HINTERNET ses = NULL, con = NULL, req = NULL;
+    char enc[2400];
+    wchar_t hdr[2500];
+    int o = 0, i;
+    r->body = (char *)calloc(1, ROOMS_BODY_MAX + 1);
+    for (i = 0; r->pw[i] && o < (int)sizeof(enc) - 4; i++) {   // percent-encoded: headers aren't UTF-8
+        unsigned char c = (unsigned char)r->pw[i];
+        if (isalnum(c)) enc[o++] = (char)c;
+        else o += sprintf_s(enc + o, sizeof(enc) - o, "%%%02X", c);
+    }
+    enc[o] = 0;
+    if (!parse_url(r->url, &u)) r->code = -1;
+    else if ((ses = WinHttpOpen(L"flim", WINHTTP_ACCESS_TYPE_NO_PROXY, NULL, NULL, 0)) != NULL) {
+        WinHttpSetTimeouts(ses, 5000, 5000, 15000, 15000);    // (a server that scales to zero wakes up first)
+        if ((con = WinHttpConnect(ses, u.host, u.port, 0)) != NULL &&
+            (req = WinHttpOpenRequest(con, L"GET", L"/rooms", NULL, NULL, NULL, u.secure ? WINHTTP_FLAG_SECURE : 0)) != NULL) {
+            DWORD code = 0, sz = sizeof(code), got = 0, n = 0;
+            swprintf_s(hdr, 2500, L"x-flim-password: %S", enc);
+            WinHttpAddRequestHeaders(req, hdr, (DWORD)-1, WINHTTP_ADDREQ_FLAG_ADD);
+            if (WinHttpSendRequest(req, NULL, 0, NULL, 0, 0, 0) && WinHttpReceiveResponse(req, NULL) &&
+                WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &code, &sz, NULL)) {
+                r->code = (int)code;
+                while (r->body && n < ROOMS_BODY_MAX && WinHttpReadData(req, r->body + n, ROOMS_BODY_MAX - n, &got) && got) n += got;
+            }
+        }
+        if (req) WinHttpCloseHandle(req);
+        if (con) WinHttpCloseHandle(con);
+        WinHttpCloseHandle(ses);
+    }
+    SecureZeroMemory(enc, sizeof(enc)); SecureZeroMemory(hdr, sizeof(hdr)); SecureZeroMemory(r->pw, sizeof(r->pw));
+    if (!PostMessageW(r->dlg, WM_ROOMS_DONE, 0, (LPARAM)r)) { free(r->body); free(r); }   // (the dialog was closed)
+    return 0;
+}
+static void rooms_fetch(HWND dlg) {
+    RoomsReq *r = (RoomsReq *)calloc(1, sizeof(RoomsReq));
+    HANDLE th;
+    r->dlg = dlg;
+    wide_to_utf8(g_roomsUrl, r->url, sizeof(r->url));
+    wide_to_utf8(g_roomsPw, r->pw, sizeof(r->pw));
+    EnableWindow(GetDlgItem(dlg, IDC_R_REFRESH), FALSE);
+    if ((th = CreateThread(NULL, 0, rooms_thread, r, 0, NULL)) != NULL) CloseHandle(th);
+    else { free(r); EnableWindow(GetDlgItem(dlg, IDC_R_REFRESH), TRUE); }
+}
+static const RoomRow *room_find(const wchar_t *name) {
+    int i;
+    for (i = 0; i < g_roomsN; i++) if (_wcsicmp(g_rooms[i].name, name) == 0) return &g_rooms[i];
+    return NULL;
+}
+static void rooms_buttons(HWND dlg) {                  // Join a room that's there, Create one that isn't
+    wchar_t name[64];
+    GetDlgItemTextW(dlg, IDC_R_NAME, name, 64);
+    SetDlgItemTextW(dlg, IDOK, room_find(name) ? L"Join" : L"Create room");
+    EnableWindow(GetDlgItem(dlg, IDOK), g_roomsKnown && name[0]);
+}
+static void rooms_show(HWND dlg, RoomsReq *r) {
+    HWND list = GetDlgItem(dlg, IDC_R_LIST);
+    char *line, *next = NULL;
+    int i;
+    g_roomsN = 0;
+    g_roomsKnown = r->code == 200 && r->body && strncmp(r->body, "flim-rooms 1\n", 13) == 0;
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+    if (g_roomsKnown) {
+        for (line = strtok_s(r->body + 13, "\n", &next); line && g_roomsN < ROOMS_MAX; line = strtok_s(NULL, "\n", &next)) {
+            char nm[ROOM_NAME_MAX + 8];
+            RoomRow *w = &g_rooms[g_roomsN];
+            if (sscanf_s(line, "%39[^\t]\t%d\t%d\t%d", nm, (unsigned)sizeof(nm), &w->people, &w->max, &w->locked) != 4) continue;
+            MultiByteToWideChar(CP_UTF8, 0, nm, -1, w->name, ROOM_NAME_MAX + 8);
+            g_roomsN++;
+        }
+        for (i = 0; i < g_roomsN; i++) {
+            wchar_t row[120];
+            swprintf_s(row, 120, L"%s  -  %d / %d people%s", g_rooms[i].name, g_rooms[i].people, g_rooms[i].max, g_rooms[i].locked ? L"  -  password" : L"");
+            SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)row);
+        }
+    }
+    SetDlgItemTextW(dlg, IDC_R_INFO,
+        g_roomsKnown ? (g_roomsN ? L"Pick a room to join, or type a new name to create one." : L"No rooms yet: type a name to create one.") :
+        r->code == 401 ? L"Wrong server password: close this, enter it next to the address in flim's window, and try again." :
+        r->code == 429 ? L"Too many wrong passwords from your address: try again in a few minutes." :
+        r->code == -1 ? L"That server address isn't valid." :
+        r->code == 0 ? L"Can't reach that server: check the address, and that the server is running." :
+        L"This server has no rooms (a session hosted with flim has just one, or it's an older flim-server). Close this and click Join.");
+    EnableWindow(GetDlgItem(dlg, IDC_R_REFRESH), TRUE);
+    rooms_buttons(dlg);
+}
+static int rooms_ok(HWND dlg) {
+    wchar_t name[64], pw[256];
+    const RoomRow *row;
+    int i;
+    GetDlgItemTextW(dlg, IDC_R_NAME, name, 64);
+    GetDlgItemTextW(dlg, IDC_R_PW, pw, 256);
+    for (i = 0; name[i]; i++) {
+        if (!((name[i] < 128 && isalnum(name[i])) || name[i] == L'-' || name[i] == L'_')) i = -1;
+        if (i < 0) break;
+        name[i] = towupper(name[i]);
+    }
+    if (i < 1 || i > ROOM_NAME_MAX) {
+        fail_box(dlg, L"A room name is 1 to %d letters, digits, - or _.", ROOM_NAME_MAX);
+        return 0;
+    }
+    row = room_find(name);
+    if (row && row->locked && !pw[0]) {
+        fail_box(dlg, L"Room %s has a password: enter it to join.", row->name);
+        SetFocus(GetDlgItem(dlg, IDC_R_PW));
+        return 0;
+    }
+    wcscpy_s(g_joinRoom, 40, name);
+    wcscpy_s(g_joinRoomPw, 256, !row || row->locked ? pw : L"");
+    SecureZeroMemory(pw, sizeof(pw));
+    return 1;
+}
+static INT_PTR CALLBACK rooms_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
+    if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_BUTTON) { theme_button((const DRAWITEMSTRUCT *)lp); return TRUE; }
+    if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { theme_listitem((const DRAWITEMSTRUCT *)lp); return TRUE; }
+    if (m == WM_MEASUREITEM && ((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { list_measure(dlg, (MEASUREITEMSTRUCT *)lp); return TRUE; }
+    if (m >= WM_CTLCOLORMSGBOX && m <= WM_CTLCOLORSTATIC) return theme_color(dlg, m, (HDC)wp, (HWND)lp);
+    if (m == WM_INITDIALOG) {
+        theme_init(dlg);
+        g_roomsN = g_roomsKnown = 0;
+        rooms_buttons(dlg);
+        rooms_fetch(dlg);
+        return TRUE;
+    }
+    if (m == WM_ROOMS_DONE) {
+        RoomsReq *r = (RoomsReq *)lp;
+        rooms_show(dlg, r);
+        free(r->body);
+        free(r);
+        return TRUE;
+    }
+    if (m == WM_COMMAND) {
+        int id = LOWORD(wp);
+        if (id == IDC_R_LIST && (HIWORD(wp) == LBN_SELCHANGE || HIWORD(wp) == LBN_DBLCLK)) {
+            int sel = (int)SendDlgItemMessageW(dlg, IDC_R_LIST, LB_GETCURSEL, 0, 0);
+            if (sel >= 0 && sel < g_roomsN) SetDlgItemTextW(dlg, IDC_R_NAME, g_rooms[sel].name);
+            if (HIWORD(wp) == LBN_DBLCLK && sel >= 0 && !(sel < g_roomsN && g_rooms[sel].locked)) id = IDOK;
+        }
+        if (id == IDC_R_NAME && HIWORD(wp) == EN_CHANGE) rooms_buttons(dlg);
+        if (id == IDC_R_REFRESH) rooms_fetch(dlg);
+        if (id == IDOK && g_roomsKnown && rooms_ok(dlg)) { EndDialog(dlg, IDOK); return TRUE; }
+        if (id == IDCANCEL) { EndDialog(dlg, IDCANCEL); return TRUE; }
+    }
+    return FALSE;
 }
 static void secret_get_w(const wchar_t *key, wchar_t *out, int cap) {
     char u[512];
@@ -973,11 +1145,11 @@ static void main_host_stop(void) {
     host_stop();
     if (g_upnpOn) { host_upnp(g_hostPort, 0, NULL, 0); g_upnpOn = 0; }   // close the port again
 }
-static void engine_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {   // "<url>\n<password>\n<name>"
-    wchar_t name[128], w[1200];
-    char m[3600];
+static void engine_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {   // "<url>\n<password>\n<name>\n<room>\n<room password>"
+    wchar_t name[128], w[1300];
+    char m[3900];
     flimcfg_get(L"name", name, 128);
-    swprintf_s(w, 1200, L"%s\n%s\n%s", url, pw, name);
+    swprintf_s(w, 1300, L"%s\n%s\n%s\n%s\n%s", url, pw, name, g_joinRoom, g_joinRoomPw);
     wide_to_utf8(w, m, sizeof(m));
     SecureZeroMemory(w, sizeof(w));
     if (!engine_send(dlg, GUI_CONNECT, m)) fail_box(dlg, L"FL didn't answer: is it busy (a dialog open)?");
@@ -1038,19 +1210,43 @@ static void main_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {
     if (!g_engine) { fail_box(dlg, L"FL is still starting: try again in a moment."); return; }
     engine_connect(dlg, url, pw);
 }
+static void main_room_clear(void) {
+    g_joinUrl[0] = g_joinRoom[0] = 0;
+    SecureZeroMemory(g_joinRoomPw, sizeof(g_joinRoomPw));
+}
+// The Join box's address and password (saved); 0: not usable yet, and it said why.
+static int main_join_fields(HWND dlg, wchar_t *url, wchar_t *pw) {
+    GetDlgItemTextW(dlg, IDC_J_URL, url, 512);
+    GetDlgItemTextW(dlg, IDC_J_PW, pw, 256);
+    if (!url[0]) { fail_box(dlg, L"Enter the server address you got from whoever hosts."); SetFocus(GetDlgItem(dlg, IDC_J_URL)); return 0; }
+    if (!main_save_name(dlg)) return 0;
+    flimcfg_set(L"server_url", url);
+    if (IsDlgButtonChecked(dlg, IDC_J_REMEMBER)) secret_set_w(L"server_pw", pw); else flimcfg_set(L"server_pw", NULL);
+    return 1;
+}
 static void main_join(HWND dlg) {
     wchar_t url[512], pw[256];
     if (fl_running() && (g_netState == NET_ON || g_netState == NET_CONNECTING)) {
         engine_send(dlg, GUI_DISCONNECT, NULL);
         return;
     }
-    GetDlgItemTextW(dlg, IDC_J_URL, url, 512);
-    GetDlgItemTextW(dlg, IDC_J_PW, pw, 256);
-    if (!url[0]) { fail_box(dlg, L"Enter the server address you got from whoever hosts."); SetFocus(GetDlgItem(dlg, IDC_J_URL)); return; }
-    if (!main_save_name(dlg)) return;
-    flimcfg_set(L"server_url", url);
-    if (IsDlgButtonChecked(dlg, IDC_J_REMEMBER)) secret_set_w(L"server_pw", pw); else flimcfg_set(L"server_pw", NULL);
-    main_connect(dlg, url, pw);
+    if (main_join_fields(dlg, url, pw)) {
+        if (wcscmp(url, g_joinUrl) != 0) main_room_clear();   // another server: its default room
+        main_connect(dlg, url, pw);
+    }
+    SecureZeroMemory(pw, sizeof(pw));
+}
+static void main_rooms(HWND dlg) {
+    wchar_t url[512], pw[256], line[100];
+    if (main_join_fields(dlg, url, pw)) {
+        g_roomsUrl = url; g_roomsPw = pw;
+        if (DialogBoxW(g_inst, MAKEINTRESOURCEW(IDD_ROOMS), dlg, rooms_proc) == IDOK) {
+            wcscpy_s(g_joinUrl, 512, url);
+            swprintf_s(line, 100, L"Joining room %s.", g_joinRoom);
+            main_log(dlg, line);
+            main_connect(dlg, url, pw);
+        }
+    }
     SecureZeroMemory(pw, sizeof(pw));
 }
 static void main_host_start(HWND dlg) {
@@ -1092,6 +1288,7 @@ static void main_host_start(HWND dlg) {
     main_log(dlg, L"If Windows asks whether flim may use the network, allow it (private networks at least).");
     if (IsDlgButtonChecked(dlg, IDC_H_ALSOFL)) {
         swprintf_s(share, 128, L"localhost:%d", port);
+        main_room_clear();
         main_connect(dlg, share, pw);
     }
     SecureZeroMemory(pw, sizeof(pw));
@@ -1542,6 +1739,7 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case IDC_J_JOIN: main_join(dlg); return TRUE;
+        case IDC_J_ROOMS: main_rooms(dlg); return TRUE;
         case IDC_H_START:
             if (host_running()) {
                 if (MessageBoxW(dlg, L"Stop hosting? Everyone connected to this PC is disconnected.", L"flim", MB_YESNO | MB_ICONQUESTION) != IDYES) return TRUE;

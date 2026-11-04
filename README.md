@@ -141,7 +141,8 @@ clicked and never get in your way. To hide them, untick **Show cursors** in flim
 3. flim's window opens. (It can be resized: made smaller than its layout, e.g. by a tiling window manager
    under Wine, it gets scrollbars, and the mouse wheel scrolls it.) Either:
    - **Join a session:** enter the address and password you got from whoever hosts and click **Join**.
-     FL opens and joins by itself.
+     FL opens and joins by itself. On a [dedicated server](#dedicated-server), **Rooms...** shows its
+     rooms instead (see [Rooms](#rooms)).
    - **Host a session on this PC:** pick a port (8080 is fine) and a password and click **Start hosting**.
      Send the others the address under *Address to give the others* (**Copy**) and the password. With
      *Also open FL on this PC and join* ticked, FL opens here too. Keep flim's window open while you
@@ -196,12 +197,30 @@ The server listens on port **8080**. Give your friends your address and the pass
   (see [Server details](#server-details)).
 - **Just testing on one PC:** `localhost:8080`.
 
+### Rooms
+A dedicated server can hold several separate sessions, called rooms. (A session hosted with flim's
+**Host a session** has just one, so it has no room list: everyone clicks **Join**.)
+1. Enter the server's address, and its password if it has one, then click **Rooms...** instead of **Join**.
+2. Pick a room from the list, which shows how many people are in each and which have a password, and
+   click **Join**. Or type a new name (letters, digits, `-` and `_`) and click **Create room**.
+
+There are two kinds of password. The **server password** (`FLIM_PASSWORD`, optional) is needed to see the
+list or get into any room. A **room password** (optional) is set by whoever creates the room, and is needed
+to join it. Anyone who can see the list sees every room's name and number of people, so keep names you
+don't want known off a public server.
+
+A room ends when its last person leaves, along with its password. **Join** and **Connect** go back to the
+room you picked for as long as the address stays the same and flim's window stays open. Otherwise they use
+the server's default room, `FLIM`, which is also where older flims land. Picking a room while connected
+leaves the session you're in, even if the new room then refuses you (a wrong password, say).
+
 ---
 
 ## Using flim
 
 ### Sessions
-- A server holds **one session**. The **first person to connect is the leader**: their FL holds the
+- A session hosted with flim is **one session** ([rooms](#rooms) are the way to have several on a dedicated
+  server). The **first person to connect is the leader**: their FL holds the
   project that people who join get. (The leader doesn't have to be the PC that hosts the server.)
 - Each song has **its own folder** in your projects folder (`Documents\flim\Projects\` unless you pick
   another with **Change...** in flim's window; **Projects folder** opens it): `Projects\MySong\` holds
@@ -345,8 +364,9 @@ hosting, and never touches songs, backups, the shared folder or settings.
 
 See [`server/README.md`](server/README.md) for the protocol and options.
 
-- **Password:** set `FLIM_PASSWORD`. If it isn't set, the server lets in anyone who knows its address
-  (fine for testing on your own PC, not for a public server). A wrong password is rejected right away.
+- **Password:** set `FLIM_PASSWORD`. If it isn't set, the server lets in anyone who knows its address and
+  shows them the room list (fine for testing on your own PC, or a public server with
+  [room passwords](#rooms)). A wrong password is rejected right away.
 - **Port:** 8080 by default; set `PORT` to change it.
 - **Limits** (both servers, for one open to the internet):
   - **People per session:** 8 by default. Set `FLIM_MAX_PEOPLE` on the Node server; on the built-in host
@@ -400,7 +420,7 @@ These environment variables are read by the engine (for tests and two FLs on one
 |---|---|
 | `FLIM_AUTOCONNECT=<url>` | connect at startup (with `FLIM_PASSWORD=<pw>`) |
 | `FLIM_NAME=<name>` | override the name from `flim.ini` (e.g. to run two FLs on one PC) |
-| `FLIM_ROOM=<room>` | use another session name on the same server (default `FLIM`) |
+| `FLIM_ROOM=<room>` | use another room on the same server (default `FLIM`), with `FLIM_ROOM_PASSWORD=<pw>` if it has a password |
 | `FLIM_SAMPLE_NOLOCAL=1` | never use a local copy of a received sample, always download it (to test sample transfer on one PC) |
 
 With `FLIM_AUTOCONNECT` set, `flim.exe` skips its window and starts FL connected right away.
@@ -413,8 +433,8 @@ for testing sync on one machine.
 ## Repository layout
 ```
 client/                 the FL side (C, Win32)
-  launcher/flim.c       flim.exe: setup and join/host windows, starts FL, loads the engine into it, shows
-                        FL's status and log
+  launcher/flim.c       flim.exe: setup, join/host and room browser windows, starts FL, loads the engine into
+                        it, shows FL's status and log
   launcher/host.c       the built-in server behind "Host a session" (relay, locks, sample store, UPnP)
   engine/flim_engine.c  the engine: edit detection, applying edits, locks, pattern ops, sample transfer,
                         networking, status / log / Connect for flim.exe's window
@@ -440,6 +460,8 @@ server/                 flim-server (Node.js + TypeScript, WebSocket + HTTP)
 - **"Can't connect: not a flim server (HTTP …)"**: something answered at that address, but it isn't
   flim-server.
 - **"Wrong password"**: ask whoever runs the server. The password is the server's `FLIM_PASSWORD`.
+- **"Wrong room password"**: ask whoever is in the room. Eight wrong passwords of either kind within 10
+  minutes lock your address out for the rest of those 10 minutes.
 - **"Alex is on flim X (built …) and you're on Y (built …)"**: everyone in a session needs the same flim
   (the same download); another build may miss or misread some changes. Everyone updates to the newest.
   (Builds from before this check don't say which they are, so it only shows between newer ones.)

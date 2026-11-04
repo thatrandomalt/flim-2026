@@ -40,6 +40,7 @@
 #include <ctype.h>
 #include <shlobj.h>
 #include "../common/flim_config.h"
+#include "../common/flim_url.h"
 #include "../common/flim_zip.h"
 #include "../common/flim_res.h"
 #include "../common/flim_version.h"
@@ -425,6 +426,7 @@ static void log_op(const char *dir, const char *m) {
     const char *p = m;
     int i;
     if (!g_logDetailed) return;
+    if (strncmp(m, "{\"t\":\"join_room\"", 16) == 0) return;   // it carries the passwords
     for (i = 0; i < 3; i++) if (strstr(m, QUIET[i])) return;
     while (*p && o + 32 < sizeof(s)) {
         if (strncmp(p, "\"data\":\"", 8) == 0) {
@@ -746,48 +748,6 @@ static void ws_send_now(const char *msg) {
 // Server address as typed in the Connect dialog:
 //   wss://host[:port][/path], ws://..., https:// / http:// (same as wss / ws), or host[:port].
 // A bare host means wss on 443; localhost, 127.x or an explicit non-443 port mean plain ws.
-typedef struct { int secure; wchar_t host[256]; INTERNET_PORT port; wchar_t path[512]; char shown[300]; } NetUrl;
-
-static int parse_url(const char *in, NetUrl *u) {
-    char buf[800], pathA[512] = "/", *p, *h, *slash, *colon;
-    int scheme = -1;                                    // 1 = TLS, 0 = plain, -1 = not given
-    size_t n;
-    memset(u, 0, sizeof(*u));
-    while (*in == ' ' || *in == '\t') in++;
-    strncpy_s(buf, sizeof(buf), in, _TRUNCATE);
-    n = strlen(buf);
-    while (n && (unsigned char)buf[n - 1] <= ' ') buf[--n] = 0;
-    p = buf;
-    if (_strnicmp(p, "wss://", 6) == 0) { scheme = 1; p += 6; }
-    else if (_strnicmp(p, "https://", 8) == 0) { scheme = 1; p += 8; }
-    else if (_strnicmp(p, "ws://", 5) == 0) { scheme = 0; p += 5; }
-    else if (_strnicmp(p, "http://", 7) == 0) { scheme = 0; p += 7; }
-    else if (strstr(p, "://")) return 0;
-    h = p;
-    slash = strchr(h, '/');
-    if (slash) { strncpy_s(pathA, sizeof(pathA), slash, _TRUNCATE); *slash = 0; }
-    colon = strrchr(h, ':');
-    if (colon) {
-        char *e; long port = strtol(colon + 1, &e, 10);
-        if (*e || port <= 0 || port > 65535) return 0;
-        u->port = (INTERNET_PORT)port; *colon = 0;
-    }
-    if (!*h) return 0;
-    for (p = h; *p; p++) if (!(isalnum((unsigned char)*p) || *p == '.' || *p == '-' || *p == '_')) return 0;
-    if (scheme < 0) {
-        int local = _stricmp(h, "localhost") == 0 || strncmp(h, "127.", 4) == 0;
-        scheme = ((u->port && u->port != 443) || local) ? 0 : 1;
-        if (local && !u->port) u->port = 8080;
-    }
-    u->secure = scheme;
-    if (!u->port) u->port = scheme ? 443 : 80;
-    MultiByteToWideChar(CP_UTF8, 0, h, -1, u->host, 256);
-    MultiByteToWideChar(CP_UTF8, 0, pathA, -1, u->path, 512);
-    strcpy_s(u->shown, sizeof(u->shown), h);              // status text: host[:port][/path]
-    if (u->port != (scheme ? 443 : 80)) sprintf_s(u->shown + strlen(u->shown), sizeof(u->shown) - strlen(u->shown), ":%u", u->port);
-    if (pathA[1]) strncat_s(u->shown, sizeof(u->shown), pathA, _TRUNCATE);
-    return 1;
-}
 
 typedef struct { HINTERNET ses, con, ws; } NetConn;
 
@@ -3962,7 +3922,7 @@ static void wguard_pass(void) {
 //                                                 GUI_PEOPLE "<leaderControls 0/1>\t<my id>\n" then a line per person,
 //                                                   "P\t<id>\t<name>\t<leader 0/1>\t<sync-only 0/1>\n" or, removed
 //                                                   from the session, "B\t<id>\t<name>\t<IP banned 0/1>\n" (on_peers)
-//   window -> engine (to our task window):       GUI_CONNECT "<url>\n<password>\n<name>",
+//   window -> engine (to our task window):       GUI_CONNECT "<url>\n<password>\n<name>\n<room>\n<room password>",
 //                                                 GUI_DISCONNECT, GUI_HELLO,
 //                                                 GUI_SETTINGS (flim.ini changed: plugin_lock_s),
 //                                                 GUI_RESYNC ("Resync from host": the leader's project now),
@@ -4081,13 +4041,23 @@ static char g_netErr[160];         // why the server ended the current connectio
 static volatile LONG g_kicked;     // ...because the host removed us (host controls)
 
 // welcome / presence: "Connected to <server> · leader · 3 people"
+// The room on the server: FLIM unless flim's room browser or FLIM_ROOM says otherwise.
+static char g_room[64] = "FLIM", g_roomPw[256];
+static void room_set(const char *room) {            // room goes into JSON unescaped: keep it simple
+    int i, o = 0;
+    for (i = 0; room && room[i] && o < (int)sizeof(g_room) - 1; i++)
+        if (isalnum((unsigned char)room[i]) || room[i] == '-' || room[i] == '_') g_room[o++] = room[i];
+    g_room[o] = 0;
+    if (!o) strcpy_s(g_room, sizeof(g_room), "FLIM");
+}
 static void net_show_connected(const char *m) {
     const char *p = strstr(m, "\"peers\":[");
     int n = 0;
     while (p && (p = strstr(p + 1, "\"role\":\"")) != NULL) n++;
-    char where[600];
+    char where[600], room[100] = "";
     focus_summary(where, sizeof(where), " \xC2\xB7 ");
-    net_status(NET_ON, "Connected to %s \xC2\xB7 %s \xC2\xB7 %d %s%s%s", g_netShown, g_isLeader ? "leader" : g_syncOnly ? "sync-only (your edits stay here)" : "member",
+    if (_stricmp(g_room, "FLIM") != 0) sprintf_s(room, sizeof(room), ", room %s", g_room);
+    net_status(NET_ON, "Connected to %s%s \xC2\xB7 %s \xC2\xB7 %d %s%s%s", g_netShown, room, g_isLeader ? "leader" : g_syncOnly ? "sync-only (your edits stay here)" : "member",
                n, n == 1 ? "person" : "people", where[0] ? " \xC2\xB7 " : "", where);
 }
 
@@ -4105,7 +4075,7 @@ static void backup_setting(void);
 static void backup_tick(void);
 // Main thread (task window): a command from the flim window, which from now on gets our news.
 static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
-    char t[1400], *pw, *name;
+    char t[4000], *pw, *name, *room, *roomPw;
     size_t n = cd->lpData ? cd->cbData : 0;
     if (n >= sizeof(t)) n = sizeof(t) - 1;
     memcpy(t, cd->lpData, n);
@@ -4118,6 +4088,12 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
         if (pw) *pw++ = 0;
         name = pw ? strchr(pw, '\n') : NULL;
         if (name) *name++ = 0;
+        room = name ? strchr(name, '\n') : NULL;
+        if (room) *room++ = 0;
+        roomPw = room ? strchr(room, '\n') : NULL;
+        if (roomPw) *roomPw++ = 0;
+        room_set(room);
+        strncpy_s(g_roomPw, sizeof(g_roomPw), roomPw ? roomPw : "", _TRUNCATE);
         if (name && name[0]) {
             wchar_t w[128], clean[FLIM_NAME_MAX + 1];
             MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 128);
@@ -8991,6 +8967,7 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
     } else if (strstr(m, "\"t\":\"error\"")) {
         logmsg("server: %.300s", m);
         if (strstr(m, "\"code\":\"bad_password\"")) strcpy_s(g_netErr, sizeof(g_netErr), "Wrong password");
+        if (strstr(m, "\"code\":\"bad_room_password\"")) strcpy_s(g_netErr, sizeof(g_netErr), "Wrong room password");
         if (strstr(m, "\"code\":\"full\"") || strstr(m, "\"code\":\"too_many\"") || strstr(m, "\"code\":\"too_many_failures\"") ||
             strstr(m, "\"code\":\"rate\"") || strstr(m, "\"code\":\"join_timeout\""))   // the server's limits: it hangs up next
             json_str(m, "\"msg\":\"", g_netErr, sizeof(g_netErr));
@@ -11734,7 +11711,6 @@ static DWORD WINAPI shThread(LPVOID p) {
 typedef struct { LONG gen; char url[512]; char pw[256]; } NetReq;
 static volatile LONG g_netGen = 0;
 static volatile LONG g_pollStarted = 0;
-static char g_room[64] = "FLIM";
 
 static void json_esc(const char *in, char *out, int cap) {
     int o = 0;
@@ -11774,7 +11750,7 @@ static DWORD WINAPI netThread(LPVOID p) {
     NetReq *r = (NetReq *)p;
     NetUrl u;
     NetConn c;
-    char err[200], name[2 * sizeof(g_myName)], pw[600], hello[1024];
+    char err[200], name[2 * sizeof(g_myName)], pw[1600], roomPw[1600], hello[4096];
     unsigned char *buf = NULL;
     DWORD cap = 0, len = 0;
 
@@ -11801,11 +11777,12 @@ static DWORD WINAPI netThread(LPVOID p) {
 
     json_esc(g_myName, name, sizeof(name));
     json_esc(r->pw, pw, sizeof(pw));
+    json_esc(g_roomPw, roomPw, sizeof(roomPw));
     sprintf_s(hello, sizeof(hello),
-        "{\"t\":\"join_room\",\"room\":\"%s\",\"password\":\"%s\",\"user\":{\"id\":\"%s\",\"name\":\"%s\"}}",
-        g_room, pw, g_myId, name);
+        "{\"t\":\"join_room\",\"room\":\"%s\",\"password\":\"%s\",\"room_password\":\"%s\",\"user\":{\"id\":\"%s\",\"name\":\"%s\"}}",
+        g_room, pw, roomPw, g_myId, name);
     ws_send(hello);
-    SecureZeroMemory(hello, sizeof(hello)); SecureZeroMemory(pw, sizeof(pw));
+    SecureZeroMemory(hello, sizeof(hello)); SecureZeroMemory(pw, sizeof(pw)); SecureZeroMemory(roomPw, sizeof(roomPw));
     logmsg("joining room %s as %s (%s)", g_room, g_myName, g_myId);
     if (!InterlockedExchange(&g_pollStarted, 1)) CreateThread(NULL, 0, pollThread, NULL, 0, NULL);
 
@@ -12211,12 +12188,12 @@ static DWORD WINAPI engineMain(LPVOID p) {
         if (flim_sanitize_name(w, clean, FLIM_NAME_MAX + 1))
             WideCharToMultiByte(CP_UTF8, 0, clean, -1, g_myName, sizeof(g_myName), NULL, NULL);
         else sprintf_s(g_myName, sizeof(g_myName), "FL-%lu", GetCurrentProcessId());
-        if (GetEnvironmentVariableA("FLIM_ROOM", env, sizeof(env)) > 0) {
-            int i, o = 0;                               // room goes into JSON unescaped: keep it simple
-            for (i = 0; env[i] && o < (int)sizeof(g_room) - 1; i++)
-                if (isalnum((unsigned char)env[i]) || env[i] == '-' || env[i] == '_') g_room[o++] = env[i];
-            g_room[o] = 0;
-            if (!o) strcpy_s(g_room, sizeof(g_room), "FLIM");
+        if (GetEnvironmentVariableA("FLIM_ROOM", env, sizeof(env)) > 0) room_set(env);
+        {
+            wchar_t wr[256];
+            if (GetEnvironmentVariableW(L"FLIM_ROOM_PASSWORD", wr, 256) > 0) WideCharToMultiByte(CP_UTF8, 0, wr, -1, g_roomPw, sizeof(g_roomPw), NULL, NULL);
+            SetEnvironmentVariableW(L"FLIM_ROOM_PASSWORD", NULL);    // not left in FL's environment
+            SecureZeroMemory(wr, sizeof(wr));
         }
         sprintf_s(g_myId, sizeof(g_myId), "fl-%lu-%u", GetCurrentProcessId(), (unsigned)rand());
         g_plugLockMs = flimcfg_lock_s() * 1000;

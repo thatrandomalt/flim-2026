@@ -48,6 +48,29 @@ function passwordOk(given: unknown): boolean {
 
 const sessions = new Map<string, Session>();
 
+const sha256 = (v: string) => crypto.createHash("sha256").update(v, "utf8").digest();
+function roomPasswordOk(session: Session, given: unknown): boolean {
+  return !session.passwordHash || crypto.timingSafeEqual(sha256(typeof given === "string" ? given : ""), session.passwordHash);
+}
+function badRoomPassword(ws: WebSocket, ip: string, code: string, user: UserInfo): void {
+  failRecord(ip);
+  console.log(`[room ${code}] wrong room password from ${user.name} (${ip})`);
+  fail(ws, "bad_room_password", "Wrong room password.");
+  setTimeout(() => ws.close(4001, "bad_room_password"), 1000);
+}
+
+// The room browser: one line per room, as plain text (flim.exe's window reads it). The password is the
+// server's, percent-encoded (headers aren't UTF-8).
+function roomList(): string {
+  const rows = [...sessions.values()].sort((a, b) => a.code.localeCompare(b.code))
+    .map((s) => `${s.code}\t${s.othersThan("")}\t${MAX_PEOPLE}\t${s.passwordHash ? 1 : 0}\n`);
+  return "flim-rooms 1\n" + rows.join("");
+}
+function roomListPasswordOk(req: http.IncomingMessage): boolean {
+  try { return passwordOk(decodeURIComponent(String(req.headers["x-flim-password"] ?? ""))); }
+  catch { return false; }
+}
+
 function makeCode(): string {
   let code: string;
   do {
@@ -60,14 +83,23 @@ function makeCode(): string {
 // sample file store (blobs.ts).
 const httpServer = http.createServer((req, res) => {
   const ip = clientIp(req);
-  if (req.url?.startsWith("/blob") && failCount(ip) >= FAIL_MAX) {   // (locked out: the store's key is the password too)
+  if ((req.url?.startsWith("/blob") || req.url === "/rooms") && failCount(ip) >= FAIL_MAX) {   // (locked out: the store's key is the password too)
     res.writeHead(429);
     res.end();
     req.resume();
     return;
   }
   if (handleBlob(req, res, PASSWORD, () => failRecord(ip))) return;
-  if (req.url === "/health" || req.url === "/") {
+  if (req.url === "/rooms" && req.method === "GET") {
+    if (!roomListPasswordOk(req)) {
+      failRecord(ip);
+      res.writeHead(401);
+      res.end();
+      return;
+    }
+    res.writeHead(200, { "content-type": "text/plain", "cache-control": "no-store" });
+    res.end(roomList());
+  } else if (req.url === "/health" || req.url === "/") {
     res.writeHead(200, { "content-type": "text/plain" });
     res.end("flim-server ok\n");
   } else {
@@ -172,6 +204,7 @@ wss.on("connection", (ws, req) => {
         const session = sessions.get(msg.session?.toUpperCase?.() ?? "");
         if (!session) return fail(ws, "no_session", "Session not found.");
         const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true, ip };
+        if (!roomPasswordOk(session, msg.room_password)) return badRoomPassword(ws, ip, session.code, client.user);
         if (session.isBanned(client.user, ip)) return fail(ws, "kicked", "You were removed from this session. The host can let you back in");
         if (session.othersThan(client.user.id) >= MAX_PEOPLE) return full(ws, session.code);
         conn.client = client;
@@ -182,17 +215,19 @@ wss.on("connection", (ws, req) => {
       if (msg.t === "join_room") {
         // join-or-create a named room; first in becomes leader. Lets two
         // clients meet without copying a session code.
-        const code = (msg.room || "FLIM").toUpperCase().slice(0, 32);
+        const code = String(msg.room ?? "").toUpperCase().replace(/[^A-Z0-9_-]/g, "").slice(0, 32) || "FLIM";
         let session = sessions.get(code);
         if (!session) {
           const client: Client = { ws, user: sanitizeUser(msg.user), role: "leader", alive: true, ip };
           session = new Session(code, client, () => sessions.delete(code));
+          if (typeof msg.room_password === "string" && msg.room_password) session.passwordHash = sha256(msg.room_password);
           sessions.set(code, session);
           conn.client = client;
           conn.session = session;
           console.log(`[room ${code}] created by ${client.user.name} (leader)`);
         } else {
           const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true, ip };
+          if (!roomPasswordOk(session, msg.room_password)) return badRoomPassword(ws, ip, code, client.user);
           if (session.isBanned(client.user, ip)) {
             console.log(`[room ${code}] ${client.user.name} was removed: not let in`);
             fail(ws, "kicked", "You were removed from this session. The host can let you back in");

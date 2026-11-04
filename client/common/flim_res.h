@@ -21,7 +21,14 @@
 #define IDC_M_AUTOATTACH 1117      // attach to a running FL by itself / let me pick the FL process
 #define IDC_M_CLEARCACHE 1118      // delete flim's caches (asks first; not while FL runs or hosting)
 #define IDD_PICKFL       103       // pick the FL process (auto-attach off)
+#define IDD_ROOMS        104       // a dedicated server's rooms: browse, join, create
 #define IDC_P_LIST       1140
+#define IDC_J_ROOMS      1141
+#define IDC_R_INFO       1142
+#define IDC_R_LIST       1143
+#define IDC_R_NAME       1144
+#define IDC_R_PW         1145
+#define IDC_R_REFRESH    1146
 #define IDC_J_URL        1110
 #define IDC_J_PW         1111
 #define IDC_J_REMEMBER   1112

@@ -33,6 +33,22 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 360, 108, 50, 15
 END
 
+IDD_ROOMS DIALOGEX 0, 0, 340, 214
+STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Rooms on this server"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "Looking for rooms...", IDC_R_INFO, 10, 8, 320, 20
+    LISTBOX         IDC_R_LIST, 10, 30, 320, 100, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Room (pick one, or type a new name: letters, digits, - and _):", -1, 10, 136, 320, 10
+    EDITTEXT        IDC_R_NAME, 10, 147, 320, 13, ES_AUTOHSCROLL
+    LTEXT           "Room password (optional for a new room):", -1, 10, 165, 320, 10
+    EDITTEXT        IDC_R_PW, 10, 176, 320, 13, ES_AUTOHSCROLL | ES_PASSWORD
+    PUSHBUTTON      "Refresh", IDC_R_REFRESH, 10, 194, 50, 15
+    DEFPUSHBUTTON   "Join", IDOK, 220, 194, 56, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 280, 194, 50, 15
+END
+
 IDD_MAIN DIALOGEX 0, 0, 560, 392
 STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME
 CAPTION "flim"
@@ -51,7 +67,8 @@ BEGIN
     EDITTEXT        IDC_J_URL, 14, 65, 312, 13, ES_AUTOHSCROLL
     LTEXT           "Password:", -1, 14, 86, 38, 10
     EDITTEXT        IDC_J_PW, 54, 84, 110, 13, ES_AUTOHSCROLL | ES_PASSWORD
-    AUTOCHECKBOX    "Remember", IDC_J_REMEMBER, 172, 86, 60, 10
+    AUTOCHECKBOX    "Remember", IDC_J_REMEMBER, 172, 86, 50, 10
+    PUSHBUTTON      "Rooms...", IDC_J_ROOMS, 226, 83, 40, 15
     DEFPUSHBUTTON   "Join", IDC_J_JOIN, 270, 83, 56, 15
 
     GROUPBOX        " Host a session on this PC (nothing else to install) ", -1, 6, 111, 328, 160

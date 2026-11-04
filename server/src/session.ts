@@ -29,6 +29,7 @@ export function send(ws: WebSocket, msg: ServerMsg): void {
 export class Session {
   readonly code: string;
   leaderId: string;
+  passwordHash: Buffer | null = null; // the room's own password, if it has one (server.ts)
   private clients = new Set<Client>();
   private locks = new Map<UnitKey, Lock>();
   private bans = new Map<string, UserInfo>(); // removed (kick) until let back in; by id, and the name matches too

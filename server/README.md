@@ -75,7 +75,7 @@ Clients connect to `wss://<your-unique-app-name>.fly.dev`.
 
 ## Protocol
 JSON over WebSocket; see `src/protocol.ts`. A client sends
-`{"t":"join_room","room":"FLIM","password":"…","user":{"id":"…","name":"…"}}` and gets `welcome`
+`{"t":"join_room","room":"FLIM","password":"…","room_password":"…","user":{"id":"…","name":"…"}}` and gets `welcome`
 (its role plus the peer list), then exchanges `op`, `lock_acquire` / `lock_release` (→ `lock`,
 `lock_released`), and receives `presence` updates. Ops that carry a project or a plugin state may
 list the samples it uses (`"samples":[{"p":…,"h":<sha256>,"s":<bytes>,"ms":<WAV length, optional>}]`), fetched from `/blob/<h>`.
@@ -84,6 +84,17 @@ silent placeholder file meanwhile. Two ops are signals rather than edits: the le
 3 s (members warn after 30 s without one) and `saving` `on:1` / `on:0` around FL saving the project
 (members hold their input meanwhile); like `cur` (mouse positions) they don't keep locks alive. A wrong password gets
 `{"t":"error","code":"bad_password"}` and the connection is closed with code 4001.
+
+**Rooms.** `join_room` joins the room or creates it; the creator's `room_password` (optional) then guards it, and
+goes when the room ends. Room names keep only `A-Z 0-9 - _` after upper-casing, up to 32 characters; empty means
+`FLIM`. A wrong room password gets `{"t":"error","code":"bad_room_password"}` and close code 4001, and counts
+toward the wrong-password lockout. `GET /rooms` lists them as plain text for flim's room browser, with the
+server password percent-encoded in an `x-flim-password` header (401 if wrong, 429 when locked out):
+```
+flim-rooms 1
+<name>\t<people>\t<max people>\t<1 if it has a password>
+```
+flim's built-in host has no `/rooms` and ignores `room_password`. `npm run build && npm test` runs the rooms test.
 
 **Host controls.** `presence` also carries `leaderControls` (whether the leader may use them: always here,
 since this server has no host window; flim's built-in host only when its host allows it) and `banned`
