@@ -143,7 +143,8 @@ or the mixer). Arrows, outlines and glows can't be clicked and never get in your
 ## Quick start
 
 ### Client
-1. Get the flim zip (`flim.exe` and `flim_engine.dll`) from whoever runs your session, or build it
+1. Download `flim-client-win64.zip` (`flim.exe` and `flim_engine.dll`) from the
+   [latest release](https://github.com/thatrandomalt/flim-2026/releases/latest), or build it
    (see [Building the client from source](#building-the-client-from-source)), and unzip it anywhere.
    Keep `flim.exe` and `flim_engine.dll` in the same folder.
 2. Double-click **`flim.exe`**. The first time, it asks for:
