@@ -1,5 +1,5 @@
 import { WebSocket } from "ws";
-import { AdminAction, LOCK_TTL_MS, Op, PeerInfo, Role, ServerMsg, UnitKey, UserInfo } from "./protocol";
+import { AdminAction, LOCK_TTL_MS, NotesMode, Op, PeerInfo, Role, ServerMsg, UnitKey, UserInfo } from "./protocol";
 
 export interface Client {
   ws: WebSocket;
@@ -15,7 +15,7 @@ const ipBans = new Map<string, UserInfo & { ip: string }>();
 const matches = (b: UserInfo, u: UserInfo) => b.id === u.id || b.name.toLowerCase() === u.name.toLowerCase();
 
 // What a sync-only member may still send: asking for things.
-const SYNC_ONLY_OPS = new Set(["state.req", "hello", "shared.need"]);
+const SYNC_ONLY_OPS = new Set(["state.req", "hello", "shared.need", "notes.mergereq"]);
 
 interface Lock {
   owner: string; // user id
@@ -39,8 +39,11 @@ export class Session {
   private epoch = 0;
   private onEmpty: () => void;
 
-  constructor(code: string, leader: Client, onEmpty: () => void) {
+  readonly notes: NotesMode;
+
+  constructor(code: string, leader: Client, onEmpty: () => void, notes: NotesMode = "lock") {
     this.code = code;
+    this.notes = notes;
     this.leaderId = leader.user.id;
     this.onEmpty = onEmpty;
     this.add(leader);
@@ -89,7 +92,7 @@ export class Session {
   add(client: Client): void {
     for (const b of this.syncs.values()) if (matches(b, client.user)) client.sync = true; // sync-only sticks
     this.clients.add(client);
-    send(client.ws, { t: "welcome", session: this.code, role: client.role, you: client.user, peers: this.peers() });
+    send(client.ws, { t: "welcome", session: this.code, role: client.role, you: client.user, peers: this.peers(), notes: this.notes });
     send(client.ws, { t: "snapshot", flp: this.flp, epoch: this.epoch });
     send(client.ws, { t: "lock_state", locks: [...this.locks].map(([key, l]) => ({ key, owner: l.owner })) });
     this.broadcast(this.presence()); // (the newcomer too: leaderControls, who was removed)

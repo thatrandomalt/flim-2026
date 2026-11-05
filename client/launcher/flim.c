@@ -158,6 +158,7 @@ static int config_ok(void) {
 // The room picked in the room browser, on the server g_joinUrl. Join / Connect go back to it while the
 // address stays the same; empty: the server's default room.
 static wchar_t g_joinUrl[512], g_joinRoom[40], g_joinRoomPw[256];
+static int g_joinMerge;                               // a new room: it merges notes
 static int g_roomEnvSet;                              // (FLIM_ROOM is a dev shortcut too: only undo our own)
 
 // Start FL with the engine. url (optional): the engine connects to it right away, with pw.
@@ -172,6 +173,7 @@ static HANDLE launch(const wchar_t *flDir, const wchar_t *url, const wchar_t *pw
         g_roomEnvSet = url && url[0] && g_joinRoom[0];
         SetEnvironmentVariableW(L"FLIM_ROOM", g_roomEnvSet ? g_joinRoom : NULL);
         SetEnvironmentVariableW(L"FLIM_ROOM_PASSWORD", g_roomEnvSet && g_joinRoomPw[0] ? g_joinRoomPw : NULL);
+        SetEnvironmentVariableW(L"FLIM_NOTES_MODE", g_roomEnvSet && g_joinMerge ? L"merge" : NULL);
     }
     swprintf_s(gv, 32, L"%llx", (unsigned long long)(uintptr_t)gui);
     SetEnvironmentVariableW(L"FLIM_GUI", gui ? gv : NULL);
@@ -479,6 +481,7 @@ static void rooms_buttons(HWND dlg) {                  // Join a room that's the
     GetDlgItemTextW(dlg, IDC_R_NAME, name, 64);
     SetDlgItemTextW(dlg, IDOK, room_find(name) ? L"Join" : L"Create room");
     EnableWindow(GetDlgItem(dlg, IDOK), g_roomsKnown && name[0]);
+    EnableWindow(GetDlgItem(dlg, IDC_R_MERGE), g_roomsKnown && !room_find(name));   // (the room's own choice, once it exists)
 }
 static void rooms_show(HWND dlg, RoomsReq *r) {
     HWND list = GetDlgItem(dlg, IDC_R_LIST);
@@ -534,6 +537,7 @@ static int rooms_ok(HWND dlg) {
     }
     wcscpy_s(g_joinRoom, 40, name);
     wcscpy_s(g_joinRoomPw, 256, !row || row->locked ? pw : L"");
+    g_joinMerge = !row && IsDlgButtonChecked(dlg, IDC_R_MERGE) == BST_CHECKED;
     SecureZeroMemory(pw, sizeof(pw));
     return 1;
 }
@@ -1133,9 +1137,9 @@ static void max_people_apply(HWND dlg) {
     host_set_max_people(n);
 }
 static void main_host_controls(HWND dlg, int on) {
-    static const int ids[] = { IDC_H_PORT, IDC_H_PW, IDC_H_UPNP, IDC_H_ALSOFL };
+    static const int ids[] = { IDC_H_PORT, IDC_H_PW, IDC_H_UPNP, IDC_H_ALSOFL, IDC_H_MERGE };
     int i;
-    for (i = 0; i < 4; i++) EnableWindow(GetDlgItem(dlg, ids[i]), !on);
+    for (i = 0; i < 5; i++) EnableWindow(GetDlgItem(dlg, ids[i]), !on);
     SetDlgItemTextW(dlg, IDC_H_START, on ? L"Stop hosting" : L"Start hosting");
     if (!on) { SetDlgItemTextW(dlg, IDC_H_STATUS, L"Not hosting."); SetDlgItemTextW(dlg, IDC_H_SHARE, L""); }
     main_people(dlg);
@@ -1145,11 +1149,11 @@ static void main_host_stop(void) {
     host_stop();
     if (g_upnpOn) { host_upnp(g_hostPort, 0, NULL, 0); g_upnpOn = 0; }   // close the port again
 }
-static void engine_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {   // "<url>\n<password>\n<name>\n<room>\n<room password>"
+static void engine_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {   // "<url>\n<password>\n<name>\n<room>\n<room password>\n<merge>"
     wchar_t name[128], w[1300];
     char m[3900];
     flimcfg_get(L"name", name, 128);
-    swprintf_s(w, 1300, L"%s\n%s\n%s\n%s\n%s", url, pw, name, g_joinRoom, g_joinRoomPw);
+    swprintf_s(w, 1300, L"%s\n%s\n%s\n%s\n%s\n%d", url, pw, name, g_joinRoom, g_joinRoomPw, g_joinMerge);
     wide_to_utf8(w, m, sizeof(m));
     SecureZeroMemory(w, sizeof(w));
     if (!engine_send(dlg, GUI_CONNECT, m)) fail_box(dlg, L"FL didn't answer: is it busy (a dialog open)?");
@@ -1212,6 +1216,7 @@ static void main_connect(HWND dlg, const wchar_t *url, const wchar_t *pw) {
 }
 static void main_room_clear(void) {
     g_joinUrl[0] = g_joinRoom[0] = 0;
+    g_joinMerge = 0;
     SecureZeroMemory(g_joinRoomPw, sizeof(g_joinRoomPw));
 }
 // The Join box's address and password (saved); 0: not usable yet, and it said why.
@@ -1262,6 +1267,8 @@ static void main_host_start(HWND dlg) {
                               MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
     wide_to_utf8(pw, pwu, sizeof(pwu));
     max_people_apply(dlg);
+    host_set_notes_merge(IsDlgButtonChecked(dlg, IDC_H_MERGE) == BST_CHECKED);
+    flimcfg_set(L"host_merge", IsDlgButtonChecked(dlg, IDC_H_MERGE) == BST_CHECKED ? L"1" : NULL);
     if (!host_start(port, pwu, dlg, err, sizeof(err))) {
         wchar_t w[200];
         MultiByteToWideChar(CP_UTF8, 0, err, -1, w, 200);
@@ -1628,6 +1635,7 @@ static INT_PTR CALLBACK main_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
         flimcfg_get(L"host_alsofl", v, 512); CheckDlgButton(dlg, IDC_H_ALSOFL, wcscmp(v, L"1") == 0 ? BST_CHECKED : BST_UNCHECKED);
         flimcfg_get(L"host_leaderctl", v, 512); CheckDlgButton(dlg, IDC_H_LEADERCTL, wcscmp(v, L"1") == 0 ? BST_CHECKED : BST_UNCHECKED);
         leader_ctl_apply(dlg);
+        flimcfg_get(L"host_merge", v, 512); CheckDlgButton(dlg, IDC_H_MERGE, wcscmp(v, L"1") == 0 ? BST_CHECKED : BST_UNCHECKED);
         main_host_controls(dlg, 0);
         SetDlgItemInt(dlg, IDC_S_LOCK, flimcfg_lock_s(), FALSE);
         SendDlgItemMessageW(dlg, IDC_S_LOCK, EM_LIMITTEXT, 2, 0);

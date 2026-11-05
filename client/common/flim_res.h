@@ -29,6 +29,8 @@
 #define IDC_R_NAME       1144
 #define IDC_R_PW         1145
 #define IDC_R_REFRESH    1146
+#define IDC_R_MERGE      1147      // new room: merge notes two people edit at once
+#define IDC_H_MERGE      1148      // hosted session: the same
 #define IDC_J_URL        1110
 #define IDC_J_PW         1111
 #define IDC_J_REMEMBER   1112

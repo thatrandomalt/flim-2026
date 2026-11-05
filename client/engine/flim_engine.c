@@ -41,6 +41,7 @@
 #include <shlobj.h>
 #include "../common/flim_config.h"
 #include "../common/flim_url.h"
+#include "../common/flim_notes_crdt.h"
 #include "../common/flim_zip.h"
 #include "../common/flim_res.h"
 #include "../common/flim_version.h"
@@ -185,6 +186,19 @@ static int  chan_list_changed(void);
 static void resync(const char *why);
 static void resync_asked(void);
 static void notes_send_channel(int c);
+static volatile LONG g_notesMerge = 0;       // this session merges notes edited at once (the welcome says)
+static int  g_wantMerge = 0;                 // if we create the room: ask for that (Rooms dialog / FLIM_NOTES_MODE=merge)
+static uint32_t g_applyGlow = 0;             // main thread: the sender's color of the merge op being applied
+static void notes_merge_local(int p);
+static void notes_merge_remote(int p, const unsigned char *wire, unsigned bytes, int full);
+static void notes_merge_send_full(int p, int reseed);
+static void notes_merge_send_all(void);
+static void notes_merge_reseed_all(void);
+static void notes_merge_stale(void);
+static void glow_changed(int pl, int ctx, int g, const unsigned char *old, unsigned no, const unsigned char *now, unsigned nn, uint32_t glow);
+static void glow_param(uint32_t id, uint32_t glow);
+static void glow_update(void);
+static COLORREF cursor_color(const char *id);
 static wchar_t *dstr_keep(const wchar_t *s);
 static int int_after(const char *p, const char *end, const char *key, int *out);
 static void ws_send(const char *msg);
@@ -358,6 +372,7 @@ typedef struct {
                              // when it runs, after the ops before it
     LONG gen;                // g_structGen when queued: a state check queued before channels moved is stale
     int sc[3];               // someone else's op: the sender's structure counts when it sent it (-1: none; sc_rebase)
+    uint32_t glow;           // someone else's op: 0x80000000 | the sender's color (what it changes glows in that color)
 } QItem;
 static void run_task_inner(const QItem *it);
 static QItem g_q[QCAP];
@@ -365,6 +380,7 @@ static int g_qh = 0, g_qt = 0;
 static __declspec(thread) int t_peerMsg;   // inside handle_msg: what gets queued is someone else's op
 enum { SC_CH, SC_MIX, SC_PAT, SC_N };       // what a structure op renumbers: channels, mixer tracks, patterns
 static __declspec(thread) int t_msgSc[SC_N] = { -1, -1, -1 };   // ... and the "sc" that op carried
+static __declspec(thread) uint32_t t_msgGlow;                   // ... and its sender's color (QItem.glow)
 // Structure counts, one per kind: how many channel (chan.add / chan.del / chan.order), mixer track (mix.struct)
 // and pattern (pat.op) structure ops this FL has applied, its own included. Ops of one kind are applied in the
 // same order everywhere, so in-step FLs count alike; each op carries its sender's counts ("sc":[ch,mix,pat]).
@@ -846,6 +862,7 @@ static void enqueue(const QItem *it) {
         *q = *it;
         q->peer = q->peer || t_peerMsg;
         for (i = 0; i < SC_N; i++) q->sc[i] = t_peerMsg ? t_msgSc[i] : -1;
+        q->glow = t_peerMsg ? t_msgGlow : 0;
         q->gen = g_structGen;
         if (q->peer) InterlockedIncrement(&g_peerQueued);
         g_qt = nt;
@@ -2220,6 +2237,7 @@ static unsigned char *notes_copy(int p, unsigned *n) {
 static void notes_rebaseline(void) {
     int p;
     for (p = 1; p < MAX_PAT; p++) { g_patSeen[p] = g_patHash[p] = notes_hash(p); g_patChangedAt[p] = 0; }
+    notes_merge_reseed_all();
     clips_rebaseline();          // audio clips reference channels: same structural events
     meta_rebase_patterns();      // pattern names / markers move with pattern ops (the rest: chan_rebase, mix_rebaseline)
     units_capture_all();         // and it is the state a lock conflict reverts to
@@ -2338,6 +2356,7 @@ static void do_notesnap(const QItem *it) {
     // FL renumbered notes that chan_rebase hasn't yet (queued just before a channel insert / delete):
     // they'd go out under numbers the others don't have yet. The scanner tries again after it.
     if (chan_list_changed()) { g_patChangedAt[p] = GetTickCount(); return; }
+    if (g_notesMerge) { notes_merge_local(p); return; }   // no locks: what changed goes out to be merged
     d = notes_copy(p, &n);
     if (d) notes_clear_sel(d, n);
     if (!unit_base(1, p, &b, &bn)) {              // no base yet: this is it
@@ -2363,14 +2382,30 @@ static void notes_send_channel(int c) {
         if (!notes_hash(p) || !(d = notes_copy(p, &n))) continue;
         notes_clear_sel(d, n);
         gd = recs_group(1, d, n, c, &gn);
-        if (gn) notes_send_group(p, c, d, n);
+        if (gn && g_notesMerge) notes_merge_send_full(p, 1);   // (nobody else has them: the rebaseline took them as known)
+        else if (gn) notes_send_group(p, c, d, n);
         free(gd); free(d);
     }
 }
 
-// it->b: the channel (-1 = the whole pattern)
+// it->b: the channel (-1 = the whole pattern). it->unit: merge mode's ops (1 a change, 2 the leader's full
+// state, 3 someone asks for the leader's state; it->order = the data, it->mode = its bytes)
 static void do_notes(const QItem *it) {
+    unsigned char *old = NULL;
+    unsigned nold = 0;
+    if (it->unit == 3) {
+        if (g_isLeader && g_notesMerge) { if (it->a) notes_merge_send_full(it->a, 0); else notes_merge_send_all(); }
+        return;
+    }
+    if (it->unit) {
+        g_applyGlow = it->glow;
+        if (g_notesMerge) notes_merge_remote(it->a, (const unsigned char *)it->order, (unsigned)it->mode, it->unit == 2);
+        return;
+    }
+    if (it->glow && it->b >= 0) old = notes_copy(it->a, &nold);
     notes_apply(it->a, (const unsigned char *)it->order, (unsigned)it->mode, it->b);
+    if (it->glow && it->b >= 0) glow_changed(0, it->a, it->b, old, nold, (const unsigned char *)it->order, (unsigned)it->mode, it->glow);
+    free(old);
     logmsg("NOTES applied pattern %d channel %d (%d notes)", it->a, it->b, it->mode);
 }
 
@@ -2388,6 +2423,7 @@ static void do_notesync(const QItem *it) {
 
 // Leader: every pattern that has notes (join / project load).
 static void send_notes_full(void) {
+    if (g_notesMerge) { notes_merge_send_all(); return; }
     size_t cap = 256, len;
     char *m = (char *)malloc(cap);
     int p, cnt = 0;
@@ -2483,6 +2519,24 @@ static const char *parse_notes_item(const char *p, unsigned char *keep) {
         if (keep) keep[pat] = 1;
     }
     return e + 1;
+}
+
+// Inbound notes.merge / notes.mergefull / notes.mergereq (recv thread): {"pat":p[,"data":"<packed>"]}
+static void on_notes_merge(const char *m) {
+    QItem it;
+    const char *d = strstr(m, "\"data\":\""), *e;
+    int pat = -1;
+    size_t n = 0;
+    memset(&it, 0, sizeof(it));
+    it.type = T_NOTES; it.b = -1;
+    if (!int_after(m, NULL, "\"pat\":", &pat) || pat < 0 || pat >= MAX_PAT) return;
+    it.a = pat;
+    if (strstr(m, "\"kind\":\"notes.mergereq\"")) { it.unit = 3; enqueue(&it); return; }
+    if (!pat || !d || !(e = strchr(d + 8, '"'))) return;
+    it.unit = strstr(m, "\"kind\":\"notes.mergefull\"") ? 2 : 1;
+    it.order = (int *)b64dec(d + 8, (size_t)(e - d - 8), &n);
+    it.mode = (int)n;
+    enqueue(&it);
 }
 
 // ---------------- playlist clips ----------------
@@ -2735,7 +2789,14 @@ static void do_clips(const QItem *it) {
         logmsg("CLIPS for arrangement %d track %d name a channel this FL doesn't have yet: held until it's here", it->a, it->b);
         return;
     }
-    clips_apply(it->a, (const unsigned char *)it->order, (unsigned)it->mode, it->b);
+    {
+        unsigned char *old = NULL;
+        unsigned nold = 0;
+        if (it->glow && it->b >= 0) old = clips_copy(it->a, &nold);
+        clips_apply(it->a, (const unsigned char *)it->order, (unsigned)it->mode, it->b);
+        if (it->glow && it->b >= 0) glow_changed(1, it->a, it->b, old, nold, (const unsigned char *)it->order, (unsigned)it->mode, it->glow);
+        free(old);
+    }
     logmsg("CLIPS applied arrangement %d track %d (%d clips)", it->a, it->b, it->mode);
 }
 
@@ -3922,7 +3983,7 @@ static void wguard_pass(void) {
 //                                                 GUI_PEOPLE "<leaderControls 0/1>\t<my id>\n" then a line per person,
 //                                                   "P\t<id>\t<name>\t<leader 0/1>\t<sync-only 0/1>\n" or, removed
 //                                                   from the session, "B\t<id>\t<name>\t<IP banned 0/1>\n" (on_peers)
-//   window -> engine (to our task window):       GUI_CONNECT "<url>\n<password>\n<name>\n<room>\n<room password>",
+//   window -> engine (to our task window):       GUI_CONNECT "<url>\n<password>\n<name>\n<room>\n<room password>\n<merge 0/1>",
 //                                                 GUI_DISCONNECT, GUI_HELLO,
 //                                                 GUI_SETTINGS (flim.ini changed: plugin_lock_s),
 //                                                 GUI_RESYNC ("Resync from host": the leader's project now),
@@ -4057,6 +4118,7 @@ static void net_show_connected(const char *m) {
     char where[600], room[100] = "";
     focus_summary(where, sizeof(where), " \xC2\xB7 ");
     if (_stricmp(g_room, "FLIM") != 0) sprintf_s(room, sizeof(room), ", room %s", g_room);
+    if (g_notesMerge) strcat_s(room, sizeof(room), ", notes merge");
     net_status(NET_ON, "Connected to %s%s \xC2\xB7 %s \xC2\xB7 %d %s%s%s", g_netShown, room, g_isLeader ? "leader" : g_syncOnly ? "sync-only (your edits stay here)" : "member",
                n, n == 1 ? "person" : "people", where[0] ? " \xC2\xB7 " : "", where);
 }
@@ -4075,7 +4137,7 @@ static void backup_setting(void);
 static void backup_tick(void);
 // Main thread (task window): a command from the flim window, which from now on gets our news.
 static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
-    char t[4000], *pw, *name, *room, *roomPw;
+    char t[4000], *pw, *name, *room, *roomPw, *merge;
     size_t n = cd->lpData ? cd->cbData : 0;
     if (n >= sizeof(t)) n = sizeof(t) - 1;
     memcpy(t, cd->lpData, n);
@@ -4092,8 +4154,11 @@ static void gui_command(HWND from, const COPYDATASTRUCT *cd) {
         if (room) *room++ = 0;
         roomPw = room ? strchr(room, '\n') : NULL;
         if (roomPw) *roomPw++ = 0;
+        merge = roomPw ? strchr(roomPw, '\n') : NULL;
+        if (merge) *merge++ = 0;
         room_set(room);
         strncpy_s(g_roomPw, sizeof(g_roomPw), roomPw ? roomPw : "", _TRUNCATE);
+        if (merge) g_wantMerge = merge[0] == '1';
         if (name && name[0]) {
             wchar_t w[128], clean[FLIM_NAME_MAX + 1];
             MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 128);
@@ -4330,6 +4395,7 @@ static void send_project(const unsigned char *d, size_t n, const wchar_t *name) 
     InterlockedIncrement(&g_projEpoch);                       // (stamped on it: the members take it)
     ws_send_samples(m, d, n);
     logmsg("PROJECT sent %S (%zu bytes, project %ld)", (name && *name) ? name : L"(untitled)", n, g_projEpoch);
+    if (g_notesMerge) notes_merge_send_all();                 // (the note identities aren't in the file)
 }
 
 // A snapshot carries no solo of ours: each track gets its own mute state back and loses the solo.
@@ -5160,6 +5226,7 @@ static void notes_remap(const int *from, int n) {
     ustate_remap_ch(&g_clipPend, 0, toNew);
     ustate_remap_ch(&g_clipBase, 0, toNew);
     LeaveCriticalSection(&g_ulockLock);
+    notes_merge_reseed_all();
 }
 
 static void chan_rebase(const int *from, int n) {
@@ -5725,7 +5792,7 @@ static int cur_passthrough(HWND hw) {
     DWORD pid = 0;
     RECT r;
     if (!root) return 0;
-    if (wnd_class_is(root, "FlimCursor") || wnd_class_is(root, "FlimSel")) return 1;
+    if (wnd_class_is(root, "FlimCursor") || wnd_class_is(root, "FlimSel") || wnd_class_is(root, "FlimGlow")) return 1;
     GetWindowThreadProcessId(root, &pid);
     if (pid != GetCurrentProcessId() || root == g_mainForm || !(GetWindowLongW(root, GWL_STYLE) & WS_POPUP)) return 0;
     return GetWindowRect(root, &r) && r.right - r.left < CUR_POPUP_W && r.bottom - r.top < CUR_POPUP_H;
@@ -6143,6 +6210,424 @@ static void sel_update(void) {
         }
     }
     LeaveCriticalSection(&g_netTextLock);
+}
+
+// ---- what the others just changed: a glow in their color that fades out ----
+// Notes (piano roll) and clips (playlist) someone else added or changed get a filled rectangle in their color
+// over our editor, fading from GLOW_ALPHA to nothing in GLOW_MS. One click-through per-pixel-alpha window per
+// editor, owned by FL's main form, sized to the editor's grid. "Show cursors" hides it too. From upstream flim.
+#define GLOW_MS     1500
+#define GLOW_ALPHA  170
+#define GLOW_MAX    256
+typedef struct { int pl, ctx, x0, x1, y; COLORREF c; DWORD at; } Glow;   // x: ticks; y: key / playlist track
+static Glow g_glow[GLOW_MAX];
+static int  g_nglow = 0;                    // main thread only
+static HWND g_glowWnd[2];
+
+static void glow_add(int pl, int ctx, const unsigned char *r, COLORREF c) {
+    DWORD now = GetTickCount();
+    int i, k = -1, pos = *(const int *)r, len = *(const int *)(r + 8);
+    for (i = 0; i < g_nglow; i++) if (now - g_glow[i].at >= GLOW_MS) { k = i; break; }   // reuse an expired one
+    if (k < 0 && g_nglow < GLOW_MAX) k = g_nglow++;
+    if (k < 0) return;
+    g_glow[k].pl = pl; g_glow[k].ctx = ctx; g_glow[k].x0 = pos; g_glow[k].x1 = pos + (len > 0 ? len : 96);
+    g_glow[k].y = pl ? 500 - *(const uint16_t *)(r + CLIP_TRK_OFS) : *(const uint16_t *)(r + 12);
+    g_glow[k].c = c; g_glow[k].at = now;
+}
+
+// Do two records say the same thing? (Selection and a clip's per-instance id aren't what someone changed.)
+static int glow_same(int pl, const unsigned char *a, const unsigned char *b) {
+    unsigned char x[NOTE_SIZE], y[NOTE_SIZE];
+    if (pl) return memcmp(a, b, 12) == 0 && *(const uint16_t *)(a + CLIP_TRK_OFS) == *(const uint16_t *)(b + CLIP_TRK_OFS);
+    memcpy(x, a, NOTE_SIZE); memcpy(y, b, NOTE_SIZE);
+    x[NOTE_SEL_OFS] &= (unsigned char)~NOTE_SEL_BIT; y[NOTE_SEL_OFS] &= (unsigned char)~NOTE_SEL_BIT;
+    return memcmp(x, y, NOTE_SIZE) == 0;
+}
+
+// Main thread: the records of group g (-1: all) in now[] that old[] didn't have glow.
+static void glow_changed(int pl, int ctx, int g, const unsigned char *old, unsigned no, const unsigned char *now, unsigned nn, uint32_t glow) {
+    size_t sz = pl ? CLIP_SIZE : NOTE_SIZE;
+    unsigned i, j, cnt = 0;
+    if (!glow || nn > GLOW_MAX * 4) return;                 // (a whole song's worth is a load, not an edit)
+    for (i = 0; i < nn && cnt < GLOW_MAX; i++) {
+        const unsigned char *r = now + i * sz;
+        int seen = 0;
+        if (g >= 0 && (int)rec_group(!pl, r) != g) continue;
+        for (j = 0; j < no && !seen; j++) seen = glow_same(pl, old + j * sz, r);
+        if (!seen) { glow_add(pl, ctx, r, (COLORREF)(glow & 0xFFFFFF)); cnt++; }
+    }
+    if (cnt) logmsg("GLOW %s %d: %u changed by someone else", pl ? "arrangement" : "pattern", ctx, cnt);
+}
+
+static void glow_class(void) {
+    static int reg = 0;
+    if (!reg) {
+        WNDCLASSW wc; memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc = DefWindowProcW; wc.hInstance = g_hinst; wc.lpszClassName = L"FlimGlow";
+        RegisterClassW(&wc);
+        reg = 1;
+    }
+}
+static HWND glow_new_window(void) {
+    glow_class();
+    return CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW, L"FlimGlow", L"",
+                           WS_POPUP, 0, 0, 1, 1, g_mainForm, NULL, g_hinst, NULL);
+}
+static int glow_live(void) { return g_netState == NET_ON && g_mainForm && !IsIconic(g_mainForm) && g_showCursors; }
+
+// Put a premultiplied BGRA picture on the screen.
+static void glow_show(HWND w, HDC sdc, HDC mdc, HBITMAP bmp, POINT org, int W, int H) {
+    HGDIOBJ ob = SelectObject(mdc, bmp);
+    SIZE sz; POINT src = { 0, 0 };
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    sz.cx = W; sz.cy = H;
+    UpdateLayeredWindow(w, sdc, &org, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+    SelectObject(mdc, ob);
+    if (!IsWindowVisible(w)) ShowWindow(w, SW_SHOWNOACTIVATE);
+    SetWindowPos(w, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+}
+static HBITMAP glow_bitmap(HDC sdc, int W, int H, uint32_t **px) {
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    return CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, (void **)px, NULL, 0);
+}
+
+// Draw one editor's live glows; hide its window when there are none.
+static void glow_paint(int pl, DWORD now) {
+    EdGeom g;
+    POINT org = { 0, 0 };
+    int i, any = 0, ctx = pl ? cur_arr() : cur_pat();
+    uint32_t *px = NULL;
+    HBITMAP bmp;
+    HDC sdc, mdc;
+    if (!g_glowWnd[pl] && !g_nglow) return;
+    for (i = 0; i < g_nglow; i++) if (g_glow[i].pl == pl && g_glow[i].ctx == ctx && now - g_glow[i].at < GLOW_MS) any = 1;
+    if (!any || !glow_live() || !ed_geom(pl, &g) || g.W <= 0 || g.H <= 0) {
+        if (g_glowWnd[pl] && IsWindowVisible(g_glowWnd[pl])) ShowWindow(g_glowWnd[pl], SW_HIDE);
+        return;
+    }
+    if (!g_glowWnd[pl] && !(g_glowWnd[pl] = glow_new_window())) return;
+    org.x = g.L; org.y = g.T;
+    ClientToScreen(g.h, &org);
+    sdc = GetDC(NULL);
+    mdc = CreateCompatibleDC(sdc);
+    bmp = glow_bitmap(sdc, g.W, g.H, &px);
+    if (!bmp) { DeleteDC(mdc); ReleaseDC(NULL, sdc); return; }
+    memset(px, 0, (size_t)g.W * g.H * 4);
+    for (i = 0; i < g_nglow; i++) {
+        Glow *e = &g_glow[i];
+        int x0, x1, y0, y1, x, y, a;
+        if (e->pl != pl || e->ctx != ctx || now - e->at >= GLOW_MS) continue;
+        a = GLOW_ALPHA * (int)(GLOW_MS - (now - e->at)) / GLOW_MS;
+        x0 = (int)(e->x0 / g.tpp) - g.hs; x1 = (int)(e->x1 / g.tpp) - g.hs;
+        if (!pl) { y0 = (g.topkey - e->y) * g.keyh - g.vs; y1 = y0 + g.keyh; }
+        else { int top, h; if (e->y < 1 || e->y > PL_TRK_MAX || !trk_rows(g.arr, e->y, &top, &h)) continue; y0 = top - g.vs; y1 = y0 + h; }
+        if (x1 - x0 < 3) x1 = x0 + 3;
+        if (!g_curNoCover) {                      // under a plugin window etc.: not drawn there
+            POINT c;
+            HWND hw;
+            c.x = org.x + (x0 + x1) / 2; c.y = org.y + (y0 + y1) / 2;
+            hw = WindowFromPoint(c);
+            if (hw != g.h && !IsChild(g.h, hw) && !cur_passthrough(hw)) continue;
+        }
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > g.W) x1 = g.W;
+        if (y1 > g.H) y1 = g.H;
+        for (y = y0; y < y1; y++)
+            for (x = x0; x < x1; x++) {
+                uint32_t *p = &px[(size_t)y * g.W + x];
+                int edge = y == y0 || y == y1 - 1 || x == x0 || x == x1 - 1, aa = edge ? (a * 3 / 2 > 255 ? 255 : a * 3 / 2) : a;
+                if ((int)(*p >> 24) >= aa) continue;
+                *p = ((uint32_t)aa << 24) | ((uint32_t)(GetRValue(e->c) * aa / 255) << 16) |
+                     ((uint32_t)(GetGValue(e->c) * aa / 255) << 8) | (uint32_t)(GetBValue(e->c) * aa / 255);
+            }
+    }
+    glow_show(g_glowWnd[pl], sdc, mdc, bmp, org, g.W, g.H);
+    DeleteObject(bmp);
+    DeleteDC(mdc);
+    ReleaseDC(NULL, sdc);
+}
+
+// Knobs: FL draws most of them itself and a plugin's own editor is opaque to FL, so a knob someone else turned
+// lights up the window it is in: that channel's plugin / settings window or that effect's window when open, else
+// the channel rack / mixer. A frame plus a light tint in their color, fading like the notes. Main thread only.
+#define FRAME_MAX   8
+#define CHAN_FORM   0x150         // channel / mixer slot object: its plugin window (TPluginForm; FL 25 had it at 0xb8)
+typedef struct { HWND target, ov; COLORREF c; DWORD at; } FrameGlow;
+static FrameGlow g_frame[FRAME_MAX];
+
+static HWND form_hwnd(void *obj) {
+    HWND h = NULL;
+    if (!obj) return NULL;
+    __try {
+        char *form = *(char **)((char *)obj + CHAN_FORM);
+        if (form) h = (HWND)(uintptr_t)*(uint32_t *)(form + ED_HWND);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
+    return h && IsWindow(h) && wnd_class_is(h, "TPluginForm") && IsWindowVisible(h) ? h : NULL;
+}
+static BOOL CALLBACK find_form_cb(HWND h, LPARAM lp) {
+    void **a = (void **)lp;
+    if (IsWindowVisible(h) && wnd_class_is(h, (const char *)a[0])) { a[1] = h; return FALSE; }
+    return TRUE;
+}
+static HWND find_form(const char *cls) {
+    void *a[2];
+    a[0] = (void *)cls; a[1] = NULL;
+    if (g_mainForm) EnumChildWindows(g_mainForm, find_form_cb, (LPARAM)a);
+    return (HWND)a[1];
+}
+
+static void glow_param(uint32_t id, uint32_t glow) {
+    HWND h = NULL;
+    int i, k = -1;
+    DWORD now = GetTickCount();
+    if (!glow || IS_MUTE_ID(id) || (id >= 0x40000000u && id < 0x70000000u)) return;   // mute bits, tempo etc.
+    if (id < 0x40000000u) {
+        h = form_hwnd(chan_obj((int)(id >> 16)));
+        if (!h && (id & 0xFFFF) < REC_PLUG_FIRST) h = find_form("TStepSeqForm");
+    } else {
+        int un, t, sl;
+        if (unit_of_id(id, &un, &t, &sl)) h = form_hwnd(fx_obj(t, sl));
+        if (!h) h = find_form("TFXForm");
+    }
+    if (!h) return;
+    for (i = 0; i < FRAME_MAX; i++) if (g_frame[i].target == h) { k = i; break; }
+    if (k < 0) for (i = 0; i < FRAME_MAX; i++) if (!g_frame[i].target || now - g_frame[i].at >= GLOW_MS) { k = i; break; }
+    if (k < 0) return;
+    if (g_frame[k].target != h) logmsg("GLOW knob: window %p", (void *)h);
+    g_frame[k].target = h; g_frame[k].c = (COLORREF)(glow & 0xFFFFFF); g_frame[k].at = now;
+}
+
+static void frame_paint(FrameGlow *f, DWORD now) {
+    RECT r, o;
+    POINT org;
+    uint32_t *px = NULL;
+    HBITMAP bmp;
+    HDC sdc, mdc;
+    HWND above, lvl;
+    int W, H, x, y, a;
+    if (!f->target) return;
+    if (now - f->at >= GLOW_MS || !IsWindow(f->target) || !IsWindowVisible(f->target) || !glow_live() || !GetWindowRect(f->target, &r)) {
+        if (f->ov && IsWindowVisible(f->ov)) ShowWindow(f->ov, SW_HIDE);
+        if (now - f->at >= GLOW_MS) f->target = NULL;
+        return;
+    }
+    W = r.right - r.left; H = r.bottom - r.top;
+    if (W <= 0 || H <= 0) return;
+    if (!g_curNoCover) {                          // FL behind another app: not drawn
+        POINT c;
+        DWORD pid = 0;
+        c.x = (r.left + r.right) / 2; c.y = r.top + 8;
+        GetWindowThreadProcessId(WindowFromPoint(c), &pid);
+        if (pid != GetCurrentProcessId()) { if (f->ov && IsWindowVisible(f->ov)) ShowWindow(f->ov, SW_HIDE); return; }
+    }
+    if (!f->ov && !(f->ov = glow_new_window())) return;
+    a = GLOW_ALPHA * (int)(GLOW_MS - (now - f->at)) / GLOW_MS;
+    sdc = GetDC(NULL);
+    mdc = CreateCompatibleDC(sdc);
+    bmp = glow_bitmap(sdc, W, H, &px);
+    if (!bmp) { DeleteDC(mdc); ReleaseDC(NULL, sdc); return; }
+    for (y = 0; y < H; y++)
+        for (x = 0; x < W; x++) {
+            int edge = x < 3 || y < 3 || x >= W - 3 || y >= H - 3, aa = edge ? (a * 3 / 2 > 255 ? 255 : a * 3 / 2) : a / 5;
+            px[(size_t)y * W + x] = ((uint32_t)aa << 24) | ((uint32_t)(GetRValue(f->c) * aa / 255) << 16) |
+                                    ((uint32_t)(GetGValue(f->c) * aa / 255) << 8) | (uint32_t)(GetBValue(f->c) * aa / 255);
+        }
+    // not over windows on top of it: its siblings above it, then its parents' siblings, up to other apps
+    for (lvl = f->target; lvl && lvl != GetDesktopWindow(); lvl = GetAncestor(lvl, GA_PARENT))
+        for (above = GetWindow(lvl, GW_HWNDPREV); above; above = GetWindow(above, GW_HWNDPREV)) {
+            RECT ar;
+            int x0, y0, x1, y1;
+            if (!IsWindowVisible(above) || (GetWindowLongW(above, GWL_EXSTYLE) & WS_EX_TRANSPARENT) ||
+                !GetWindowRect(above, &ar) || !IntersectRect(&o, &ar, &r)) continue;
+            x0 = o.left - r.left; x1 = o.right - r.left; y0 = o.top - r.top; y1 = o.bottom - r.top;
+            for (y = y0; y < y1; y++) memset(&px[(size_t)y * W + x0], 0, (size_t)(x1 - x0) * 4);
+        }
+    org.x = r.left; org.y = r.top;
+    glow_show(f->ov, sdc, mdc, bmp, org, W, H);
+    DeleteObject(bmp);
+    DeleteDC(mdc);
+    ReleaseDC(NULL, sdc);
+}
+
+static void glow_update(void) {
+    DWORD now = GetTickCount();
+    int i;
+    glow_paint(0, now);
+    glow_paint(1, now);
+    for (i = 0; i < FRAME_MAX; i++) frame_paint(&g_frame[i], now);
+}
+
+// ---- note merge mode (whoever hosts or creates the room chooses; the welcome tells everyone) ----
+// Instead of locking a channel in a pattern, every note has an identity and both people's edits are kept
+// (flim_notes_crdt.h, by cashflowbeatz). A local edit goes out as a change (new notes + observed removals,
+// "notes.merge"); someone else's is merged after our own unsent edits got their identities. Each pattern's state
+// starts from a seed every FL computes the same way from the same notes (scope = hash of them). The leader sends
+// its full state when someone joins; if a merge ever fails (another seed, the size cap, an op that crossed a
+// structure change), the leader's state wins for everyone ("notes.mergefull"). From upstream flim.
+static FncState g_fnc[MAX_PAT];
+static CRITICAL_SECTION g_fncLock;
+
+static int fnc_new_id(unsigned char out[16]) {
+    int i, nz = 0;
+    if (BCryptGenRandom(NULL, out, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return 0;
+    for (i = 0; i < 16; i++) nz |= out[i];
+    return nz != 0;
+}
+
+static void fnc_scope_of(const unsigned char *notes, unsigned n, unsigned char scope[16]) {
+    uint64_t a = fnv64(notes ? notes : (const unsigned char *)"", (size_t)n * NOTE_SIZE), b = fnv_add(a ^ 0x9e3779b97f4a7c15ull, "flim-notes", 10);
+    memcpy(scope, &a, 8); memcpy(scope + 8, &b, 8);
+}
+
+// Seed pattern p from these notes (selection bits cleared here). Caller holds g_fncLock.
+static int fnc_seed_notes(int p, const unsigned char *d, unsigned n) {
+    unsigned char *c = n ? (unsigned char *)malloc((size_t)n * NOTE_SIZE) : NULL, scope[16];
+    int r;
+    if (n) { memcpy(c, d, (size_t)n * NOTE_SIZE); notes_clear_sel(c, n); qsort(c, n, NOTE_SIZE, fnc_notecmp); }
+    fnc_scope_of(c, n, scope);
+    r = fnc_seed(&g_fnc[p], c, n, scope);
+    free(c);
+    return r;
+}
+
+// Everything known so far is the new seed (session start, project load, structure changes).
+static void notes_merge_reseed_all(void) {
+    int p;
+    if (!g_notesMerge) return;
+    EnterCriticalSection(&g_fncLock);
+    for (p = 1; p < MAX_PAT; p++) fnc_free(&g_fnc[p]);       // seeded again on first use, from the agreed notes
+    LeaveCriticalSection(&g_fncLock);
+}
+
+// Pattern p's state, seeded from its agreed notes if needed. Caller holds g_fncLock.
+static FncState *fnc_state(int p) {
+    if (!g_fnc[p].known) {
+        unsigned char *d = NULL;
+        unsigned n = 0;
+        EnterCriticalSection(&g_ulockLock);
+        if (g_patLast[p].known && g_patLast[p].n) { n = g_patLast[p].n; d = (unsigned char *)malloc((size_t)n * NOTE_SIZE); memcpy(d, g_patLast[p].d, (size_t)n * NOTE_SIZE); }
+        LeaveCriticalSection(&g_ulockLock);
+        fnc_seed_notes(p, d, n);
+        free(d);
+    }
+    return &g_fnc[p];
+}
+
+static void notes_merge_send(const char *kind, int p, const unsigned char *wire, unsigned bytes) {
+    size_t cap = 96 + ((size_t)bytes + 2) / 3 * 4;
+    char *m = (char *)malloc(cap);
+    int o = sprintf_s(m, cap, "{\"t\":\"op\",\"op\":{\"kind\":\"%s\",\"pat\":%d,\"data\":\"", kind, p);
+    b64enc(wire, (int)bytes, m + o);
+    strcat_s(m, cap, "\"}}");
+    ws_send(m);
+    free(m);
+}
+
+// (Re)seed pattern p from what FL has now if asked, and send its whole state to everyone.
+static void notes_merge_send_full(int p, int reseed) {
+    unsigned n = 0, bytes = 0;
+    unsigned char *d = reseed ? notes_copy(p, &n) : NULL, *wire;
+    FncState *s;
+    EnterCriticalSection(&g_fncLock);
+    if (reseed) fnc_seed_notes(p, d, n);
+    s = fnc_state(p);
+    wire = fnc_pack(s, s->entries, s->count, &bytes);
+    LeaveCriticalSection(&g_fncLock);
+    free(d);
+    if (wire) { notes_merge_send("notes.mergefull", p, wire, bytes); logmsg("NOTES merge: full state of pattern %d sent (%u bytes)", p, bytes); }
+    free(wire);
+}
+
+// Out of step: the leader's state wins (members ask for it).
+static void notes_merge_repair(int p, const char *why) {
+    logmsg("NOTES merge: pattern %d out of step (%s): %s", p, why, g_isLeader ? "sending ours to everyone" : "asking the leader");
+    if (g_isLeader) notes_merge_send_full(p, 1);
+    else { char m[96]; sprintf_s(m, sizeof(m), "{\"t\":\"op\",\"op\":{\"kind\":\"notes.mergereq\",\"pat\":%d}}", p); ws_send(m); }
+}
+
+// Someone's change crossed a structure change, so its numbers may be anyone's: the leader's state wins.
+static void notes_merge_stale(void) {
+    logmsg("NOTES merge: a change crossed a structure change: %s", g_isLeader ? "sending ours to everyone" : "asking the leader");
+    if (g_isLeader) notes_merge_send_all();
+    else ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"notes.mergereq\",\"pat\":0}}");
+}
+
+// Main thread: give our unsent edits of pattern p identities and send them. cur = FL's notes now.
+static void notes_merge_capture(int p, const unsigned char *cur, unsigned n) {
+    FncEntry *delta = NULL;
+    unsigned cnt = 0, bytes = 0;
+    unsigned char *wire = NULL;
+    int ok;
+    FncState *s;
+    EnterCriticalSection(&g_fncLock);
+    s = fnc_state(p);
+    ok = fnc_capture(s, cur, n, fnc_new_id, &delta, &cnt, FNC_LIMIT);
+    if (ok && cnt) wire = fnc_pack(s, delta, cnt, &bytes);
+    LeaveCriticalSection(&g_fncLock);
+    if (!ok) { notes_merge_repair(p, "too many edits to track"); return; }
+    if (wire) { notes_merge_send("notes.merge", p, wire, bytes); logmsg("NOTES merge: sent pattern %d (%u changes)", p, cnt); }
+    free(delta); free(wire);
+}
+
+// Main thread: local change of pattern p.
+static void notes_merge_local(int p) {
+    unsigned n = 0;
+    unsigned char *d = notes_copy(p, &n);
+    if (d) notes_clear_sel(d, n);
+    notes_merge_capture(p, d, n);
+    unit_agreed(1, p, d, n, -1);
+    g_patHash[p] = n ? notes_fnv(d, n) : 0;
+    free(d);
+}
+
+// Main thread: someone's change (full = 0) or the leader's full state (full = 1) for pattern p.
+static void notes_merge_remote(int p, const unsigned char *wire, unsigned bytes, int full) {
+    unsigned char scope[16], *before = NULL, *after;
+    const FncEntry *in;
+    unsigned cnt, nb = 0, na = 0;
+    int ok, same;
+    if (!fnc_unpack(wire, bytes, scope, &in, &cnt)) { logmsg("NOTES merge: bad data for pattern %d", p); return; }
+    before = notes_copy(p, &nb);
+    if (before) { notes_clear_sel(before, nb); qsort(before, nb, NOTE_SIZE, fnc_notecmp); }
+    notes_merge_capture(p, before, nb);             // our unsent edits first get identities (and go out)
+    EnterCriticalSection(&g_fncLock);
+    if (full) {
+        FncState mine = g_fnc[p];                   // keep ours to merge our own edits back in
+        FncEntry *copy = cnt ? (FncEntry *)malloc((size_t)cnt * sizeof(FncEntry)) : NULL;
+        if (cnt) memcpy(copy, in, (size_t)cnt * sizeof(FncEntry));
+        memset(&g_fnc[p], 0, sizeof(FncState));
+        memcpy(g_fnc[p].scope, scope, 16); g_fnc[p].entries = copy; g_fnc[p].count = cnt; g_fnc[p].known = 1;
+        if (mine.known && memcmp(mine.scope, scope, 16) == 0) fnc_merge(&g_fnc[p], scope, mine.entries, mine.count);
+        fnc_free(&mine);
+        ok = 1;
+    } else ok = fnc_merge(fnc_state(p), scope, in, cnt);
+    after = ok ? fnc_materialize(&g_fnc[p], &na) : NULL;
+    LeaveCriticalSection(&g_fncLock);
+    if (!ok || na == UINT32_MAX) { free(before); free(after); notes_merge_repair(p, "merge failed"); return; }
+    same = na == nb && (!na || memcmp(before, after, (size_t)na * NOTE_SIZE) == 0);
+    if (!same) {                                    // (nothing to rewrite, or a join would re-add every note everywhere)
+        notes_apply(p, after, na, -1);
+        if (!full) glow_changed(0, p, -1, before, nb, after, na, g_applyGlow);
+        logmsg("NOTES merge: applied %s for pattern %d (%u notes now)", full ? "the leader's full state" : "a change", p, na);
+    }
+    free(before); free(after);
+}
+
+// Leader, join: every pattern's full state (patterns without notes start from the same empty seed).
+static void notes_merge_send_all(void) {
+    int p, cnt = 0;
+    for (p = 1; p < MAX_PAT; p++) {
+        int has;
+        EnterCriticalSection(&g_fncLock);
+        has = (g_fnc[p].known && g_fnc[p].count) || notes_hash(p);
+        LeaveCriticalSection(&g_fncLock);
+        if (has) { notes_merge_send_full(p, 0); cnt++; }
+    }
+    logmsg("NOTES merge: full state of %d patterns sent", cnt);
 }
 
 // Hooks for the notes / clips code ------------------------------------------------------
@@ -7124,6 +7609,13 @@ static int sc_rebase(QItem *it) {
         task_free(it);
         return 0;
     }
+    if (it->type == T_NOTES && it->unit) {                     // merge mode: identities can't be renumbered
+        if (it->sc[SC_CH] == g_sc[SC_CH] && it->sc[SC_PAT] == g_sc[SC_PAT]) return 1;
+        if (it->unit == 3) { it->a = 0; return 1; }            // (asks for a number that may have moved: all of them)
+        notes_merge_stale();
+        task_free(it);
+        return 0;
+    }
     for (k = 0; k < SC_N; k++) {                               // each kind on its own (they don't renumber each other)
         int *toNew = TONEW[k], cap = CAP[k], ok = 1;
         now = g_sc[k];
@@ -7419,6 +7911,7 @@ static void drain_queue_mainthread(void) {
             LeaveCriticalSection(&g_slotLock);
         }
         uint32_t r = write_value(it.id, it.v);
+        if (it.mode == 1) glow_param(it.id, it.glow);
         if (it.mode) {
             // someone else's edit moved this channel's / effect's saved state: not ours to send back (the
             // state checks would, and take the plugin lock from them). They wait for a new baseline; params
@@ -7516,7 +8009,7 @@ static void main_stuck(DWORD forMs) {
 
 static LRESULT CALLBACK task_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_FLIM_TASKS) { drain_queue_mainthread(); return 0; }
-    if (m == WM_TIMER && wp == CUR_TIMER) { cursor_update(); sel_update(); return 0; }
+    if (m == WM_TIMER && wp == CUR_TIMER) { cursor_update(); sel_update(); glow_update(); return 0; }
     if (m == WM_TIMER && wp == BUSY_TIMER) { KillTimer(h, BUSY_TIMER); drain_queue_mainthread(); return 0; }
     if (m == WM_TIMER && wp == BACKUP_TIMER) { backup_tick(); return 0; }
     if (m == WM_TIMER && wp == ALIVE_TIMER) {
@@ -8765,6 +9258,14 @@ static void handle_msg(const char *m) {
             q = *e == ',' ? e + 1 : e;
         }
     }
+    {   // who sent it (top level "from"; chan.order's is a list)
+        const char *f = strstr(m, "\"from\":\"");
+        char id[64];
+        int i = 0;
+        if (f) for (f += 8; f[i] && f[i] != '"' && i < (int)sizeof(id) - 1; i++) id[i] = f[i];
+        if (f) id[i] = 0;
+        t_msgGlow = f ? 0x80000000u | (uint32_t)cursor_color(id) : 0;
+    }
     t_msgEp = -1;
     int_after(m, NULL, "\"ep\":", &t_msgEp);
     if (strstr(m, "\"kind\":\"project.load\"")) {
@@ -8813,6 +9314,8 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         if (int_after(m, NULL, "\"ch\":", &a)) enqueue_peer(T_DELCH, U_CH, a, 0, n0, NULL);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"notes.set\"")) {
         parse_notes_item(strstr(m, "\"kind\":\"notes.set\""), NULL);
+    } else if (strstr(m, "\"t\":\"op\"") && (strstr(m, "\"kind\":\"notes.merge\"") || strstr(m, "\"kind\":\"notes.mergefull\"") || strstr(m, "\"kind\":\"notes.mergereq\""))) {
+        on_notes_merge(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"clips.set\"")) {
         on_clips_set(m);
     } else if (strstr(m, "\"t\":\"op\"") && strstr(m, "\"kind\":\"meta.set\"")) {
@@ -8864,6 +9367,8 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         const char *r = strstr(m, "\"role\":\"");
         g_isLeader = r && strncmp(r + 8, "leader", 6) == 0;
         if (!g_isLeader) { int k; for (k = 0; k < SC_N; k++) InterlockedExchange(&g_sc[k], -1); }   // until the leader's project says
+        InterlockedExchange(&g_notesMerge, strstr(m, "\"notes\":\"merge\"") != NULL);   // (older servers: locks)
+        notes_merge_reseed_all();
         on_peers(m);
         net_show_connected(m);
         if (!g_isLeader) ws_send("{\"t\":\"op\",\"op\":{\"kind\":\"state.req\"}}");
@@ -8968,7 +9473,7 @@ static void handle_msg_body(const char *m) {    uint32_t id, v;
         logmsg("server: %.300s", m);
         if (strstr(m, "\"code\":\"bad_password\"")) strcpy_s(g_netErr, sizeof(g_netErr), "Wrong password");
         if (strstr(m, "\"code\":\"bad_room_password\"")) strcpy_s(g_netErr, sizeof(g_netErr), "Wrong room password");
-        if (strstr(m, "\"code\":\"full\"") || strstr(m, "\"code\":\"too_many\"") || strstr(m, "\"code\":\"too_many_failures\"") ||
+        if (strstr(m, "\"code\":\"full\"") || strstr(m, "\"code\":\"notes_merge\"") || strstr(m, "\"code\":\"too_many\"") || strstr(m, "\"code\":\"too_many_failures\"") ||
             strstr(m, "\"code\":\"rate\"") || strstr(m, "\"code\":\"join_timeout\""))   // the server's limits: it hangs up next
             json_str(m, "\"msg\":\"", g_netErr, sizeof(g_netErr));
         if (strstr(m, "\"code\":\"kicked\"")) {             // removed by the host: the server hangs up next
@@ -10367,7 +10872,7 @@ static int sync_only_keeps(const char *msg) {
     if (!g_syncOnly) return 0;
     if (strncmp(msg, "{\"t\":\"lock_", 10) == 0) return 1;
     if (strncmp(msg, OP, sizeof(OP) - 1) != 0) return 0;
-    if (!strncmp(k, "hello\"", 6) || !strncmp(k, "shared.need\"", 12)) return 0;
+    if (!strncmp(k, "hello\"", 6) || !strncmp(k, "shared.need\"", 12) || !strncmp(k, "notes.mergereq\"", 15)) return 0;
     if (!strncmp(k, "state.req\"", 10)) return !g_userResync;   // only the user's (every member reloads with it)
     if (op_changes_song(msg) && InterlockedIncrement(&g_syncKept) == 1) logmsg("SYNC sync-only: this edit stays in this FL (%.80s)", msg);
     return 1;
@@ -11779,8 +12284,8 @@ static DWORD WINAPI netThread(LPVOID p) {
     json_esc(r->pw, pw, sizeof(pw));
     json_esc(g_roomPw, roomPw, sizeof(roomPw));
     sprintf_s(hello, sizeof(hello),
-        "{\"t\":\"join_room\",\"room\":\"%s\",\"password\":\"%s\",\"room_password\":\"%s\",\"user\":{\"id\":\"%s\",\"name\":\"%s\"}}",
-        g_room, pw, roomPw, g_myId, name);
+        "{\"t\":\"join_room\",\"room\":\"%s\",\"password\":\"%s\",\"room_password\":\"%s\",\"caps\":[\"notes.merge\"],\"notes\":\"%s\",\"user\":{\"id\":\"%s\",\"name\":\"%s\"}}",
+        g_room, pw, roomPw, g_wantMerge ? "merge" : "lock", g_myId, name);
     ws_send(hello);
     SecureZeroMemory(hello, sizeof(hello)); SecureZeroMemory(pw, sizeof(pw)); SecureZeroMemory(roomPw, sizeof(roomPw));
     logmsg("joining room %s as %s (%s)", g_room, g_myName, g_myId);
@@ -12189,6 +12694,7 @@ static DWORD WINAPI engineMain(LPVOID p) {
             WideCharToMultiByte(CP_UTF8, 0, clean, -1, g_myName, sizeof(g_myName), NULL, NULL);
         else sprintf_s(g_myName, sizeof(g_myName), "FL-%lu", GetCurrentProcessId());
         if (GetEnvironmentVariableA("FLIM_ROOM", env, sizeof(env)) > 0) room_set(env);
+        if (GetEnvironmentVariableA("FLIM_NOTES_MODE", env, sizeof(env)) > 0) g_wantMerge = _stricmp(env, "merge") == 0;
         {
             wchar_t wr[256];
             if (GetEnvironmentVariableW(L"FLIM_ROOM_PASSWORD", wr, 256) > 0) WideCharToMultiByte(CP_UTF8, 0, wr, -1, g_roomPw, sizeof(g_roomPw), NULL, NULL);
@@ -12267,6 +12773,7 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved) {
         InitializeCriticalSection(&g_qLock);
         InitializeCriticalSection(&g_heldLock);
         InitializeCriticalSection(&g_ulockLock);
+    InitializeCriticalSection(&g_fncLock);
         InitializeCriticalSection(&g_netTextLock);
         InitializeCriticalSection(&g_guiLock);
         InitializeCriticalSection(&g_sampleLock);

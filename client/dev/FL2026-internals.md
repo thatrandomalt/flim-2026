@@ -1394,3 +1394,32 @@ and keeps a sync-only FL's edits to itself. Protocol: `server/README.md`, "Host 
   `fl-<pid>-<rand>` id), and for IP bans also the address (host.c: `getpeername`, `::ffff:` stripped;
   Node: the socket's, or `Fly-Client-IP` on fly.io). Kicks belong to the session, IP bans to the server.
   Addresses never go out in `presence`. On one PC every test FL has the same address: unban promptly.
+
+## 11. Merging notes and the glow for others' edits
+
+Both come from upstream flim 26.10.29 (the note CRDT, `common/flim_notes_crdt.h`, is cashflowbeatz's, unchanged).
+
+**Merge mode.** The welcome's `notes` says which mode a session is in; whoever creates the room chooses (`join_room`
+`notes`), and on the built-in host the host's checkbox does. Instead of locking `pat:<p>:<ch>`, every note has an identity.
+`do_notesnap` -> `notes_merge_local`: what changed goes out as `notes.merge` (new notes + observed removals). A move is
+a removal plus a new note, so two people moving one note end up with two notes. `notes_merge_remote` first gives our
+own unsent edits identities (they go out), then merges, then rewrites the pattern only if the notes differ.
+
+Each pattern's state starts from a seed every FL computes the same way (scope = hash of the agreed notes, g_patLast). The
+state isn't in the project file, so `send_project` also sends every pattern's state (`notes.mergefull`): without it, a
+member who rejoined had another scope than the leader, and the next edit made in the same moment was lost.
+
+Numbers: identities hold whole note records (channel number included) and can't be moved through `sc_rebase`. So a
+structure change seeds everything again (`notes_rebaseline`, `notes_remap`), and a merge op that crossed one is dropped
+for the leader's state (`notes_merge_stale`). **That edit can be lost**, the known ceiling of this mode; a failed merge
+goes the same way (`notes_merge_repair`). A clone's notes go out as a full state (`notes_send_channel`).
+
+**Glow.** The recv thread takes the sender's color (t_msgGlow, from the top level `"from"`) into QItem.glow. `do_notes` /
+`do_clips` / merge compare before and after (`glow_changed`), params go to `glow_param`; `glow_update` runs on CUR_TIMER.
+Hidden while FL is minimized or Show cursors is off, and where another window covers the spot (FLIM_CURSOR_NOCOVER=1 for tests).
+
+- A channel's or effect's plugin window: object +0x150 -> form, form +0x45c -> HWND (`CHAN_FORM`). Upstream's +0xb8 is
+  FL 25's; in FL 2026 it holds an object whose +0x45c stays 0. Found with the window open by walking the channel's offsets.
+- FL 2026's form classes under the main form: `TStepSeqForm` (channel rack), `TFXForm` (mixer), `TEventEditForm`.
+- `client/dev/live_test.py` `merge` needs a session in merge mode (`FLIM_NOTES_MODE=merge` on the FL that creates it, else
+  skipped). The whole suite passes in both modes. The tests read the log; how the glow looks has to be checked by eye.

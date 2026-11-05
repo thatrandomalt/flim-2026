@@ -96,6 +96,13 @@ flim-rooms 1
 ```
 flim's built-in host has no `/rooms` and ignores `room_password`. `npm run build && npm test` runs the rooms test.
 
+**Merging notes.** When `join_room` creates a room, `"notes":"merge"` makes it merge notes two people edit at once
+(default `"lock"`); `welcome` tells everyone with its `notes` field. Clients that can merge send
+`"caps":["notes.merge"]`, and a merging room refuses others with `{"t":"error","code":"notes_merge"}`. On the built-in
+host, the host's checkbox decides instead. The server only relays the ops: `notes.merge` (a change), `notes.mergefull`
+(someone's whole state for a pattern) and `notes.mergereq` (asks the leader for it; `"pat":0` = all). Sync-only members
+can still send `notes.mergereq`.
+
 **Host controls.** `presence` also carries `leaderControls` (whether the leader may use them: always here,
 since this server has no host window; flim's built-in host only when its host allows it) and `banned`
 (`[{"id","name","ip"?:true}]`, the people removed or IP banned; never the address). A peer that is

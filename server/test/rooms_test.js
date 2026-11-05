@@ -56,6 +56,18 @@ const join = (room, room_password, name) => new Promise((resolve, reject) => {
   const d = await join("OPENROOM", "ignored", "D");
   assert.strictEqual(d.msg.role, "member", "a room without a password lets anyone in");
 
+  // Merge: only when creating; a client that can't merge can't join such a room.
+  const hello = (room, extra, name) => new Promise((resolve) => {
+    const ws = new WebSocket(`ws://localhost:${PORT}`);
+    ws.on("open", () => ws.send(JSON.stringify({ t: "join_room", room, password: "sërver", user: { id: name, name }, ...extra })));
+    ws.on("message", (m) => { const msg = JSON.parse(m.toString()); if (msg.t === "welcome" || msg.t === "error") resolve(msg); });
+  });
+  const caps = { caps: ["notes.merge"] };
+  assert.strictEqual((await hello("MERGED", { notes: "merge", ...caps }, "M1")).notes, "merge", "the creator chooses merge");
+  assert.strictEqual((await hello("MERGED", caps, "M2")).notes, "merge", "everyone is told");
+  assert.strictEqual((await hello("MERGED", {}, "M3")).code, "notes_merge", "a client that can't merge is refused");
+  assert.strictEqual((await hello("OPENROOM", { notes: "merge", ...caps }, "M4")).notes, "lock", "joining doesn't change a room");
+
   // A room goes when its last person leaves, and its password with it.
   a.ws.close(); c.ws.close();
   await sleep(300);

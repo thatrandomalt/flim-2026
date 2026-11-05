@@ -2,7 +2,7 @@ import crypto from "crypto";
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
 import { handleBlob } from "./blobs";
-import { ClientMsg, PING_INTERVAL_MS, Role, UserInfo } from "./protocol";
+import { CAP_NOTES_MERGE, ClientMsg, PING_INTERVAL_MS, Role, UserInfo } from "./protocol";
 import { Client, Session, send } from "./session";
 
 const PORT = Number(process.env.PORT ?? 8080);
@@ -69,6 +69,14 @@ function roomList(): string {
 function roomListPasswordOk(req: http.IncomingMessage): boolean {
   try { return passwordOk(decodeURIComponent(String(req.headers["x-flim-password"] ?? ""))); }
   catch { return false; }
+}
+
+// A room that merges notes can't take a client that can't: its edits would never reach the others.
+function cantMerge(ws: WebSocket, session: Session, caps: unknown): boolean {
+  if (session.notes !== "merge" || (Array.isArray(caps) && caps.includes(CAP_NOTES_MERGE))) return false;
+  fail(ws, "notes_merge", "This room merges notes, which your flim can't do yet. Update flim to join.");
+  setTimeout(() => ws.close(4004, "notes_merge"), 200);
+  return true;
 }
 
 function makeCode(): string {
@@ -205,6 +213,7 @@ wss.on("connection", (ws, req) => {
         if (!session) return fail(ws, "no_session", "Session not found.");
         const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true, ip };
         if (!roomPasswordOk(session, msg.room_password)) return badRoomPassword(ws, ip, session.code, client.user);
+        if (cantMerge(ws, session, msg.caps)) return;
         if (session.isBanned(client.user, ip)) return fail(ws, "kicked", "You were removed from this session. The host can let you back in");
         if (session.othersThan(client.user.id) >= MAX_PEOPLE) return full(ws, session.code);
         conn.client = client;
@@ -219,7 +228,7 @@ wss.on("connection", (ws, req) => {
         let session = sessions.get(code);
         if (!session) {
           const client: Client = { ws, user: sanitizeUser(msg.user), role: "leader", alive: true, ip };
-          session = new Session(code, client, () => sessions.delete(code));
+          session = new Session(code, client, () => sessions.delete(code), msg.notes === "merge" ? "merge" : "lock");
           if (typeof msg.room_password === "string" && msg.room_password) session.passwordHash = sha256(msg.room_password);
           sessions.set(code, session);
           conn.client = client;
@@ -228,6 +237,7 @@ wss.on("connection", (ws, req) => {
         } else {
           const client: Client = { ws, user: sanitizeUser(msg.user), role: "member", alive: true, ip };
           if (!roomPasswordOk(session, msg.room_password)) return badRoomPassword(ws, ip, code, client.user);
+          if (cantMerge(ws, session, msg.caps)) return;
           if (session.isBanned(client.user, ip)) {
             console.log(`[room ${code}] ${client.user.name} was removed: not let in`);
             fail(ws, "kicked", "You were removed from this session. The host can let you back in");

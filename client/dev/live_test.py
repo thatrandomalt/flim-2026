@@ -1387,7 +1387,7 @@ class RawWs:                                                    # a bare WebSock
         r = b''
         while b'\r\n\r\n' not in r: r += self.s.recv(4096)
         self.buf, self.got = r.split(b'\r\n\r\n', 1)[1], []
-        self.send({'t': 'join_room', 'room': room, 'password': '', 'user': {'id': uid, 'name': name}})
+        self.send({'t': 'join_room', 'room': room, 'password': '', 'caps': ['notes.merge'], 'user': {'id': uid, 'name': name}})
     def send(self, obj):
         import json
         d, m = json.dumps(obj, separators=(',', ':')).encode(), os.urandom(4)   # (compact, as flim sends: host.c relays it as is)
@@ -1496,6 +1496,79 @@ def t_kick():
     check('IP unban: B joins again', lambda: logged(pos, B, 'PROJECT settled', 40), lambda: True, wait=0)
     x = RawWs('raw-y-%d' % os.getpid(), 'RawY'); x.pump(1.5); x.close()
     check('...and so can others from that address', lambda: [m['t'] for m in x.got][:1], lambda: ['welcome'], wait=0)
+
+# What someone else changed glows: B's log says what (the picture itself was checked on screen).
+def t_glow():
+    p = next(q for q in range(100, 999) if not notes(a, q) and not notes(b, q))
+    pos = os.path.getsize(LOG)
+    pa = a.call(0x12d16e0, p, 0); rec = a.alloc(24)
+    a.w(rec, struct.pack('<IHHIH', 96, 0, 0, 48, 60) + bytes(10)); a.call(va(a, a.q(a.q(pa) + 8)), pa, rec)
+    check('glow: a note someone else added', lambda: logged(pos, B, 'GLOW pattern %d: 1 changed' % p, 6), lambda: True, wait=0)
+    check('...not on the FL that made it', lambda: logged(pos, A, 'GLOW pattern %d' % p), lambda: False, wait=0)
+    ca = a.q(arr(a) + 0x14); rc = a.alloc(0x58)
+    pos = os.path.getsize(LOG)
+    a.call(va(a, a.q(a.q(ca) + 16)), ca, rc)
+    a.w(rc, struct.pack('<IIIH', 96 * 40, 0x5000 + 1, 96, 490))
+    a.call(va(a, a.q(a.q(ca) + 8)), ca, rc)
+    check('glow: a clip someone else added', lambda: logged(pos, B, 'GLOW arrangement', 6), lambda: True, wait=0)
+    time.sleep(2)                                               # (the frame of a window that glowed just now isn't new)
+    pos = os.path.getsize(LOG)
+    i = mix_id(2, 0x1fc0); rec_set(a, i, (rec_get(a, i) + 1234) % 12800)
+    check('glow: a knob lights up its window', lambda: logged(pos, B, 'GLOW knob', 6), lambda: True, wait=0)
+    # a channel's and an effect's open plugin window: the object's CHAN_FORM (+0x150) -> form, its +0x45c -> the window
+    import ctypes
+    u = ctypes.windll.user32
+    def forms(): return [k for q, h, cl, ti in fl.windows((A,)) for k, cc in [(h, cl)] + fl.children(h) if cc == 'TPluginForm' and u.IsWindowVisible(k)]
+    objs = [('channel', chans(a)[0])] + ([('effect', fx_slot(a, 1, 0))] if has_plug(a, 1, 0) else [])
+    for what, o in objs:
+        was = forms(); show = va(a, a.q(a.q(o) + 0xE0)); a.call(show, o, 1); time.sleep(1.5)
+        h = a.d(a.q(o + 0x150) + 0x45c)
+        check("glow: %s's plugin window is at the offset" % what, lambda: h in forms() and h != 0, lambda: True, wait=0)
+        if h not in was: a.call(show, o, 0)
+    time.sleep(1)
+
+# Merge mode (restart with FLIM_NOTES_MODE=merge on the FL that creates the room; skipped otherwise): notes two people
+# edit in the same pattern and channel at once are all kept, on both FLs.
+def t_merge():
+    if not logged(0, A, '"notes":"merge"'): print('   (the session locks notes: skipped)'); return
+    def add(p, pat, tick, key):
+        pa = p.call(0x12d16e0, pat, 0); rec = p.alloc(24)
+        p.w(rec, struct.pack('<IHHIH', tick, 0, 0, 48, key) + bytes(10)); p.call(va(p, p.q(p.q(pa) + 8)), pa, rec)
+    def keys(p, pat): return sorted(struct.unpack('<H', r[12:14])[0] for r in notes(p, pat))
+    def key_up(p, pat, i, by):
+        d = p.q(p.q(pat_rec(p, pat) + 0x28) + 8) + i * 24
+        p.w(d + 12, struct.pack('<H', struct.unpack('<H', p.r(d + 12, 2))[0] + by))
+    def same(name, want, wait=6):
+        check(name, lambda: keys(a, pat), lambda: keys(b, pat), wait=wait)
+        check('...and it is what both did', lambda: keys(a, pat), lambda: want, wait=0)
+    pat = next(q for q in range(100, 999) if not notes(a, q) and not notes(b, q))
+    pos = os.path.getsize(LOG)
+    add(a, pat, 0, 60); add(b, pat, 96, 72)                     # the same channel, within the settle time
+    same('merge: both add a note in one channel at once', [60, 72])
+    time.sleep(1)
+    ib = [struct.unpack('<H', r[12:14])[0] for r in notes(b, pat)].index(72)
+    ia = [struct.unpack('<H', r[12:14])[0] for r in notes(a, pat)].index(60)
+    key_up(a, pat, ia, 1); key_up(b, pat, ib, 1)
+    same('merge: both move their own note at once', [61, 73])
+    time.sleep(1)
+    ia = [struct.unpack('<H', r[12:14])[0] for r in notes(a, pat)].index(61)
+    ib = [struct.unpack('<H', r[12:14])[0] for r in notes(b, pat)].index(61)
+    key_up(a, pat, ia, 1); key_up(b, pat, ib, 2)
+    same('merge: both move the same note: both kept', [62, 63, 73])
+    check('merge: no locks and nothing out of step', lambda: [logged(pos, A, 'out of step'), logged(pos, B, 'out of step'), logged(pos, A, 'reverted'), logged(pos, B, 'reverted')],
+          lambda: [False] * 4, wait=0)
+    # a channel inserted renumbers notes: everyone seeds again, and merging goes on
+    add_named(a, 0, 'merge test'); time.sleep(2)
+    add(a, pat, 192, 50); add(b, pat, 288, 51)
+    check('merge: after a channel insert', lambda: keys(a, pat), lambda: keys(b, pat), wait=8)
+    check('...both notes are there', lambda: [50 in keys(a, pat), 51 in keys(a, pat)], lambda: [True, True], wait=0)
+    # someone joining gets the state (and the leader's isn't rewritten for it)
+    pos = os.path.getsize(LOG)
+    engine_cmd(B, 3, URL + '\n\nB')
+    check('merge: B rejoins and loads the project', lambda: logged(pos, B, 'PROJECT settled', 40), lambda: True, wait=0)
+    add(a, pat, 384, 40); add(b, pat, 480, 41)
+    check('...and merges again', lambda: keys(a, pat), lambda: keys(b, pat), wait=8)
+    check('...both notes are there', lambda: [40 in keys(a, pat), 41 in keys(a, pat)], lambda: [True, True], wait=0)
 
 if __name__ == '__main__':
     T = {k[2:]: v for k, v in list(globals().items()) if k.startswith('t_')}

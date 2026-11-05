@@ -33,7 +33,7 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 360, 108, 50, 15
 END
 
-IDD_ROOMS DIALOGEX 0, 0, 340, 214
+IDD_ROOMS DIALOGEX 0, 0, 340, 228
 STYLE DS_SHELLFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Rooms on this server"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -44,9 +44,10 @@ BEGIN
     EDITTEXT        IDC_R_NAME, 10, 147, 320, 13, ES_AUTOHSCROLL
     LTEXT           "Room password (optional for a new room):", -1, 10, 165, 320, 10
     EDITTEXT        IDC_R_PW, 10, 176, 320, 13, ES_AUTOHSCROLL | ES_PASSWORD
-    PUSHBUTTON      "Refresh", IDC_R_REFRESH, 10, 194, 50, 15
-    DEFPUSHBUTTON   "Join", IDOK, 220, 194, 56, 15
-    PUSHBUTTON      "Cancel", IDCANCEL, 280, 194, 50, 15
+    AUTOCHECKBOX    "New room: merge notes when two people edit the same instrument, instead of locking", IDC_R_MERGE, 10, 193, 320, 10
+    PUSHBUTTON      "Refresh", IDC_R_REFRESH, 10, 208, 50, 15
+    DEFPUSHBUTTON   "Join", IDOK, 220, 208, 56, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 280, 208, 50, 15
 END
 
 IDD_MAIN DIALOGEX 0, 0, 560, 392
@@ -86,6 +87,7 @@ BEGIN
     EDITTEXT        IDC_H_SHARE, 14, 220, 256, 13, ES_AUTOHSCROLL | ES_READONLY
     PUSHBUTTON      "Copy", IDC_H_COPY, 274, 219, 52, 15
     AUTOCHECKBOX    "Let the session leader use the people controls too (when this PC doesn't join)", IDC_H_LEADERCTL, 14, 241, 312, 10
+    AUTOCHECKBOX    "Merge notes when two people edit the same instrument, instead of locking", IDC_H_MERGE, 14, 254, 312, 10
 
     GROUPBOX        " Session ", -1, 340, 6, 214, 265
     LTEXT           "FL isn't running.", IDC_S_STATUS, 348, 18, 198, 50

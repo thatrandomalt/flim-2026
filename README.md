@@ -78,6 +78,11 @@ change (many knobs at once) or loading the plugin's whole state locks the plugin
 released shortly after you stop: about 0.6 s for a knob, 2 s for notes or a playlist track, and for a
 whole plugin **10 s** by default. Each person sets their own plugin time (1–10 s, *Keep a plugin I change locked to
 me for … s* in flim's window): it is how long a plugin you're working on stays yours after your last change.
+**Lock or Merge for notes:** whoever hosts, or creates a [room](#rooms), picks what happens when two people
+edit the same instrument in the same pattern at once. **Lock** is the default: one person at a time, as above.
+With **Merge**, there's no lock on notes and both people's edits are kept. If you both drag the same note at
+the same moment, you end up with two notes. An edit made in the same instant as someone adding or removing a
+channel or pattern can be lost: the leader's notes win then. Everyone in the session needs a flim that can merge.
 Names, colors, routing, markers and the time signature have no locks; if two people change the same
 one at the same moment, the leader's change wins. If the channel lists ever end up different anyway (say,
 two people add or delete channels at the very same moment), flim notices and reloads the leader's
@@ -116,8 +121,12 @@ e.g. `Connected to flim.example.com · leader · 2 people · Alex: Piano roll - 
 When someone's mouse is over the piano roll or the playlist, you see a small arrow with their name at
 the same spot in yours (the same note and bar, whatever your zoom or scroll), as long as you are looking
 at the same pattern or arrangement. The notes and playlist clips someone has selected show as outlines in
-their arrow's colour (in the same pattern or arrangement, up to 256 each). Arrows and outlines can't be
-clicked and never get in your way. To hide them, untick **Show cursors** in flim's window.
+their arrow's colour (in the same pattern or arrangement, up to 256 each).
+
+**What others just changed glows in their colour** and fades out over 1.5 seconds: notes in the piano roll, clips
+in the playlist, and for a knob, the window it's in (the plugin's window if it's open, otherwise the channel rack
+or the mixer). Arrows, outlines and glows can't be clicked and never get in your way. To hide them, untick
+**Show cursors** in flim's window.
 
 ---
 
@@ -205,7 +214,8 @@ A dedicated server can hold several separate sessions, called rooms. (A session 
 **Host a session** has just one, so it has no room list: everyone clicks **Join**.)
 1. Enter the server's address, and its password if it has one, then click **Rooms...** instead of **Join**.
 2. Pick a room from the list, which shows how many people are in each and which have a password, and
-   click **Join**. Or type a new name (letters, digits, `-` and `_`) and click **Create room**.
+   click **Join**. Or type a new name (letters, digits, `-` and `_`), choose whether it
+   [merges notes](#whats-synced), and click **Create room**.
 
 There are two kinds of password. The **server password** (`FLIM_PASSWORD`, optional) is needed to see the
 list or get into any room. A **room password** (optional) is set by whoever creates the room, and is needed
@@ -424,6 +434,7 @@ These environment variables are read by the engine (for tests and two FLs on one
 | `FLIM_AUTOCONNECT=<url>` | connect at startup (with `FLIM_PASSWORD=<pw>`) |
 | `FLIM_NAME=<name>` | override the name from `flim.ini` (e.g. to run two FLs on one PC) |
 | `FLIM_ROOM=<room>` | use another room on the same server (default `FLIM`), with `FLIM_ROOM_PASSWORD=<pw>` if it has a password |
+| `FLIM_NOTES_MODE=merge` | if this FL creates the room, it merges notes |
 | `FLIM_SAMPLE_NOLOCAL=1` | never use a local copy of a received sample, always download it (to test sample transfer on one PC) |
 
 With `FLIM_AUTOCONNECT` set, `flim.exe` skips its window and starts FL connected right away.
@@ -485,8 +496,9 @@ server/                 flim-server (Node.js + TypeScript, WebSocket + HTTP)
 
 - **[fckwader](https://github.com/fckwader)** created [flim](https://github.com/fckwader/flim), which this fork
   is built on. fckwader's project isn't responsible for this fork, so please report its bugs here.
-- **[cashflowbeatz](https://github.com/cashflowbeatz)** found fixes in upstream flim that this fork adapted, such as
-  big note edits getting dropped.
+- **[cashflowbeatz](https://github.com/cashflowbeatz)** wrote the note merging (`client/common/flim_notes_crdt.h`,
+  used unchanged) and found fixes in upstream flim that this fork adapted, such as big note edits getting dropped.
+  The glow for others' edits is adapted from upstream flim too.
 
 ---
 

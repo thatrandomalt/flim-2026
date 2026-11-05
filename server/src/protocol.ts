@@ -2,6 +2,8 @@
 // carried as base64 in `flp`. Keep this file in sync with the FL client.
 
 export type Role = "leader" | "member";
+export type NotesMode = "lock" | "merge";
+export const CAP_NOTES_MERGE = "notes.merge";
 
 export interface UserInfo {
   id: string;
@@ -43,8 +45,10 @@ export type ClientMsg =
   // `password`: the server's FLIM_PASSWORD (ignored when the server has none)
   // `room_password`: the room's own (optional); whoever creates a room sets it
   | { t: "host"; user: UserInfo; password?: string }
-  | { t: "join"; user: UserInfo; session: string; password?: string; room_password?: string }
-  | { t: "join_room"; user: UserInfo; room: string; password?: string; room_password?: string } // join-or-create a named room
+  | { t: "join"; user: UserInfo; session: string; password?: string; room_password?: string; caps?: string[] }
+  // `notes`: when this creates the room, what happens when two people edit the same notes: "lock" (default) or
+  // "merge" (both kept; engine's notes.merge ops). `caps`: "notes.merge" = this client can merge
+  | { t: "join_room"; user: UserInfo; room: string; password?: string; room_password?: string; notes?: NotesMode; caps?: string[] } // join-or-create a named room
   | { t: "snapshot"; flp: string } // leader seeds/updates the project blob
   | { t: "project_swap"; flp: string } // leader only; replaces the project
   | { t: "op"; op: Op }
@@ -55,7 +59,7 @@ export type ClientMsg =
 
 // ---- server -> client ----
 export type ServerMsg =
-  | { t: "welcome"; session: string; role: Role; you: UserInfo; peers: PeerInfo[] }
+  | { t: "welcome"; session: string; role: Role; you: UserInfo; peers: PeerInfo[]; notes: NotesMode }
   | { t: "snapshot"; flp: string | null; epoch: number }
   | { t: "op"; seq: number; from: string; op: Op }
   | { t: "lock"; key: UnitKey; granted: boolean; owner: string | null }

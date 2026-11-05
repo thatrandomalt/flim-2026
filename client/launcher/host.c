@@ -40,7 +40,7 @@
 
 typedef struct Buf { volatile LONG refs; size_t n; unsigned char d[1]; } Buf;
 typedef struct QNode { Buf *b; struct QNode *next; } QNode;
-typedef struct Session { char code[40], leader[72]; unsigned seq; struct Lock *locks; struct Ban *bans, *syncs; struct Session *next; } Session;
+typedef struct Session { char code[40], leader[72]; unsigned seq; struct Lock *locks; struct Ban *bans, *syncs; struct Session *next; int merge; } Session;
 typedef struct Lock { char key[200], owner[72]; DWORD at; struct Lock *next; } Lock;
 typedef struct Ban { char id[72], name[40], ip[64]; struct Ban *next; } Ban;   // removed (kick / IP ban) until let back in; sync-only
 typedef struct Client {
@@ -72,6 +72,7 @@ static HWND    g_notify;
 static Ban    *g_ipBans;                            // IP bans: every session on this server (admin_do)
 static volatile LONG g_leaderCtl;                  // the session leader may use the host controls too (host_leader_controls)
 static volatile LONG g_maxPeople = 8;              // people per session, the leader included (host_set_max_people)
+static volatile LONG g_hostMerge;                  // sessions started from now on merge notes (host_set_notes_merge)
 // Per address: open connections and wrong passwords (g_ipLk). A slot is free again once it has neither.
 typedef struct { char ip[64]; int conns, fails; DWORD failSince; } IpEnt;
 static IpEnt   g_ips[IPS_MAX];
@@ -435,8 +436,8 @@ static void session_add(Session *s, Client *c) {
     c->sess = s;
     peers_json(s, peers, sizeof(peers));
     js_esc(c->id, id, sizeof(id)); js_esc(c->name, nm, sizeof(nm)); js_esc(s->code, code, sizeof(code));
-    sprintf_s(m, sizeof(m), "{\"t\":\"welcome\",\"session\":\"%s\",\"role\":\"%s\",\"you\":{\"id\":\"%s\",\"name\":\"%s\"},\"peers\":%s}",
-              code, c->leader ? "leader" : "member", id, nm, peers);
+    sprintf_s(m, sizeof(m), "{\"t\":\"welcome\",\"session\":\"%s\",\"role\":\"%s\",\"you\":{\"id\":\"%s\",\"name\":\"%s\"},\"peers\":%s,\"notes\":\"%s\"}",
+              code, c->leader ? "leader" : "member", id, nm, peers, s->merge ? "merge" : "lock");
     send_str(c, m);
     send_str(c, "{\"t\":\"snapshot\",\"flp\":null,\"epoch\":0}");
     o = sprintf_s(m, sizeof(m), "{\"t\":\"lock_state\",\"locks\":[");
@@ -652,8 +653,17 @@ static void on_message(Client *c, char *msg, size_t n) {
             LeaveCriticalSection(&g_lk);
             return;
         }
+        if (!strstr(msg, "\"notes.merge\"") && (s ? s->merge : g_hostMerge)) {   // (its edits would never reach the others)
+            hlog("%s: this session merges notes, which their flim can't do: not let in", c->name);
+            send_error(c, "notes_merge", "This session merges notes, which your flim can't do yet. Update flim to join.");
+            c->id[0] = 0;
+            InterlockedExchange(&c->closed, 1); SetEvent(c->qev);
+            LeaveCriticalSection(&g_lk);
+            return;
+        }
         if (!s) {
             s = (Session *)calloc(1, sizeof(Session));
+            s->merge = g_hostMerge;
             strcpy_s(s->code, sizeof(s->code), room);
             strcpy_s(s->leader, sizeof(s->leader), c->id);
             s->next = g_sessions; g_sessions = s;
@@ -692,7 +702,7 @@ static void on_message(Client *c, char *msg, size_t n) {
         if (!end) { LeaveCriticalSection(&g_lk); return; }
         js_str(js_get(op, "kind"), kind, sizeof(kind));
         js_str(js_get(op, "key"), key, sizeof(key));
-        if (c->sync && strcmp(kind, "state.req") != 0 && strcmp(kind, "hello") != 0 && strcmp(kind, "shared.need") != 0) {
+        if (c->sync && strcmp(kind, "state.req") != 0 && strcmp(kind, "hello") != 0 && strcmp(kind, "shared.need") != 0 && strcmp(kind, "notes.mergereq") != 0) {
             LeaveCriticalSection(&g_lk);                  // sync-only: only asking for things goes through
             return;
         }
@@ -1141,6 +1151,7 @@ static DWORD WINAPI timer_thread(LPVOID p) {
 // ---------------- public ----------------
 int host_running(void) { return g_run != 0; }
 void host_set_max_people(int n) { InterlockedExchange(&g_maxPeople, n < 2 ? 2 : n > 64 ? 64 : n); }
+void host_set_notes_merge(int on) { InterlockedExchange(&g_hostMerge, on != 0); }
 
 int host_start(int port, const char *password, HWND notify, char *err, int errcap) {
     WSADATA wd;
