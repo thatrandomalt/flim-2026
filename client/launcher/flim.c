@@ -97,6 +97,7 @@ static void show_fl_info(HWND dlg) {
 }
 
 static void theme_init(HWND dlg);
+static LRESULT theme_check(const NMCUSTOMDRAW *cd);
 static void theme_button(const DRAWITEMSTRUCT *di);
 static void theme_listitem(const DRAWITEMSTRUCT *di);
 static INT_PTR theme_color(HWND dlg, UINT m, HDC dc, HWND c);
@@ -546,6 +547,12 @@ static INT_PTR CALLBACK rooms_proc(HWND dlg, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_DRAWITEM && ((const DRAWITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { theme_listitem((const DRAWITEMSTRUCT *)lp); return TRUE; }
     if (m == WM_MEASUREITEM && ((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) { list_measure(dlg, (MEASUREITEMSTRUCT *)lp); return TRUE; }
     if (m >= WM_CTLCOLORMSGBOX && m <= WM_CTLCOLORSTATIC) return theme_color(dlg, m, (HDC)wp, (HWND)lp);
+    if (m == WM_NOTIFY) {
+        LRESULT r = theme_check((const NMCUSTOMDRAW *)lp);
+        if (r == -1) return FALSE;
+        SetWindowLongPtrW(dlg, DWLP_MSGRESULT, r);
+        return TRUE;
+    }
     if (m == WM_INITDIALOG) {
         theme_init(dlg);
         g_roomsN = g_roomsKnown = 0;
